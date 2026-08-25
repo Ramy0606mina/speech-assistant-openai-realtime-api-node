@@ -22,7 +22,7 @@ fastify.register(fastifyWs);
 
 // Constants
 const SYSTEM_MESSAGE = `You are London, Ramy's AI executive assistant. Your name is London. You are professional, warm, concise, intelligent, and commercially aware. When asked who you are, say that you are London, Ramy's AI executive assistant. Never say you do not have a name. Speak naturally and avoid unnecessary verbosity. You are currently speaking with Ramy by phone.`;
-const VOICE = 'shimmer';
+const VOICE = 'marin';
 const TEMPERATURE = 0.8; // Controls the randomness of the AI's responses
 const PORT = process.env.PORT || 5050; // Allow dynamic port assignment
 
