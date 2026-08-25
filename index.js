@@ -136,6 +136,25 @@ fastify.register(async (fastify) => {
                         output: { format: { type: 'audio/pcmu' }, voice: VOICE },
                     },
                     instructions: SYSTEM_MESSAGE,
+                  tools: [
+  {
+    type: 'function',
+    name: 'send_sms',
+    description: 'Send an SMS message to Ramy when Ramy explicitly asks London to text him.',
+    parameters: {
+      type: 'object',
+      properties: {
+        message: {
+          type: 'string',
+          description: 'The exact SMS message to send to Ramy.'
+        }
+      },
+      required: ['message'],
+      additionalProperties: false
+    }
+  }
+],
+tool_choice: 'auto',
                 },
             };
 
@@ -216,9 +235,55 @@ fastify.register(async (fastify) => {
         });
 
         // Listen for messages from the OpenAI WebSocket (and send to Twilio if necessary)
-        openAiWs.on('message', (data) => {
+        openAiWs.on('message', async (data) => {
             try {
                 const response = JSON.parse(data);
+              if (
+  response.type === 'response.function_call_arguments.done' &&
+  response.name === 'send_sms'
+) {
+  let toolResult;
+
+  try {
+    const args = JSON.parse(response.arguments || '{}');
+
+    if (!args.message || typeof args.message !== 'string') {
+      throw new Error('No SMS message was provided.');
+    }
+
+    await sendSmsToRamy(args.message);
+
+    toolResult = JSON.stringify({
+      success: true,
+      message: 'SMS sent successfully to Ramy.'
+    });
+  } catch (error) {
+    console.error('SMS error:', error);
+
+    toolResult = JSON.stringify({
+      success: false,
+      error: error.message
+    });
+  }
+
+  openAiWs.send(JSON.stringify({
+    type: 'conversation.item.create',
+    item: {
+      type: 'function_call_output',
+      call_id: response.call_id,
+      output: toolResult
+    }
+  }));
+
+  openAiWs.send(JSON.stringify({
+    type: 'response.create',
+    response: {
+      instructions: 'Briefly tell Ramy whether the SMS was sent successfully.'
+    }
+  }));
+
+  return;
+}
 
                 if (LOG_EVENT_TYPES.includes(response.type)) {
                     console.log(`Received event: ${response.type}`, response);
