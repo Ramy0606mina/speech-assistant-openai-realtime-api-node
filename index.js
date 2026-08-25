@@ -8,12 +8,54 @@ import fastifyWs from '@fastify/websocket';
 dotenv.config();
 
 // Retrieve the OpenAI API key from environment variables.
-const { OPENAI_API_KEY } = process.env;
+const {
+  OPENAI_API_KEY,
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  TWILIO_PHONE_NUMBER,
+  RAMY_PHONE_NUMBER
+} = process.env;
 
-if (!OPENAI_API_KEY) {
-    console.error('Missing OpenAI API key. Please set it in the .env file.');
-    process.exit(1);
-}
+const sendSmsToRamy = async (message) => {
+  if (
+    !TWILIO_ACCOUNT_SID ||
+    !TWILIO_AUTH_TOKEN ||
+    !TWILIO_PHONE_NUMBER ||
+    !RAMY_PHONE_NUMBER
+  ) {
+    throw new Error('Missing Twilio SMS environment variables.');
+  }
+
+  const auth = Buffer.from(
+    `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
+  ).toString('base64');
+
+  const form = new URLSearchParams({
+    To: RAMY_PHONE_NUMBER,
+    From: TWILIO_PHONE_NUMBER,
+    Body: message
+  });
+
+  const response = await fetch(
+    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: form.toString()
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(`Twilio SMS failed: ${data.message || response.status}`);
+  }
+
+  return data;
+};
 
 // Initialize Fastify
 const fastify = Fastify();
