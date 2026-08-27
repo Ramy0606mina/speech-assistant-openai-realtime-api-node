@@ -502,7 +502,8 @@ tool_choice: 'auto',
     type: 'response.create',
     response: {
       instructions:
-        'Answer Ramy using only the live Minaco email results returned by the tool. Be concise and practical. Mention sender, subject, and what matters. Do not invent anything. If the lookup failed, tell Ramy the live email lookup failed.'
+        instructions:
+  'Answer Ramy using only the live Minaco email results returned by the tool. All email times are already converted to Montreal local time in receivedTimeMontreal. Use that time when mentioning when an email arrived. Be concise and practical. Mention sender, subject, and what matters. Do not invent anything. If the lookup failed, tell Ramy the live email lookup failed.'
     }
   }));
 
