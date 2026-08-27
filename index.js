@@ -358,24 +358,7 @@ fastify.register(async (fastify) => {
   }
 ],
 tool_choice: 'auto',
-  {
-    type: 'function',
-    name: 'send_sms',
-    description: 'Send an SMS message to Ramy when Ramy explicitly asks London to text him.',
-    parameters: {
-      type: 'object',
-      properties: {
-        message: {
-          type: 'string',
-          description: 'The exact SMS message to send to Ramy.'
-        }
-      },
-      required: ['message'],
-      additionalProperties: false
-    }
-  }
-],
-tool_choice: 'auto',
+  
                 },
             };
 
