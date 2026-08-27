@@ -463,7 +463,34 @@ fastify.register(async (fastify) => {
       },
       additionalProperties: false
     }
+      }
+  },
+  {
+    type: 'function',
+    name: 'prepare_email',
+    description: 'Prepare an email draft for Ramy. This tool must never send the email. Use it when Ramy asks London to write, draft, prepare, or send an email. After preparing the draft, London must read back the recipient, subject, and message and ask Ramy to confirm.',
+    parameters: {
+      type: 'object',
+      properties: {
+        to: {
+          type: 'string',
+          description: 'Recipient email address.'
+        },
+        subject: {
+          type: 'string',
+          description: 'Email subject.'
+        },
+        body: {
+          type: 'string',
+          description: 'Complete email body.'
+        }
+      },
+      required: ['to', 'subject', 'body'],
+      additionalProperties: false
+    }
   }
+],
+tool_choice: 'auto',
 ],
 tool_choice: 'auto',
   
