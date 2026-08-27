@@ -21,6 +21,7 @@ const {
   ACTIONS_MS_TENANT_ID,
   ACTIONS_MS_CLIENT_ID,
   ACTIONS_MS_CLIENT_SECRET
+  LONDON_MINACO_EMAIL,
 } = process.env;
 
 const sendSmsToRamy = async (message) => {
