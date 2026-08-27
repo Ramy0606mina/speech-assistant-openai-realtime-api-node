@@ -577,6 +577,58 @@ tool_choice: 'auto',
                 const response = JSON.parse(data);
              if (
   response.type === 'response.function_call_arguments.done' &&
+  response.name === 'prepare_email'
+) {
+  let toolResult;
+
+  try {
+    const args = JSON.parse(response.arguments || '{}');
+
+    if (!args.to || !args.subject || !args.body) {
+      throw new Error('Recipient, subject, and body are required.');
+    }
+
+    pendingEmailDraft = {
+      to: args.to,
+      subject: args.subject,
+      body: args.body
+    };
+
+    toolResult = JSON.stringify({
+      success: true,
+      draft: pendingEmailDraft,
+      sent: false
+    });
+  } catch (error) {
+    console.error('Prepare email error:', error);
+
+    toolResult = JSON.stringify({
+      success: false,
+      error: error.message
+    });
+  }
+
+  openAiWs.send(JSON.stringify({
+    type: 'conversation.item.create',
+    item: {
+      type: 'function_call_output',
+      call_id: response.call_id,
+      output: toolResult
+    }
+  }));
+
+  openAiWs.send(JSON.stringify({
+    type: 'response.create',
+    response: {
+      instructions:
+        'Read back the recipient, subject, and email message to Ramy. Clearly say the email has NOT been sent. Ask Ramy to confirm by saying Send it. Do not send anything yet.'
+    }
+  }));
+
+  return;
+}
+              if (
+  response.type === 'response.function_call_arguments.done' &&
   response.name === 'check_email'
 ) {
   let toolResult;
