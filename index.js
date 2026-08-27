@@ -459,6 +459,68 @@ tool_choice: 'auto',
         openAiWs.on('message', async (data) => {
             try {
                 const response = JSON.parse(data);
+             if (
+  response.type === 'response.function_call_arguments.done' &&
+  response.name === 'check_email'
+) {
+  let toolResult;
+
+  try {
+    const args = JSON.parse(response.arguments || '{}');
+
+    const requestedLimit = Number(args.limit);
+    const limit =
+      Number.isInteger(requestedLimit) && requestedLimit >= 1
+        ? Math.min(requestedLimit, 10)
+        : 5;
+
+    const emails = await getRecentMinacoEmails(limit);
+
+    const simplifiedEmails = emails.map((email) => ({
+      from:
+        email.from?.emailAddress?.name ||
+        email.from?.emailAddress?.address ||
+        'Unknown sender',
+      fromEmail: email.from?.emailAddress?.address || '',
+      subject: email.subject || '(No subject)',
+      receivedDateTime: email.receivedDateTime,
+      isRead: Boolean(email.isRead),
+      preview: email.bodyPreview || ''
+    }));
+
+    toolResult = JSON.stringify({
+      success: true,
+      mailbox: RAMY_MINACO_EMAIL,
+      emails: simplifiedEmails
+    });
+  } catch (error) {
+    console.error('Email lookup error:', error);
+
+    toolResult = JSON.stringify({
+      success: false,
+      error: error.message
+    });
+  }
+
+  openAiWs.send(JSON.stringify({
+    type: 'conversation.item.create',
+    item: {
+      type: 'function_call_output',
+      call_id: response.call_id,
+      output: toolResult
+    }
+  }));
+
+  openAiWs.send(JSON.stringify({
+    type: 'response.create',
+    response: {
+      instructions:
+        'Answer Ramy using only the live Minaco email results returned by the tool. Be concise and practical. Mention sender, subject, and what matters. Do not invent anything. If the lookup failed, tell Ramy the live email lookup failed.'
+    }
+  }));
+
+  return;
+}
               if (
   response.type === 'response.function_call_arguments.done' &&
   response.name === 'send_sms'
