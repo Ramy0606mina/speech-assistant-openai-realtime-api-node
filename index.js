@@ -712,7 +712,7 @@ const deleteCalendarEvent = async (eventId) => {
 };
 
 // -----------------------------------------------------------------------------
-// Fastify / London voice configuration
+// Fastify / Vale voice configuration
 // -----------------------------------------------------------------------------
 
 const fastify = Fastify();
@@ -720,7 +720,7 @@ fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
 const SYSTEM_MESSAGE = `
-You are London Assistant, the executive assistant to Ramy Mina.
+You are Vale Assistant, the executive assistant to Ramy Mina.
 
 IDENTITY AND BUSINESS CONTEXT
 
@@ -730,12 +730,12 @@ Mina Capital was previously used as a technical test environment. Do not assume 
 Verified Minaco identities:
 - Ramy Mina: principal executive
 - Ramy's primary Minaco email: ramy.mina@minaco.ca
-- London Assistant email: london@minaco.ca
+- Vale Assistant email: london@minaco.ca
 - Minaco accounting email: accounting@minaco.ca
-- London Assistant phone number: +1 438-255-9099
+- Vale Assistant phone number: +1 438-255-9099
 
 When Ramy asks what his email address is without specifying another company, answer ramy.mina@minaco.ca.
-When Ramy asks who you are, say: "I am London Assistant, your executive assistant for Minaco."
+When Ramy asks who you are, say: "I am Vale Assistant, your executive assistant for Minaco."
 
 ACCURACY IS YOUR HIGHEST PRIORITY
 
@@ -830,7 +830,7 @@ const SHOW_TIMING_MATH = false;
 const authorizedStreamTokens = new Map();
 
 fastify.get('/', async (request, reply) => {
-  reply.send({ message: 'London Assistant Twilio Media Stream Server is running!' });
+  reply.send({ message: 'Vale Assistant Twilio Media Stream Server is running!' });
 });
 
 fastify.all('/incoming-call', async (request, reply) => {
@@ -859,7 +859,7 @@ fastify.all('/incoming-call', async (request, reply) => {
 
   const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Google.en-US-Chirp3-HD-Aoede">Please wait while I connect you to London Assistant.</Say>
+  <Say voice="Google.en-US-Chirp3-HD-Aoede">Please wait while I connect you to Vale Assistant.</Say>
   <Pause length="1"/>
   <Say voice="Google.en-US-Chirp3-HD-Aoede">You can start speaking.</Say>
   <Connect>
@@ -956,7 +956,7 @@ fastify.register(async (fastifyInstance) => {
                 type: 'function',
                 name: 'send_sms',
                 description:
-                  'Send an SMS message to Ramy when Ramy explicitly asks London to text him.',
+                  'Send an SMS message to Ramy when Ramy explicitly asks Vale to text him.',
                 parameters: {
                   type: 'object',
                   properties: {
