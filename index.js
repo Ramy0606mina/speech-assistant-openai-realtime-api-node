@@ -60,7 +60,76 @@ const sendSmsToRamy = async (message) => {
 
   return data;
 };
+const getMicrosoftGraphToken = async () => {
+  if (!MS_TENANT_ID || !MS_CLIENT_ID || !MS_CLIENT_SECRET) {
+    throw new Error('Missing Microsoft Graph environment variables.');
+  }
 
+  const form = new URLSearchParams({
+    client_id: MS_CLIENT_ID,
+    client_secret: MS_CLIENT_SECRET,
+    scope: 'https://graph.microsoft.com/.default',
+    grant_type: 'client_credentials'
+  });
+
+  const response = await fetch(
+    `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/token`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: form.toString()
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Microsoft authentication failed: ${data.error_description || data.error || response.status}`
+    );
+  }
+
+  return data.access_token;
+};
+
+const getRecentMinacoEmails = async (limit = 5) => {
+  if (!RAMY_MINACO_EMAIL) {
+    throw new Error('RAMY_MINACO_EMAIL is not configured.');
+  }
+
+  const token = await getMicrosoftGraphToken();
+
+  const url = new URL(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      RAMY_MINACO_EMAIL
+    )}/mailFolders/inbox/messages`
+  );
+
+  url.searchParams.set('$top', String(limit));
+  url.searchParams.set(
+    '$select',
+    'subject,from,receivedDateTime,bodyPreview,isRead'
+  );
+  url.searchParams.set('$orderby', 'receivedDateTime desc');
+
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`
+    }
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Microsoft Graph email lookup failed: ${data.error?.message || response.status}`
+    );
+  }
+
+  return data.value || [];
+};
 // Initialize Fastify
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
