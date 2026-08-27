@@ -565,7 +565,60 @@ tool_choice: 'auto',
         // Send mark messages to Media Streams so we know if and when AI response playback is finished
         const sendMark = (connection, streamSid) => {
             if (streamSid) {
-                const markEvent = {
+              if (
+  response.type === 'response.function_call_arguments.done' &&
+  response.name === 'send_confirmed_email'
+) {
+  let toolResult;
+
+  try {
+    if (!pendingEmailDraft) {
+      throw new Error('There is no pending email draft to send.');
+    }
+
+    const emailToSend = { ...pendingEmailDraft };
+
+    const result = await sendEmailFromLondon(emailToSend);
+
+    pendingEmailDraft = null;
+
+    toolResult = JSON.stringify({
+      success: true,
+      sent: true,
+      from: result.from,
+      to: result.to,
+      subject: result.subject
+    });
+  } catch (error) {
+    console.error('Confirmed email send error:', error);
+
+    toolResult = JSON.stringify({
+      success: false,
+      sent: false,
+      error: error.message
+    });
+  }
+
+  openAiWs.send(JSON.stringify({
+    type: 'conversation.item.create',
+    item: {
+      type: 'function_call_output',
+      call_id: response.call_id,
+      output: toolResult
+    }
+  }));
+
+  openAiWs.send(JSON.stringify({
+    type: 'response.create',
+    response: {
+      instructions:
+        'Tell Ramy whether the email was successfully sent. If successful, briefly confirm the recipient and subject. If it failed, clearly say it was not sent and give the error without inventing anything.'
+    }
+  }));
+
+  return;
+}  
+              const markEvent = {
                     event: 'mark',
                     streamSid: streamSid,
                     mark: { name: 'responsePart' }
