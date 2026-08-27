@@ -136,6 +136,61 @@ const getMicrosoftGraphActionsToken = async () => {
 
   return data.access_token;
 };
+const sendEmailFromLondon = async ({ to, subject, body }) => {
+  if (!LONDON_MINACO_EMAIL) {
+    throw new Error('LONDON_MINACO_EMAIL is not configured.');
+  }
+
+  if (!to || !subject || !body) {
+    throw new Error('Email requires recipient, subject, and body.');
+  }
+
+  const token = await getMicrosoftGraphActionsToken();
+
+  const response = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      LONDON_MINACO_EMAIL
+    )}/sendMail`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        message: {
+          subject,
+          body: {
+            contentType: 'Text',
+            content: body
+          },
+          toRecipients: [
+            {
+              emailAddress: {
+                address: to
+              }
+            }
+          ]
+        },
+        saveToSentItems: true
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Microsoft Graph email send failed: ${errorText || response.status}`
+    );
+  }
+
+  return {
+    success: true,
+    from: LONDON_MINACO_EMAIL,
+    to,
+    subject
+  };
+};
 const getRecentMinacoEmails = async (limit = 5) => {
   if (!RAMY_MINACO_EMAIL) {
     throw new Error('RAMY_MINACO_EMAIL is not configured.');
