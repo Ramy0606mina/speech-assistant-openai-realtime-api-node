@@ -488,7 +488,17 @@ fastify.register(async (fastify) => {
       required: ['to', 'subject', 'body'],
       additionalProperties: false
     }
+  },
+                    {
+  type: 'function',
+  name: 'send_confirmed_email',
+  description: 'Send the email draft that Ramy has already reviewed. Use this tool ONLY when Ramy explicitly confirms the pending email by saying Send it, send the email, yes send it, or equivalent. Never use it when merely drafting or discussing an email.',
+  parameters: {
+    type: 'object',
+    properties: {},
+    additionalProperties: false
   }
+}
 ],
 tool_choice: 'auto',
 
