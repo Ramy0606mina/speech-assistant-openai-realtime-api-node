@@ -466,7 +466,11 @@ tool_choice: 'auto',
         'Unknown sender',
       fromEmail: email.from?.emailAddress?.address || '',
       subject: email.subject || '(No subject)',
-      receivedDateTime: email.receivedDateTime,
+      receivedTimeMontreal: new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/Toronto',
+  dateStyle: 'medium',
+  timeStyle: 'short'
+}).format(new Date(email.receivedDateTime)),
       isRead: Boolean(email.isRead),
       preview: email.bodyPreview || ''
     }));
