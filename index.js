@@ -338,6 +338,41 @@ fastify.register(async (fastify) => {
       required: ['message'],
       additionalProperties: false
     }
+  },
+  {
+    type: 'function',
+    name: 'check_email',
+    description: 'Read Ramy Mina’s live Minaco inbox. Use this whenever Ramy asks about current emails, latest emails, unread emails, or whether someone emailed him.',
+    parameters: {
+      type: 'object',
+      properties: {
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 10,
+          description: 'Number of recent emails to retrieve. Use 5 unless Ramy asks otherwise.'
+        }
+      },
+      additionalProperties: false
+    }
+  }
+],
+tool_choice: 'auto',
+  {
+    type: 'function',
+    name: 'send_sms',
+    description: 'Send an SMS message to Ramy when Ramy explicitly asks London to text him.',
+    parameters: {
+      type: 'object',
+      properties: {
+        message: {
+          type: 'string',
+          description: 'The exact SMS message to send to Ramy.'
+        }
+      },
+      required: ['message'],
+      additionalProperties: false
+    }
   }
 ],
 tool_choice: 'auto',
