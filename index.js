@@ -13,7 +13,11 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_PHONE_NUMBER,
-  RAMY_PHONE_NUMBER
+  RAMY_PHONE_NUMBER,
+  MS_TENANT_ID,
+  MS_CLIENT_ID,
+  MS_CLIENT_SECRET,
+  RAMY_MINACO_EMAIL
 } = process.env;
 
 const sendSmsToRamy = async (message) => {
