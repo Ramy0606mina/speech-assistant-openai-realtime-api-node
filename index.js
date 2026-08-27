@@ -96,7 +96,45 @@ const getMicrosoftGraphToken = async () => {
 
   return data.access_token;
 };
+const getMicrosoftGraphActionsToken = async () => {
+  if (
+    !ACTIONS_MS_TENANT_ID ||
+    !ACTIONS_MS_CLIENT_ID ||
+    !ACTIONS_MS_CLIENT_SECRET
+  ) {
+    throw new Error('Missing Microsoft Graph Actions environment variables.');
+  }
 
+  const form = new URLSearchParams({
+    client_id: ACTIONS_MS_CLIENT_ID,
+    client_secret: ACTIONS_MS_CLIENT_SECRET,
+    scope: 'https://graph.microsoft.com/.default',
+    grant_type: 'client_credentials'
+  });
+
+  const response = await fetch(
+    `https://login.microsoftonline.com/${ACTIONS_MS_TENANT_ID}/oauth2/v2.0/token`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: form.toString()
+    }
+  );
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Microsoft Actions authentication failed: ${
+        data.error_description || data.error || response.status
+      }`
+    );
+  }
+
+  return data.access_token;
+};
 const getRecentMinacoEmails = async (limit = 5) => {
   if (!RAMY_MINACO_EMAIL) {
     throw new Error('RAMY_MINACO_EMAIL is not configured.');
