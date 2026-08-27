@@ -164,7 +164,7 @@ const getRecentMinacoEmails = async (limit = 5) => {
   url.searchParams.set('$top', String(limit));
   url.searchParams.set(
     '$select',
-    'subject,from,receivedDateTime,bodyPreview,isRead'
+    'id,subject,from,receivedDateTime,bodyPreview,isRead'
   );
   url.searchParams.set('$orderby', 'receivedDateTime desc');
 
@@ -185,6 +185,132 @@ const getRecentMinacoEmails = async (limit = 5) => {
   }
 
   return data.value || [];
+};
+
+const getFullMinacoEmail = async (messageId) => {
+  if (!RAMY_MINACO_EMAIL) {
+    throw new Error('RAMY_MINACO_EMAIL is not configured.');
+  }
+
+  if (!messageId) {
+    throw new Error('A message id is required.');
+  }
+
+  const token = await getMicrosoftGraphToken();
+
+  const url = new URL(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      RAMY_MINACO_EMAIL
+    )}/messages/${encodeURIComponent(messageId)}`
+  );
+
+  url.searchParams.set(
+    '$select',
+    'id,conversationId,internetMessageId,subject,from,replyTo,toRecipients,ccRecipients,receivedDateTime,body,isRead'
+  );
+
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Prefer: 'outlook.body-content-type="text"',
+    },
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Microsoft Graph full email lookup failed: ${
+        data.error?.message || response.status
+      }`
+    );
+  }
+
+  return data;
+};
+
+const simplifyEmailRecipients = (recipients = []) =>
+  (Array.isArray(recipients) ? recipients : [])
+    .map((recipient) => ({
+      name: recipient?.emailAddress?.name || '',
+      address: recipient?.emailAddress?.address || '',
+    }))
+    .filter((recipient) => recipient.address);
+
+const getReplyRecipientSummary = (email, mode) => {
+  const ownAddress = String(RAMY_MINACO_EMAIL || '').toLowerCase();
+  const firstRecipients =
+    Array.isArray(email?.replyTo) && email.replyTo.length > 0
+      ? email.replyTo
+      : email?.from
+        ? [email.from]
+        : [];
+
+  const sourceRecipients =
+    mode === 'all'
+      ? [
+          ...firstRecipients,
+          ...(Array.isArray(email?.toRecipients) ? email.toRecipients : []),
+          ...(Array.isArray(email?.ccRecipients) ? email.ccRecipients : []),
+        ]
+      : firstRecipients;
+
+  const seen = new Set();
+  const result = [];
+
+  for (const recipient of simplifyEmailRecipients(sourceRecipients)) {
+    const normalized = recipient.address.toLowerCase();
+    if (!normalized || normalized === ownAddress || seen.has(normalized)) continue;
+    seen.add(normalized);
+    result.push(recipient);
+  }
+
+  return result;
+};
+
+const replyToMinacoEmail = async ({ messageId, mode, body }) => {
+  if (!RAMY_MINACO_EMAIL) {
+    throw new Error('RAMY_MINACO_EMAIL is not configured.');
+  }
+
+  if (!messageId || !body) {
+    throw new Error('Reply requires a message id and reply body.');
+  }
+
+  if (!['sender', 'all'].includes(mode)) {
+    throw new Error('Reply mode must be sender or all.');
+  }
+
+  const token = await getMicrosoftGraphActionsToken();
+  const action = mode === 'all' ? 'replyAll' : 'reply';
+
+  const response = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      RAMY_MINACO_EMAIL
+    )}/messages/${encodeURIComponent(messageId)}/${action}`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ comment: body }),
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Microsoft Graph email ${action} failed: ${errorText || response.status}`
+    );
+  }
+
+  return {
+    success: true,
+    from: RAMY_MINACO_EMAIL,
+    mode,
+    messageId,
+  };
 };
 
 const sendEmailFromLondon = async ({ to, subject, body }) => {
@@ -747,12 +873,24 @@ Never make up a plausible answer just to be helpful.
 LIVE EMAIL RULES
 
 Use check_email whenever Ramy asks about current emails or his inbox. Never answer a current email question from memory.
-Use prepare_email when Ramy asks you to draft, write, prepare, or send an email.
-Preparing an email NEVER sends it.
+check_email returns a recent-email list and message ids. It does NOT contain the entire body.
+Use read_email whenever Ramy asks you to read, translate, summarize, analyze, or respond based on the complete contents of a specific email. read_email retrieves the full live message body in text form.
+If the target email has not yet been identified, use check_email first, identify the exact email, then use read_email with its message id. Never translate or analyze an email from a preview when the full body is available.
+
+Use prepare_email when Ramy asks you to draft, write, prepare, or send a NEW standalone email from London Assistant. Preparing an email NEVER sends it.
 After prepare_email succeeds, read back the recipient, subject, and message and clearly say it has not been sent. Ask Ramy to confirm.
-Use send_confirmed_email ONLY after Ramy explicitly confirms the pending email with "Send it" or an unmistakable equivalent in response to your confirmation request.
-Never claim an email was sent unless the send tool confirms success.
-Never invent a recipient email address. If Ramy gives only a person's name and you do not have a verified email address, ask for the email address.
+
+For a REPLY to an email in Ramy's Minaco inbox:
+1. Identify the exact email and message id with check_email and, when the reply depends on its contents, read_email.
+2. If Ramy says reply, respond, or answer without specifying the recipient scope, ask one short question: "Reply to sender only or reply all?"
+3. Use prepare_email_reply with reply_mode "sender" for sender-only or "all" for reply-all.
+4. Replies are sent from ramy.mina@minaco.ca and remain in the original Outlook conversation thread.
+5. Read back whether it is sender-only or reply-all, the recipients, subject, and complete reply text. Clearly say it has NOT been sent yet.
+6. Ask Ramy to confirm by saying "Send it."
+
+Use send_confirmed_email ONLY after Ramy explicitly confirms the currently pending NEW email or REPLY with "Send it" or an unmistakable equivalent in direct response to your confirmation request.
+Never claim an email or reply was sent unless the send tool confirms success.
+Never invent a recipient email address. If Ramy gives only a person's name for a new email and you do not have a verified email address, ask for the email address.
 
 LIVE CALENDAR RULES
 
@@ -897,6 +1035,8 @@ fastify.register(async (fastifyInstance) => {
       let markQueue = [];
       let responseStartTimestampTwilio = null;
       let pendingEmailDraft = null;
+      let pendingEmailReply = null;
+      let pendingEmailActionType = null;
       let pendingCalendarAction = null;
 
       const openAiWs = new WebSocket(
@@ -973,7 +1113,7 @@ fastify.register(async (fastifyInstance) => {
                 type: 'function',
                 name: 'check_email',
                 description:
-                  'Read Ramy Mina’s latest live Minaco inbox emails. Use for current inbox questions. This retrieves the most recent messages; it is not a full historical mailbox search.',
+                  'List Ramy Mina’s latest live Minaco inbox emails with sender, subject, preview, time, and message id. Use for current inbox questions or to identify an email before reading or replying. This is not a full historical mailbox search.',
                 parameters: {
                   type: 'object',
                   properties: {
@@ -985,6 +1125,52 @@ fastify.register(async (fastifyInstance) => {
                         'Number of recent emails to retrieve. Use 5 unless Ramy asks otherwise.',
                     },
                   },
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'read_email',
+                description:
+                  'Retrieve the complete live body and recipient details of one specific email in Ramy’s Minaco mailbox. Use whenever Ramy asks to read, translate, summarize, analyze, or respond based on the full email rather than a preview.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    message_id: {
+                      type: 'string',
+                      description:
+                        'Exact Microsoft Graph message id returned by check_email.',
+                    },
+                  },
+                  required: ['message_id'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'prepare_email_reply',
+                description:
+                  'Prepare a reply to a specific live email in Ramy’s Minaco mailbox. This NEVER sends. reply_mode must be sender for sender-only or all for reply-all. Use only after the exact message id is known.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    message_id: {
+                      type: 'string',
+                      description:
+                        'Exact Microsoft Graph message id returned by check_email or read_email.',
+                    },
+                    reply_mode: {
+                      type: 'string',
+                      enum: ['sender', 'all'],
+                      description:
+                        'sender = reply to sender/reply-to only. all = reply all to the original conversation recipients.',
+                    },
+                    body: {
+                      type: 'string',
+                      description: 'Complete reply body to send after confirmation.',
+                    },
+                  },
+                  required: ['message_id', 'reply_mode', 'body'],
                   additionalProperties: false,
                 },
               },
@@ -1017,7 +1203,7 @@ fastify.register(async (fastifyInstance) => {
                 type: 'function',
                 name: 'send_confirmed_email',
                 description:
-                  'Send the already-prepared email draft. Use ONLY after Ramy explicitly confirms the pending email by saying Send it or an unmistakable equivalent.',
+                  'Send the currently pending prepared email action, either a new London email or a reply from Ramy’s mailbox. Use ONLY after Ramy explicitly confirms by saying Send it or an unmistakable equivalent.',
                 parameters: {
                   type: 'object',
                   properties: {},
@@ -1278,31 +1464,62 @@ fastify.register(async (fastifyInstance) => {
             response.name === 'send_confirmed_email'
           ) {
             try {
-              if (!pendingEmailDraft) {
-                throw new Error('There is no pending email draft to send.');
+              if (pendingEmailActionType === 'reply') {
+                if (!pendingEmailReply) {
+                  throw new Error('There is no pending email reply to send.');
+                }
+
+                const replyToSend = { ...pendingEmailReply };
+                const result = await replyToMinacoEmail(replyToSend);
+                pendingEmailReply = null;
+                pendingEmailDraft = null;
+                pendingEmailActionType = null;
+
+                respondToToolCall(
+                  response.call_id,
+                  {
+                    success: true,
+                    sent: true,
+                    action: 'reply',
+                    from: result.from,
+                    replyMode: result.mode,
+                    subject: replyToSend.subject,
+                    recipients: replyToSend.recipients,
+                  },
+                  'Confirm briefly that the reply was successfully sent. Say whether it was reply-to-sender or reply-all, mention the subject, and do not invent anything.'
+                );
+              } else if (pendingEmailActionType === 'new') {
+                if (!pendingEmailDraft) {
+                  throw new Error('There is no pending new email draft to send.');
+                }
+
+                const emailToSend = { ...pendingEmailDraft };
+                const result = await sendEmailFromLondon(emailToSend);
+                pendingEmailDraft = null;
+                pendingEmailReply = null;
+                pendingEmailActionType = null;
+
+                respondToToolCall(
+                  response.call_id,
+                  {
+                    success: true,
+                    sent: true,
+                    action: 'new_email',
+                    from: result.from,
+                    to: result.to,
+                    subject: result.subject,
+                  },
+                  'Confirm briefly that the new email was successfully sent. Mention the recipient and subject. Do not invent anything.'
+                );
+              } else {
+                throw new Error('There is no pending email action to send.');
               }
-
-              const emailToSend = { ...pendingEmailDraft };
-              const result = await sendEmailFromLondon(emailToSend);
-              pendingEmailDraft = null;
-
-              respondToToolCall(
-                response.call_id,
-                {
-                  success: true,
-                  sent: true,
-                  from: result.from,
-                  to: result.to,
-                  subject: result.subject,
-                },
-                'Confirm briefly that the email was successfully sent. Mention the recipient and subject. Do not invent anything.'
-              );
             } catch (error) {
               console.error('Confirmed email send error:', error);
               respondToToolCall(
                 response.call_id,
                 { success: false, sent: false, error: error.message },
-                'Tell Ramy the email was NOT sent and state the returned error concisely. Do not invent anything.'
+                'Tell Ramy the email action was NOT sent and state the returned error concisely. Do not invent anything.'
               );
             }
             return;
@@ -1324,6 +1541,8 @@ fastify.register(async (fastifyInstance) => {
                 subject: args.subject,
                 body: args.body,
               };
+              pendingEmailReply = null;
+              pendingEmailActionType = 'new';
 
               respondToToolCall(
                 response.call_id,
@@ -1358,7 +1577,9 @@ fastify.register(async (fastifyInstance) => {
                   : 5;
 
               const emails = await getRecentMinacoEmails(limit);
-              const simplifiedEmails = emails.map((email) => ({
+              const simplifiedEmails = emails.map((email, index) => ({
+                number: index + 1,
+                messageId: email.id,
                 from:
                   email.from?.emailAddress?.name ||
                   email.from?.emailAddress?.address ||
@@ -1389,6 +1610,109 @@ fastify.register(async (fastifyInstance) => {
                 response.call_id,
                 { success: false, error: error.message },
                 'Tell Ramy the live email lookup failed and state the returned error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'read_email'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const email = await getFullMinacoEmail(args.message_id);
+
+              respondToToolCall(
+                response.call_id,
+                {
+                  success: true,
+                  messageId: email.id,
+                  conversationId: email.conversationId || '',
+                  subject: email.subject || '(No subject)',
+                  from: {
+                    name: email.from?.emailAddress?.name || '',
+                    address: email.from?.emailAddress?.address || '',
+                  },
+                  replyTo: simplifyEmailRecipients(email.replyTo),
+                  toRecipients: simplifyEmailRecipients(email.toRecipients),
+                  ccRecipients: simplifyEmailRecipients(email.ccRecipients),
+                  receivedTimeMontreal: email.receivedDateTime
+                    ? new Intl.DateTimeFormat('en-US', {
+                        timeZone: MONTREAL_IANA_TIME_ZONE,
+                        dateStyle: 'medium',
+                        timeStyle: 'short',
+                      }).format(new Date(email.receivedDateTime))
+                    : '',
+                  isRead: Boolean(email.isRead),
+                  bodyContentType: email.body?.contentType || 'text',
+                  fullBody: email.body?.content || '',
+                },
+                'Use the complete live email body returned by the tool. If Ramy asked to translate it, translate the full body, not the preview. If he asked to summarize or analyze it, use the full body. Do not invent omitted attachments or content.'
+              );
+            } catch (error) {
+              console.error('Full email lookup error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the full email could not be retrieved and state the returned error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'prepare_email_reply'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const mode = args.reply_mode;
+
+              if (!args.message_id || !args.body) {
+                throw new Error('Message id and reply body are required.');
+              }
+
+              if (!['sender', 'all'].includes(mode)) {
+                throw new Error('Reply mode must be sender or all.');
+              }
+
+              const email = await getFullMinacoEmail(args.message_id);
+              const recipients = getReplyRecipientSummary(email, mode);
+
+              if (recipients.length === 0) {
+                throw new Error('No valid reply recipient could be determined.');
+              }
+
+              pendingEmailReply = {
+                messageId: email.id,
+                mode,
+                body: args.body,
+                subject: email.subject || '(No subject)',
+                recipients,
+              };
+              pendingEmailDraft = null;
+              pendingEmailActionType = 'reply';
+
+              respondToToolCall(
+                response.call_id,
+                {
+                  success: true,
+                  sent: false,
+                  from: RAMY_MINACO_EMAIL,
+                  replyMode: mode,
+                  subject: pendingEmailReply.subject,
+                  recipients,
+                  body: args.body,
+                },
+                'Read back whether this is reply-to-sender or reply-all, the recipient names or addresses, the subject, and the complete reply message. Clearly say the reply has NOT been sent. Ask Ramy to confirm by saying Send it.'
+              );
+            } catch (error) {
+              console.error('Prepare email reply error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the reply could not be prepared and state the returned error concisely.'
               );
             }
             return;
