@@ -565,7 +565,28 @@ tool_choice: 'auto',
         // Send mark messages to Media Streams so we know if and when AI response playback is finished
         const sendMark = (connection, streamSid) => {
             if (streamSid) {
-              if (
+             
+              const markEvent = {
+                    event: 'mark',
+                    streamSid: streamSid,
+                    mark: { name: 'responsePart' }
+                };
+                connection.send(JSON.stringify(markEvent));
+                markQueue.push('responsePart');
+            }
+        };
+
+        // Open event for OpenAI WebSocket
+        openAiWs.on('open', () => {
+            console.log('Connected to the OpenAI Realtime API');
+            setTimeout(initializeSession, 100);
+        });
+
+        // Listen for messages from the OpenAI WebSocket (and send to Twilio if necessary)
+        openAiWs.on('message', async (data) => {
+            try {
+                const response = JSON.parse(data);
+if (
   response.type === 'response.function_call_arguments.done' &&
   response.name === 'send_confirmed_email'
 ) {
@@ -617,27 +638,8 @@ tool_choice: 'auto',
   }));
 
   return;
-}  
-              const markEvent = {
-                    event: 'mark',
-                    streamSid: streamSid,
-                    mark: { name: 'responsePart' }
-                };
-                connection.send(JSON.stringify(markEvent));
-                markQueue.push('responsePart');
-            }
-        };
-
-        // Open event for OpenAI WebSocket
-        openAiWs.on('open', () => {
-            console.log('Connected to the OpenAI Realtime API');
-            setTimeout(initializeSession, 100);
-        });
-
-        // Listen for messages from the OpenAI WebSocket (and send to Twilio if necessary)
-        openAiWs.on('message', async (data) => {
-            try {
-                const response = JSON.parse(data);
+}
+              
              if (
   response.type === 'response.function_call_arguments.done' &&
   response.name === 'prepare_email'
