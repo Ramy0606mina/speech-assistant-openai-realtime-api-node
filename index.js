@@ -463,7 +463,7 @@ fastify.register(async (fastify) => {
       },
       additionalProperties: false
     }
-      }
+      
   },
   {
     type: 'function',
