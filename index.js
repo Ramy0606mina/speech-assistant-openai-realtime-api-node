@@ -491,10 +491,8 @@ fastify.register(async (fastify) => {
   }
 ],
 tool_choice: 'auto',
-],
-tool_choice: 'auto',
-  
-                },
+
+                  },
             };
 
             console.log('Sending session update:', JSON.stringify(sessionUpdate));
