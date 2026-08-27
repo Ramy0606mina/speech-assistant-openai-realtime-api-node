@@ -22,10 +22,19 @@ const {
   ACTIONS_MS_CLIENT_ID,
   ACTIONS_MS_CLIENT_SECRET,
   LONDON_MINACO_EMAIL,
+  ACCOUNTING_MINACO_EMAIL,
+  DAILY_BRIEF_SECRET,
+  OPENAI_DOCUMENT_MODEL,
+  EXECUTIVE_BRIEF_MODEL,
 } = process.env;
 
 const MONTREAL_IANA_TIME_ZONE = 'America/Toronto';
 const MICROSOFT_EASTERN_TIME_ZONE = 'Eastern Standard Time';
+const ACCOUNTING_MAILBOX = ACCOUNTING_MINACO_EMAIL || 'accounting@minaco.ca';
+const ACTION_REGISTER_CALENDAR_NAME = 'London Action Register';
+const DOCUMENT_ANALYSIS_MODEL = OPENAI_DOCUMENT_MODEL || 'gpt-5.6';
+const DAILY_BRIEF_MODEL = EXECUTIVE_BRIEF_MODEL || 'gpt-5.6-luna';
+const MAX_ATTACHMENT_BYTES = 45 * 1024 * 1024;
 
 // -----------------------------------------------------------------------------
 // Shared helpers
@@ -227,6 +236,402 @@ const getFullMinacoEmail = async (messageId) => {
   }
 
   return data;
+};
+
+
+// -----------------------------------------------------------------------------
+// Advanced mailbox search, attachments, and contact intelligence
+// -----------------------------------------------------------------------------
+
+const mailboxAddressFromKey = (mailbox = 'ramy') => {
+  const key = String(mailbox || 'ramy').trim().toLowerCase();
+  if (key === 'ramy' || key === 'executive' || key === 'inbox') {
+    return RAMY_MINACO_EMAIL;
+  }
+  if (key === 'accounting' || key === 'accounts' || key === 'finance') {
+    return ACCOUNTING_MAILBOX;
+  }
+  if (key === 'london' || key === 'assistant') {
+    return LONDON_MINACO_EMAIL;
+  }
+  if (key.includes('@')) return key;
+  throw new Error(`Unknown mailbox: ${mailbox}`);
+};
+
+const getRecentMailboxEmails = async (mailboxAddress, limit = 5) => {
+  if (!mailboxAddress) throw new Error('Mailbox address is required.');
+
+  const token = await getMicrosoftGraphToken();
+  const url = new URL(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      mailboxAddress
+    )}/mailFolders/inbox/messages`
+  );
+
+  url.searchParams.set('$top', String(Math.min(Math.max(Number(limit) || 5, 1), 25)));
+  url.searchParams.set(
+    '$select',
+    'id,subject,from,toRecipients,ccRecipients,receivedDateTime,bodyPreview,isRead,hasAttachments'
+  );
+  url.searchParams.set('$orderby', 'receivedDateTime desc');
+
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Microsoft Graph mailbox lookup failed for ${mailboxAddress}: ${
+        data.error?.message || response.status
+      }`
+    );
+  }
+
+  return data.value || [];
+};
+
+const getFullMailboxEmail = async (mailboxAddress, messageId) => {
+  if (!mailboxAddress || !messageId) {
+    throw new Error('Mailbox address and message id are required.');
+  }
+
+  const token = await getMicrosoftGraphToken();
+  const url = new URL(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      mailboxAddress
+    )}/messages/${encodeURIComponent(messageId)}`
+  );
+  url.searchParams.set(
+    '$select',
+    'id,conversationId,internetMessageId,subject,from,replyTo,toRecipients,ccRecipients,receivedDateTime,body,isRead,hasAttachments'
+  );
+
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Prefer: 'outlook.body-content-type="text"',
+    },
+  });
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Microsoft Graph full email lookup failed for ${mailboxAddress}: ${
+        data.error?.message || response.status
+      }`
+    );
+  }
+
+  return data;
+};
+
+const searchMailboxEmails = async ({
+  mailboxAddress,
+  query,
+  limit = 10,
+  startDate,
+  endDate,
+}) => {
+  if (!mailboxAddress) throw new Error('Mailbox address is required.');
+  const searchTerm = String(query || '').trim();
+  if (!searchTerm) throw new Error('An email search term is required.');
+
+  const token = await getMicrosoftGraphToken();
+  const requestedLimit = Math.min(Math.max(Number(limit) || 10, 1), 25);
+  const fetchLimit = Math.min(Math.max(requestedLimit * 4, 25), 100);
+
+  const url = new URL(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      mailboxAddress
+    )}/messages`
+  );
+  const escaped = searchTerm.replace(/"/g, '\\"');
+  url.searchParams.set('$search', `"${escaped}"`);
+  url.searchParams.set('$top', String(fetchLimit));
+  url.searchParams.set(
+    '$select',
+    'id,subject,from,toRecipients,ccRecipients,receivedDateTime,bodyPreview,isRead,hasAttachments'
+  );
+
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Microsoft Graph email search failed for ${mailboxAddress}: ${
+        data.error?.message || response.status
+      }`
+    );
+  }
+
+  let results = data.value || [];
+
+  if (startDate) {
+    const start = new Date(`${String(startDate).slice(0, 10)}T00:00:00Z`);
+    if (!Number.isNaN(start.getTime())) {
+      results = results.filter(
+        (email) => new Date(email.receivedDateTime).getTime() >= start.getTime()
+      );
+    }
+  }
+
+  if (endDate) {
+    const end = new Date(`${String(endDate).slice(0, 10)}T23:59:59Z`);
+    if (!Number.isNaN(end.getTime())) {
+      results = results.filter(
+        (email) => new Date(email.receivedDateTime).getTime() <= end.getTime()
+      );
+    }
+  }
+
+  return results.slice(0, requestedLimit);
+};
+
+const listMailboxEmailAttachments = async (mailboxAddress, messageId) => {
+  if (!mailboxAddress || !messageId) {
+    throw new Error('Mailbox address and message id are required.');
+  }
+
+  const token = await getMicrosoftGraphToken();
+  const url = new URL(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      mailboxAddress
+    )}/messages/${encodeURIComponent(messageId)}/attachments`
+  );
+  url.searchParams.set('$select', 'id,name,contentType,size,isInline');
+
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Microsoft Graph attachment list failed: ${
+        data.error?.message || response.status
+      }`
+    );
+  }
+
+  return (data.value || []).map((attachment, index) => ({
+    number: index + 1,
+    attachmentId: attachment.id,
+    name: attachment.name || 'Unnamed attachment',
+    contentType: attachment.contentType || '',
+    size: Number(attachment.size) || 0,
+    isInline: Boolean(attachment.isInline),
+    odataType: attachment['@odata.type'] || '',
+  }));
+};
+
+const getMailboxEmailAttachment = async (
+  mailboxAddress,
+  messageId,
+  attachmentId
+) => {
+  if (!mailboxAddress || !messageId || !attachmentId) {
+    throw new Error('Mailbox address, message id, and attachment id are required.');
+  }
+
+  const token = await getMicrosoftGraphToken();
+  const response = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      mailboxAddress
+    )}/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(
+      attachmentId
+    )}`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Microsoft Graph attachment retrieval failed: ${
+        data.error?.message || response.status
+      }`
+    );
+  }
+
+  return data;
+};
+
+const extractOpenAIResponseText = (data) => {
+  if (typeof data?.output_text === 'string' && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
+
+  const chunks = [];
+  for (const item of Array.isArray(data?.output) ? data.output : []) {
+    for (const content of Array.isArray(item?.content) ? item.content : []) {
+      if (content?.type === 'output_text' && typeof content.text === 'string') {
+        chunks.push(content.text);
+      }
+    }
+  }
+  return chunks.join('\n').trim();
+};
+
+const callOpenAIResponses = async (payload) => {
+  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not configured.');
+
+  const response = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(
+      `OpenAI Responses API failed: ${data.error?.message || response.status}`
+    );
+  }
+  return data;
+};
+
+const analyzeMailboxAttachment = async ({
+  mailboxAddress,
+  messageId,
+  attachmentId,
+  instruction,
+}) => {
+  const attachment = await getMailboxEmailAttachment(
+    mailboxAddress,
+    messageId,
+    attachmentId
+  );
+
+  const size = Number(attachment.size) || 0;
+  if (size > MAX_ATTACHMENT_BYTES) {
+    throw new Error(
+      `The attachment is too large for voice analysis (${Math.round(
+        size / 1024 / 1024
+      )} MB). The current limit is 45 MB.`
+    );
+  }
+
+  if (!attachment.contentBytes) {
+    throw new Error(
+      'This attachment type does not expose file bytes for direct analysis. File attachments such as PDF, Word, Excel, PowerPoint, text, and images are supported.'
+    );
+  }
+
+  const filename = attachment.name || 'attachment';
+  const contentType = attachment.contentType || 'application/octet-stream';
+  const dataUri = `data:${contentType};base64,${attachment.contentBytes}`;
+  const requestInstruction =
+    String(instruction || '').trim() ||
+    'Summarize this attachment accurately and identify any decisions, deadlines, amounts, risks, or actions that matter to Ramy.';
+
+  const content = [];
+  if (contentType.toLowerCase().startsWith('image/')) {
+    content.push({
+      type: 'input_image',
+      image_url: dataUri,
+      detail: 'auto',
+    });
+  } else {
+    content.push({
+      type: 'input_file',
+      filename,
+      file_data: dataUri,
+      detail: 'auto',
+    });
+  }
+  content.push({ type: 'input_text', text: requestInstruction });
+
+  const data = await callOpenAIResponses({
+    model: DOCUMENT_ANALYSIS_MODEL,
+    instructions:
+      'You are London Assistant analyzing a live Minaco email attachment for Ramy. Follow the user instruction exactly. Do not invent missing content. Preserve names, dates, amounts, legal terms, and material qualifiers. If asked to translate, translate the complete available document faithfully.',
+    input: [{ role: 'user', content }],
+  });
+
+  const result = extractOpenAIResponseText(data);
+  if (!result) throw new Error('The attachment analysis returned no text.');
+
+  return {
+    filename,
+    contentType,
+    size,
+    result,
+  };
+};
+
+const addAddressCandidate = (map, candidate, query) => {
+  const address = candidate?.emailAddress?.address || candidate?.address || '';
+  const name = candidate?.emailAddress?.name || candidate?.name || '';
+  if (!address) return;
+
+  const normalizedAddress = address.toLowerCase();
+  const q = String(query || '').trim().toLowerCase();
+  const normalizedName = name.toLowerCase();
+  const localPart = normalizedAddress.split('@')[0] || '';
+
+  let score = 0;
+  if (q === normalizedAddress || q === normalizedName) score = 100;
+  else if (normalizedName.startsWith(q) && q) score = 90;
+  else if (normalizedName.includes(q) && q) score = 80;
+  else if (localPart.includes(q.replace(/\s+/g, '.')) && q) score = 70;
+  else if (normalizedAddress.includes(q.replace(/\s+/g, '')) && q) score = 60;
+  else if (q && normalizedAddress.includes(q.split(/\s+/)[0])) score = 50;
+
+  if (score <= 0) return;
+
+  const existing = map.get(normalizedAddress);
+  if (!existing || score > existing.score) {
+    map.set(normalizedAddress, { name, address, score });
+  }
+};
+
+const resolvePersonFromMailHistory = async (query) => {
+  const q = String(query || '').trim();
+  if (!q) throw new Error('A person name or email is required.');
+
+  const candidates = new Map();
+
+  const verified = [
+    { name: 'Ramy Mina', address: RAMY_MINACO_EMAIL },
+    { name: 'London Assistant', address: LONDON_MINACO_EMAIL },
+    { name: 'Minaco Accounting', address: ACCOUNTING_MAILBOX },
+  ].filter((item) => item.address);
+
+  for (const item of verified) addAddressCandidate(candidates, item, q);
+
+  let messages = [];
+  try {
+    const [searched, recent] = await Promise.all([
+      searchMailboxEmails({
+        mailboxAddress: RAMY_MINACO_EMAIL,
+        query: q,
+        limit: 25,
+      }),
+      getRecentMailboxEmails(RAMY_MINACO_EMAIL, 25),
+    ]);
+    messages = [...searched, ...recent];
+  } catch (error) {
+    console.warn('Contact resolution mailbox search warning:', error.message);
+  }
+
+  for (const message of messages) {
+    addAddressCandidate(candidates, message.from, q);
+    for (const recipient of message.toRecipients || []) {
+      addAddressCandidate(candidates, recipient, q);
+    }
+    for (const recipient of message.ccRecipients || []) {
+      addAddressCandidate(candidates, recipient, q);
+    }
+  }
+
+  return [...candidates.values()]
+    .sort((a, b) => b.score - a.score || a.address.localeCompare(b.address))
+    .slice(0, 8);
 };
 
 const simplifyEmailRecipients = (recipients = []) =>
@@ -837,6 +1242,480 @@ const deleteCalendarEvent = async (eventId) => {
   return { success: true, eventId };
 };
 
+
+// -----------------------------------------------------------------------------
+// Persistent Master Action Register (stored in a dedicated Outlook calendar)
+// -----------------------------------------------------------------------------
+
+const ACTION_REGISTER_MARKER = 'LONDON_ACTION_V1';
+const ACTION_STATUSES = [
+  'NEW',
+  'ACTIVE',
+  'WAITING - EXTERNAL',
+  'WAITING - INTERNAL',
+  'WAITING - RAMY',
+  'BLOCKED',
+  'OVERDUE',
+  'COMPLETED',
+  'CANCELLED',
+];
+const ACTION_PRIORITIES = ['CRITICAL', 'HIGH', 'NORMAL', 'LOW'];
+
+const montrealDateParts = (date = new Date()) => {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: MONTREAL_IANA_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+  const values = {};
+  for (const part of parts) {
+    if (part.type !== 'literal') values[part.type] = part.value;
+  }
+  return `${values.year}-${values.month}-${values.day}`;
+};
+
+const addDaysToDateOnly = (dateString, days) => {
+  const match = String(dateString || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!match) return montrealDateParts();
+  const date = new Date(
+    Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + days)
+  );
+  return date.toISOString().slice(0, 10);
+};
+
+const normalizeActionStatus = (status) => {
+  if (!status) return 'NEW';
+  const normalized = String(status)
+    .trim()
+    .toUpperCase()
+    .replace(/[–—]/g, '-')
+    .replace(/\s+/g, ' ');
+  const aliases = {
+    WAITING: 'WAITING - EXTERNAL',
+    'WAITING EXTERNAL': 'WAITING - EXTERNAL',
+    'WAITING INTERNAL': 'WAITING - INTERNAL',
+    'WAITING RAMY': 'WAITING - RAMY',
+    DONE: 'COMPLETED',
+    COMPLETE: 'COMPLETED',
+    CANCELED: 'CANCELLED',
+  };
+  const mapped = aliases[normalized] || normalized;
+  return ACTION_STATUSES.includes(mapped) ? mapped : 'ACTIVE';
+};
+
+const normalizeActionPriority = (priority) => {
+  const normalized = String(priority || 'NORMAL').trim().toUpperCase();
+  return ACTION_PRIORITIES.includes(normalized) ? normalized : 'NORMAL';
+};
+
+let cachedActionCalendarId = null;
+
+const getOrCreateActionRegisterCalendar = async () => {
+  if (cachedActionCalendarId) return cachedActionCalendarId;
+  if (!RAMY_MINACO_EMAIL) throw new Error('RAMY_MINACO_EMAIL is not configured.');
+
+  const token = await getMicrosoftGraphActionsToken();
+  const listResponse = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      RAMY_MINACO_EMAIL
+    )}/calendars?$select=id,name`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  const listData = await listResponse.json();
+  if (!listResponse.ok) {
+    throw new Error(
+      `Could not list calendars for the action register: ${
+        listData.error?.message || listResponse.status
+      }`
+    );
+  }
+
+  const existing = (listData.value || []).find(
+    (calendar) =>
+      String(calendar.name || '').toLowerCase() ===
+      ACTION_REGISTER_CALENDAR_NAME.toLowerCase()
+  );
+  if (existing?.id) {
+    cachedActionCalendarId = existing.id;
+    return existing.id;
+  }
+
+  const createResponse = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      RAMY_MINACO_EMAIL
+    )}/calendars`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name: ACTION_REGISTER_CALENDAR_NAME }),
+    }
+  );
+  const createData = await createResponse.json();
+  if (!createResponse.ok) {
+    throw new Error(
+      `Could not create the action register calendar: ${
+        createData.error?.message || createResponse.status
+      }`
+    );
+  }
+
+  cachedActionCalendarId = createData.id;
+  return createData.id;
+};
+
+const actionAnchorDate = (action) => {
+  for (const candidate of [
+    action.nextFollowUp,
+    action.hardDeadline,
+    action.promisedDate,
+    action.dateOpened,
+  ]) {
+    const match = String(candidate || '').match(/^(\d{4}-\d{2}-\d{2})/);
+    if (match) return match[1];
+  }
+  return montrealDateParts();
+};
+
+const serializeActionBody = (action) =>
+  `${ACTION_REGISTER_MARKER}\n${JSON.stringify(action, null, 2)}`;
+
+const parseActionBody = (content) => {
+  const raw = String(content || '');
+  const markerIndex = raw.indexOf(ACTION_REGISTER_MARKER);
+  if (markerIndex < 0) return null;
+  const jsonStart = raw.indexOf('{', markerIndex + ACTION_REGISTER_MARKER.length);
+  if (jsonStart < 0) return null;
+  try {
+    return JSON.parse(raw.slice(jsonStart));
+  } catch {
+    return null;
+  }
+};
+
+const actionEventPayload = (action) => {
+  const anchor = actionAnchorDate(action);
+  const nextDay = addDaysToDateOnly(anchor, 1);
+  return {
+    subject: `[${normalizeActionPriority(action.priority)}] [${normalizeActionStatus(
+      action.status
+    )}] ${action.title}`,
+    body: {
+      contentType: 'Text',
+      content: serializeActionBody(action),
+    },
+    isAllDay: true,
+    showAs: 'free',
+    isReminderOn: false,
+    sensitivity: 'private',
+    start: {
+      dateTime: `${anchor}T00:00:00`,
+      timeZone: MICROSOFT_EASTERN_TIME_ZONE,
+    },
+    end: {
+      dateTime: `${nextDay}T00:00:00`,
+      timeZone: MICROSOFT_EASTERN_TIME_ZONE,
+    },
+  };
+};
+
+const createActionItem = async (input) => {
+  if (!input?.title) throw new Error('Action title is required.');
+  const calendarId = await getOrCreateActionRegisterCalendar();
+  const token = await getMicrosoftGraphActionsToken();
+  const now = new Date().toISOString();
+
+  const action = {
+    actionId: randomUUID(),
+    title: String(input.title).trim(),
+    project: String(input.project || '').trim(),
+    category: String(input.category || '').trim(),
+    owner: String(input.owner || 'London').trim(),
+    dateOpened: String(input.dateOpened || montrealDateParts()).slice(0, 10),
+    promisedDate: String(input.promisedDate || '').trim(),
+    hardDeadline: String(input.hardDeadline || '').trim(),
+    nextFollowUp: String(input.nextFollowUp || '').trim(),
+    status: normalizeActionStatus(input.status),
+    priority: normalizeActionPriority(input.priority),
+    lastContact: String(input.lastContact || '').trim(),
+    nextAction: String(input.nextAction || '').trim(),
+    waitingOn: String(input.waitingOn || '').trim(),
+    ramyRequired: Boolean(input.ramyRequired),
+    ramyDecisionBy: String(input.ramyDecisionBy || '').trim(),
+    riskIfDelayed: String(input.riskIfDelayed || '').trim(),
+    source: String(input.source || 'Voice').trim(),
+    notes: String(input.notes || '').trim(),
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const response = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      RAMY_MINACO_EMAIL
+    )}/calendars/${encodeURIComponent(calendarId)}/events`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Prefer: `outlook.timezone="${MICROSOFT_EASTERN_TIME_ZONE}"`,
+      },
+      body: JSON.stringify(actionEventPayload(action)),
+    }
+  );
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(
+      `Could not create action item: ${data.error?.message || response.status}`
+    );
+  }
+
+  return { eventId: data.id, ...action };
+};
+
+const listActionItems = async ({
+  status,
+  priority,
+  project,
+  owner,
+  onlyOverdue = false,
+  includeClosed = false,
+  limit = 100,
+} = {}) => {
+  const calendarId = await getOrCreateActionRegisterCalendar();
+  const token = await getMicrosoftGraphActionsToken();
+  let url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+    RAMY_MINACO_EMAIL
+  )}/calendars/${encodeURIComponent(
+    calendarId
+  )}/events?$top=100&$select=id,subject,body,start,end,lastModifiedDateTime`;
+
+  const events = [];
+  while (url && events.length < 500) {
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Prefer: 'outlook.body-content-type="text"',
+      },
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(
+        `Could not read action register: ${data.error?.message || response.status}`
+      );
+    }
+    events.push(...(data.value || []));
+    url = data['@odata.nextLink'] || null;
+  }
+
+  const today = montrealDateParts();
+  let actions = events
+    .map((event) => {
+      const meta = parseActionBody(event.body?.content);
+      if (!meta) return null;
+      const normalizedStatus = normalizeActionStatus(meta.status);
+      const isClosed = ['COMPLETED', 'CANCELLED'].includes(normalizedStatus);
+      const deadlineOverdue =
+        meta.hardDeadline && String(meta.hardDeadline).slice(0, 10) < today;
+      const followUpOverdue =
+        meta.nextFollowUp && String(meta.nextFollowUp).slice(0, 10) < today;
+      return {
+        eventId: event.id,
+        ...meta,
+        status: normalizedStatus,
+        priority: normalizeActionPriority(meta.priority),
+        overdue: !isClosed && Boolean(deadlineOverdue || followUpOverdue),
+        lastModifiedDateTime: event.lastModifiedDateTime,
+      };
+    })
+    .filter(Boolean);
+
+  if (!includeClosed) {
+    actions = actions.filter(
+      (action) => !['COMPLETED', 'CANCELLED'].includes(action.status)
+    );
+  }
+  if (status) {
+    const wanted = normalizeActionStatus(status);
+    actions = actions.filter((action) => action.status === wanted);
+  }
+  if (priority) {
+    const wanted = normalizeActionPriority(priority);
+    actions = actions.filter((action) => action.priority === wanted);
+  }
+  if (project) {
+    const q = String(project).toLowerCase();
+    actions = actions.filter((action) =>
+      String(action.project || '').toLowerCase().includes(q)
+    );
+  }
+  if (owner) {
+    const q = String(owner).toLowerCase();
+    actions = actions.filter((action) =>
+      String(action.owner || '').toLowerCase().includes(q)
+    );
+  }
+  if (onlyOverdue) actions = actions.filter((action) => action.overdue);
+
+  const priorityRank = { CRITICAL: 0, HIGH: 1, NORMAL: 2, LOW: 3 };
+  actions.sort((a, b) => {
+    if (a.overdue !== b.overdue) return a.overdue ? -1 : 1;
+    const pr = priorityRank[a.priority] - priorityRank[b.priority];
+    if (pr !== 0) return pr;
+    return String(a.hardDeadline || a.nextFollowUp || '9999-12-31').localeCompare(
+      String(b.hardDeadline || b.nextFollowUp || '9999-12-31')
+    );
+  });
+
+  return actions.slice(0, Math.min(Math.max(Number(limit) || 100, 1), 200));
+};
+
+const updateActionItem = async (eventId, changes = {}) => {
+  if (!eventId) throw new Error('An action event id is required.');
+  const calendarId = await getOrCreateActionRegisterCalendar();
+  const token = await getMicrosoftGraphActionsToken();
+
+  const getResponse = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      RAMY_MINACO_EMAIL
+    )}/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(
+      eventId
+    )}?$select=id,subject,body,start,end`,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Prefer: 'outlook.body-content-type="text"',
+      },
+    }
+  );
+  const current = await getResponse.json();
+  if (!getResponse.ok) {
+    throw new Error(
+      `Could not retrieve action item: ${current.error?.message || getResponse.status}`
+    );
+  }
+
+  const existing = parseActionBody(current.body?.content);
+  if (!existing) throw new Error('The selected event is not a London action item.');
+
+  const allowedFields = [
+    'title',
+    'project',
+    'category',
+    'owner',
+    'promisedDate',
+    'hardDeadline',
+    'nextFollowUp',
+    'status',
+    'priority',
+    'lastContact',
+    'nextAction',
+    'waitingOn',
+    'ramyRequired',
+    'ramyDecisionBy',
+    'riskIfDelayed',
+    'source',
+    'notes',
+  ];
+
+  const merged = { ...existing };
+  for (const field of allowedFields) {
+    if (Object.prototype.hasOwnProperty.call(changes, field)) {
+      merged[field] = changes[field];
+    }
+  }
+  merged.status = normalizeActionStatus(merged.status);
+  merged.priority = normalizeActionPriority(merged.priority);
+  merged.updatedAt = new Date().toISOString();
+
+  const response = await fetch(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      RAMY_MINACO_EMAIL
+    )}/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(
+      eventId
+    )}`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(actionEventPayload(merged)),
+    }
+  );
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(
+      `Could not update action item: ${data.error?.message || response.status}`
+    );
+  }
+
+  return { eventId: data.id || eventId, ...merged };
+};
+
+// -----------------------------------------------------------------------------
+// Daily executive brief
+// -----------------------------------------------------------------------------
+
+const compactEmailForBrief = (email) => ({
+  id: email.id,
+  from:
+    email.from?.emailAddress?.name || email.from?.emailAddress?.address || '',
+  fromEmail: email.from?.emailAddress?.address || '',
+  subject: email.subject || '(No subject)',
+  received: email.receivedDateTime || '',
+  unread: !email.isRead,
+  hasAttachments: Boolean(email.hasAttachments),
+  preview: email.bodyPreview || '',
+});
+
+const generateDailyExecutiveBrief = async () => {
+  const today = montrealDateParts();
+  const tomorrow = addDaysToDateOnly(today, 1);
+  const dayAfter = addDaysToDateOnly(today, 2);
+
+  const [calendarEvents, ramyEmails, accountingEmails, actions] = await Promise.all([
+    getCalendarEvents({
+      startLocal: `${today}T00:00:00`,
+      endLocal: `${dayAfter}T00:00:00`,
+      top: 30,
+    }),
+    getRecentMailboxEmails(RAMY_MINACO_EMAIL, 20),
+    getRecentMailboxEmails(ACCOUNTING_MAILBOX, 15).catch((error) => {
+      console.warn('Accounting brief lookup warning:', error.message);
+      return [];
+    }),
+    listActionItems({ includeClosed: false, limit: 100 }).catch((error) => {
+      console.warn('Action brief lookup warning:', error.message);
+      return [];
+    }),
+  ]);
+
+  const context = {
+    generatedAtMontreal: formatMontrealDateTime(new Date()),
+    today,
+    tomorrow,
+    calendar: calendarEvents,
+    executiveInbox: ramyEmails.map(compactEmailForBrief),
+    accountingInbox: accountingEmails.map(compactEmailForBrief),
+    actions,
+  };
+
+  const data = await callOpenAIResponses({
+    model: DAILY_BRIEF_MODEL,
+    instructions:
+      'You are London Assistant preparing Ramy Mina’s concise Minaco executive brief. Use ONLY the supplied live data. Prioritize: urgent decisions, deadlines/risks, financial or contractual consequences, today’s meetings, overdue actions, people waiting on Ramy, and important accounting items. Do not turn every email into an action. Clearly separate facts from recommended next actions. If a section has nothing important, omit it. Keep the brief compact enough to read by phone in about two minutes.',
+    input: `LIVE MINACO DATA:\n${JSON.stringify(context)}`,
+  });
+
+  const brief = extractOpenAIResponseText(data);
+  if (!brief) throw new Error('Daily executive brief returned no text.');
+  return brief;
+};
+
 // -----------------------------------------------------------------------------
 // Fastify / London voice configuration
 // -----------------------------------------------------------------------------
@@ -892,6 +1771,28 @@ Use send_confirmed_email ONLY after Ramy explicitly confirms the currently pendi
 Never claim an email or reply was sent unless the send tool confirms success.
 Never invent a recipient email address. If Ramy gives only a person's name for a new email and you do not have a verified email address, ask for the email address.
 
+
+ADVANCED EMAIL, ATTACHMENTS, AND CONTACTS
+
+Use search_email when Ramy asks you to find an older email, search by person/company/topic, or search a specific period. Search can target Ramy's mailbox or Accounting.
+Use check_accounting when Ramy asks about current invoices, statements, payment reminders, deposits, supplier credits, overdue notices, insurance, taxes, financing charges, or other accounting-mailbox items.
+Use read_accounting_email to retrieve the complete Accounting email body before translating, analyzing, or making conclusions from it.
+
+When an email has attachments, use list_email_attachments to identify the exact attachment. Use analyze_email_attachment when Ramy asks to open, summarize, translate, analyze, extract amounts/deadlines, or answer questions about an attachment. The attachment tool analyzes the actual file; never pretend you opened an attachment when you only saw its filename.
+
+Use resolve_person when Ramy gives a person's name but not an email address. It searches verified identities and Minaco email history. If one clear candidate is returned, use that verified address. If multiple plausible candidates are returned, ask Ramy which one he means. Never invent an address.
+
+MASTER ACTION & FOLLOW-UP REGISTER
+
+Use create_action when Ramy explicitly asks you to track, remember, follow up, add an action, or when he clearly instructs you that a business outcome must be monitored. Do not create action items merely because an email contains information.
+Use list_actions when Ramy asks what is overdue, what he is waiting for, what needs his decision, what London must follow up on, or for a project/action status.
+Use update_action when Ramy tells you an action changed, someone replied, a follow-up occurred, a deadline changed, an item is completed/cancelled, or the next action changes.
+The register fields are outcome, project, owner, dates, status, priority, next action, waiting on, Ramy requirement, risk, source, and notes. Preserve the distinction between promised date, hard deadline, and next follow-up.
+
+DAILY EXECUTIVE BRIEF
+
+Use daily_executive_brief when Ramy asks for his morning brief, daily brief, what needs his attention today, or an executive overview. It combines live calendar, executive email, Accounting email, and the action register. Never invent missing items.
+
 LIVE CALENDAR RULES
 
 Use check_calendar whenever Ramy asks what is on his calendar, what meetings he has, or asks about a specific date or period.
@@ -936,7 +1837,7 @@ If a question is materially ambiguous, ask one short clarification instead of gu
 
 AUTHORITY
 
-You may retrieve information, summarize, organize, prepare actions, send SMS when explicitly requested, send a confirmed email, and execute a confirmed calendar action through the authorized tools.
+You may retrieve information, summarize, translate, analyze attachments, organize and maintain the Master Action Register, prepare actions, send SMS when explicitly requested, send a confirmed email, and execute a confirmed calendar action through the authorized tools.
 Do not claim to have approved payments, signed contracts, committed Minaco to pricing, settled disputes, or made legal or financial decisions unless an authorized system actually performed that action.
 
 PHONE STYLE
@@ -968,7 +1869,50 @@ const SHOW_TIMING_MATH = false;
 const authorizedStreamTokens = new Map();
 
 fastify.get('/', async (request, reply) => {
-  reply.send({ message: 'London Assistant Twilio Media Stream Server is running!' });
+  reply.send({
+    message: 'London Assistant Twilio Media Stream Server is running!',
+    features: [
+      'voice',
+      'full email',
+      'email search',
+      'attachments',
+      'contact resolution',
+      'calendar',
+      'action register',
+      'accounting mailbox',
+      'daily executive brief',
+    ],
+  });
+});
+
+// Optional scheduled endpoint. Power Automate can POST here each morning.
+// Set DAILY_BRIEF_SECRET in Render and pass it as x-london-brief-secret.
+fastify.post('/daily-brief', async (request, reply) => {
+  try {
+    if (!DAILY_BRIEF_SECRET) {
+      return reply.code(503).send({
+        success: false,
+        error: 'DAILY_BRIEF_SECRET is not configured, so scheduled briefs are disabled.',
+      });
+    }
+
+    const suppliedSecret = request.headers['x-london-brief-secret'];
+    if (!suppliedSecret || suppliedSecret !== DAILY_BRIEF_SECRET) {
+      return reply.code(401).send({ success: false, error: 'Unauthorized.' });
+    }
+
+    const brief = await generateDailyExecutiveBrief();
+    await sendEmailFromLondon({
+      to: RAMY_MINACO_EMAIL,
+      subject: `London — Daily Executive Brief — ${montrealDateParts()}`,
+      body: brief,
+    });
+
+    return reply.send({ success: true, sentTo: RAMY_MINACO_EMAIL });
+  } catch (error) {
+    console.error('Scheduled daily brief error:', error);
+    return reply.code(500).send({ success: false, error: error.message });
+  }
 });
 
 fastify.all('/incoming-call', async (request, reply) => {
@@ -1204,6 +2148,236 @@ fastify.register(async (fastifyInstance) => {
                 name: 'send_confirmed_email',
                 description:
                   'Send the currently pending prepared email action, either a new London email or a reply from Ramy’s mailbox. Use ONLY after Ramy explicitly confirms by saying Send it or an unmistakable equivalent.',
+                parameters: {
+                  type: 'object',
+                  properties: {},
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'search_email',
+                description:
+                  'Search historical live email by person, company, subject, or keywords. Can search Ramy or Accounting. Use when the desired email may not be in the latest inbox list.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    mailbox: {
+                      type: 'string',
+                      enum: ['ramy', 'accounting'],
+                      description: 'Mailbox to search. Default ramy.',
+                    },
+                    query: {
+                      type: 'string',
+                      description: 'Person, company, subject, or keywords to search.',
+                    },
+                    start_date: {
+                      type: 'string',
+                      description: 'Optional start date YYYY-MM-DD.',
+                    },
+                    end_date: {
+                      type: 'string',
+                      description: 'Optional end date YYYY-MM-DD.',
+                    },
+                    limit: {
+                      type: 'integer',
+                      minimum: 1,
+                      maximum: 25,
+                      description: 'Maximum results. Default 10.',
+                    },
+                  },
+                  required: ['query'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'check_accounting',
+                description:
+                  'List current live emails in Minaco Accounting. Use for invoices, statements, payment reminders, deposits, supplier credits, overdue notices, insurance, taxes, financing charges, or other finance inbox questions.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    limit: {
+                      type: 'integer',
+                      minimum: 1,
+                      maximum: 20,
+                      description: 'Number of recent Accounting emails. Default 10.',
+                    },
+                  },
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'read_accounting_email',
+                description:
+                  'Retrieve the complete body and recipient details of a specific Minaco Accounting email.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    message_id: {
+                      type: 'string',
+                      description: 'Exact message id returned by check_accounting or search_email.',
+                    },
+                  },
+                  required: ['message_id'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'list_email_attachments',
+                description:
+                  'List the actual attachments on a specific live email. Use before opening or analyzing an attachment.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    mailbox: {
+                      type: 'string',
+                      enum: ['ramy', 'accounting'],
+                      description: 'Mailbox containing the email.',
+                    },
+                    message_id: {
+                      type: 'string',
+                      description: 'Exact email message id.',
+                    },
+                  },
+                  required: ['message_id'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'analyze_email_attachment',
+                description:
+                  'Open and analyze a real email file attachment. Use for PDF, Word, Excel, PowerPoint, text/code files, and images. Can summarize, translate, extract facts/amounts/deadlines, or answer questions about the attachment.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    mailbox: {
+                      type: 'string',
+                      enum: ['ramy', 'accounting'],
+                      description: 'Mailbox containing the email.',
+                    },
+                    message_id: {
+                      type: 'string',
+                      description: 'Exact email message id.',
+                    },
+                    attachment_id: {
+                      type: 'string',
+                      description: 'Exact attachment id returned by list_email_attachments.',
+                    },
+                    instruction: {
+                      type: 'string',
+                      description: 'What Ramy wants done with the attachment, e.g. summarize it, translate it into French, or extract all deadlines and amounts.',
+                    },
+                  },
+                  required: ['message_id', 'attachment_id', 'instruction'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'resolve_person',
+                description:
+                  'Resolve a person name to verified email candidates using Minaco identities and Ramy’s live email history. Use before sending email or inviting someone when Ramy gives only a name.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    query: {
+                      type: 'string',
+                      description: 'Person name or partial email address.',
+                    },
+                  },
+                  required: ['query'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'create_action',
+                description:
+                  'Create a persistent item in London’s Master Action & Follow-Up Register. Use when Ramy explicitly asks to track, remember, follow up, or monitor an outcome.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    title: { type: 'string', description: 'Action or outcome to track.' },
+                    project: { type: 'string', description: 'Project/property if applicable.' },
+                    category: { type: 'string', description: 'Category such as project, tenant, finance, legal, vendor, or admin.' },
+                    owner: { type: 'string', description: 'Person responsible. Default London.' },
+                    promised_date: { type: 'string', description: 'Promised date YYYY-MM-DD if someone committed to a date.' },
+                    hard_deadline: { type: 'string', description: 'True deadline YYYY-MM-DD if one exists.' },
+                    next_follow_up: { type: 'string', description: 'Next follow-up date YYYY-MM-DD.' },
+                    status: { type: 'string', description: 'NEW, ACTIVE, WAITING - EXTERNAL, WAITING - INTERNAL, WAITING - RAMY, BLOCKED, OVERDUE, COMPLETED, or CANCELLED.' },
+                    priority: { type: 'string', description: 'CRITICAL, HIGH, NORMAL, or LOW.' },
+                    next_action: { type: 'string', description: 'Concrete next action.' },
+                    waiting_on: { type: 'string', description: 'Who or what the action is waiting on.' },
+                    ramy_required: { type: 'boolean', description: 'Whether Ramy personally must act or decide.' },
+                    ramy_decision_by: { type: 'string', description: 'Date Ramy must decide by, YYYY-MM-DD.' },
+                    risk_if_delayed: { type: 'string', description: 'Consequence if delayed.' },
+                    source: { type: 'string', description: 'Source, e.g. voice, email subject, meeting.' },
+                    notes: { type: 'string', description: 'Concise history or context.' },
+                  },
+                  required: ['title'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'list_actions',
+                description:
+                  'Read London’s persistent Master Action & Follow-Up Register. Use for overdue items, waiting items, Ramy decisions, project follow-ups, or action status.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    status: { type: 'string', description: 'Optional status filter.' },
+                    priority: { type: 'string', description: 'Optional priority filter.' },
+                    project: { type: 'string', description: 'Optional project/property filter.' },
+                    owner: { type: 'string', description: 'Optional owner filter.' },
+                    only_overdue: { type: 'boolean', description: 'Return only overdue items.' },
+                    include_closed: { type: 'boolean', description: 'Include completed/cancelled items. Default false.' },
+                    limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Maximum items. Default 30.' },
+                  },
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'update_action',
+                description:
+                  'Update an existing Master Action Register item after a reply, follow-up, decision, deadline change, completion, cancellation, or change in next action.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    event_id: { type: 'string', description: 'Exact action event id returned by list_actions.' },
+                    title: { type: 'string' },
+                    project: { type: 'string' },
+                    category: { type: 'string' },
+                    owner: { type: 'string' },
+                    promised_date: { type: 'string' },
+                    hard_deadline: { type: 'string' },
+                    next_follow_up: { type: 'string' },
+                    status: { type: 'string' },
+                    priority: { type: 'string' },
+                    last_contact: { type: 'string' },
+                    next_action: { type: 'string' },
+                    waiting_on: { type: 'string' },
+                    ramy_required: { type: 'boolean' },
+                    ramy_decision_by: { type: 'string' },
+                    risk_if_delayed: { type: 'string' },
+                    source: { type: 'string' },
+                    notes: { type: 'string' },
+                  },
+                  required: ['event_id'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'daily_executive_brief',
+                description:
+                  'Generate Ramy’s live Minaco executive brief using calendar, Ramy inbox, Accounting inbox, and the Master Action Register. Use when he asks what needs attention today, for his morning brief, or daily executive overview.',
                 parameters: {
                   type: 'object',
                   properties: {},
@@ -1713,6 +2887,374 @@ fastify.register(async (fastifyInstance) => {
                 response.call_id,
                 { success: false, error: error.message },
                 'Tell Ramy the reply could not be prepared and state the returned error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'search_email'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const mailboxKey = args.mailbox || 'ramy';
+              const mailboxAddress = mailboxAddressFromKey(mailboxKey);
+              const emails = await searchMailboxEmails({
+                mailboxAddress,
+                query: args.query,
+                limit: args.limit || 10,
+                startDate: args.start_date,
+                endDate: args.end_date,
+              });
+
+              respondToToolCall(
+                response.call_id,
+                {
+                  success: true,
+                  mailbox: mailboxAddress,
+                  results: emails.map((email, index) => ({
+                    number: index + 1,
+                    messageId: email.id,
+                    from:
+                      email.from?.emailAddress?.name ||
+                      email.from?.emailAddress?.address ||
+                      'Unknown sender',
+                    fromEmail: email.from?.emailAddress?.address || '',
+                    subject: email.subject || '(No subject)',
+                    receivedTimeMontreal: email.receivedDateTime
+                      ? new Intl.DateTimeFormat('en-US', {
+                          timeZone: MONTREAL_IANA_TIME_ZONE,
+                          dateStyle: 'medium',
+                          timeStyle: 'short',
+                        }).format(new Date(email.receivedDateTime))
+                      : '',
+                    isRead: Boolean(email.isRead),
+                    hasAttachments: Boolean(email.hasAttachments),
+                    preview: email.bodyPreview || '',
+                  })),
+                },
+                'Use only these live search results. Identify the best matching email(s) by sender, subject, date, and preview. If multiple results are plausible, ask Ramy which one he means instead of guessing.'
+              );
+            } catch (error) {
+              console.error('Historical email search error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the email search failed and state the returned error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'check_accounting'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const limit = Math.min(Math.max(Number(args.limit) || 10, 1), 20);
+              const emails = await getRecentMailboxEmails(ACCOUNTING_MAILBOX, limit);
+              respondToToolCall(
+                response.call_id,
+                {
+                  success: true,
+                  mailbox: ACCOUNTING_MAILBOX,
+                  emails: emails.map((email, index) => ({
+                    number: index + 1,
+                    messageId: email.id,
+                    from:
+                      email.from?.emailAddress?.name ||
+                      email.from?.emailAddress?.address ||
+                      'Unknown sender',
+                    fromEmail: email.from?.emailAddress?.address || '',
+                    subject: email.subject || '(No subject)',
+                    receivedTimeMontreal: email.receivedDateTime
+                      ? new Intl.DateTimeFormat('en-US', {
+                          timeZone: MONTREAL_IANA_TIME_ZONE,
+                          dateStyle: 'medium',
+                          timeStyle: 'short',
+                        }).format(new Date(email.receivedDateTime))
+                      : '',
+                    isRead: Boolean(email.isRead),
+                    hasAttachments: Boolean(email.hasAttachments),
+                    preview: email.bodyPreview || '',
+                  })),
+                },
+                'Summarize only the live Accounting inbox results. Prioritize invoices, statements, overdue notices, payment deadlines, deposits, credits, insurance, taxes, financing charges, unusual amounts, or anything requiring Ramy’s attention. Do not authorize payment.'
+              );
+            } catch (error) {
+              console.error('Accounting mailbox lookup error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the Accounting mailbox lookup failed and state the returned error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'read_accounting_email'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const email = await getFullMailboxEmail(
+                ACCOUNTING_MAILBOX,
+                args.message_id
+              );
+              respondToToolCall(
+                response.call_id,
+                {
+                  success: true,
+                  mailbox: ACCOUNTING_MAILBOX,
+                  messageId: email.id,
+                  subject: email.subject || '(No subject)',
+                  from: {
+                    name: email.from?.emailAddress?.name || '',
+                    address: email.from?.emailAddress?.address || '',
+                  },
+                  toRecipients: simplifyEmailRecipients(email.toRecipients),
+                  ccRecipients: simplifyEmailRecipients(email.ccRecipients),
+                  receivedTimeMontreal: email.receivedDateTime
+                    ? new Intl.DateTimeFormat('en-US', {
+                        timeZone: MONTREAL_IANA_TIME_ZONE,
+                        dateStyle: 'medium',
+                        timeStyle: 'short',
+                      }).format(new Date(email.receivedDateTime))
+                    : '',
+                  hasAttachments: Boolean(email.hasAttachments),
+                  fullBody: email.body?.content || '',
+                },
+                'Use the complete live Accounting email body. Preserve amounts, dates, invoice numbers, deadlines, and material conditions. Do not infer that a payment is approved.'
+              );
+            } catch (error) {
+              console.error('Accounting full email lookup error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the Accounting email could not be retrieved and state the error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'list_email_attachments'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const mailboxAddress = mailboxAddressFromKey(args.mailbox || 'ramy');
+              const attachments = await listMailboxEmailAttachments(
+                mailboxAddress,
+                args.message_id
+              );
+              respondToToolCall(
+                response.call_id,
+                { success: true, mailbox: mailboxAddress, attachments },
+                'Tell Ramy which real attachments are available, with filename and approximate size. Ignore inline signature images unless he asks for them. If there are no attachments, say so.'
+              );
+            } catch (error) {
+              console.error('Attachment list error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the attachment list could not be retrieved and state the error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'analyze_email_attachment'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const mailboxAddress = mailboxAddressFromKey(args.mailbox || 'ramy');
+              const analysis = await analyzeMailboxAttachment({
+                mailboxAddress,
+                messageId: args.message_id,
+                attachmentId: args.attachment_id,
+                instruction: args.instruction,
+              });
+              respondToToolCall(
+                response.call_id,
+                { success: true, mailbox: mailboxAddress, ...analysis },
+                'Answer Ramy using the actual attachment analysis returned by the tool. If he requested translation, provide that translation. If the result is long, start with the requested answer and offer to continue reading rather than inventing or omitting material facts.'
+              );
+            } catch (error) {
+              console.error('Attachment analysis error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the attachment could not be analyzed and state the returned error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'resolve_person'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const candidates = await resolvePersonFromMailHistory(args.query);
+              respondToToolCall(
+                response.call_id,
+                { success: true, query: args.query, candidates },
+                'Use these verified email candidates only. If there is one clearly matching candidate, state the name and address and continue the requested workflow. If there are multiple plausible candidates or no candidate, ask one short clarification. Never invent an email address.'
+              );
+            } catch (error) {
+              console.error('Person resolution error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the contact could not be resolved from verified Minaco data and ask for the email address if needed.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'create_action'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const action = await createActionItem({
+                title: args.title,
+                project: args.project,
+                category: args.category,
+                owner: args.owner,
+                promisedDate: args.promised_date,
+                hardDeadline: args.hard_deadline,
+                nextFollowUp: args.next_follow_up,
+                status: args.status,
+                priority: args.priority,
+                nextAction: args.next_action,
+                waitingOn: args.waiting_on,
+                ramyRequired: args.ramy_required,
+                ramyDecisionBy: args.ramy_decision_by,
+                riskIfDelayed: args.risk_if_delayed,
+                source: args.source,
+                notes: args.notes,
+              });
+              respondToToolCall(
+                response.call_id,
+                { success: true, action },
+                'Confirm briefly that London is now tracking the action. Mention the outcome, owner, next follow-up or deadline if present, and whether Ramy is required. Do not over-explain.'
+              );
+            } catch (error) {
+              console.error('Create action error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the action could not be added to the register and state the error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'list_actions'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const actions = await listActionItems({
+                status: args.status,
+                priority: args.priority,
+                project: args.project,
+                owner: args.owner,
+                onlyOverdue: Boolean(args.only_overdue),
+                includeClosed: Boolean(args.include_closed),
+                limit: Math.min(Math.max(Number(args.limit) || 30, 1), 100),
+              });
+              respondToToolCall(
+                response.call_id,
+                { success: true, actions },
+                'Summarize the live action register based on Ramy’s question. Prioritize overdue, critical/high, WAITING - RAMY, hard deadlines, and next follow-ups. Mention eventId only if a follow-up tool action needs it; do not read technical ids aloud unnecessarily.'
+              );
+            } catch (error) {
+              console.error('List actions error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the action register could not be read and state the error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'update_action'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const changes = {};
+              const mapping = {
+                title: 'title',
+                project: 'project',
+                category: 'category',
+                owner: 'owner',
+                promised_date: 'promisedDate',
+                hard_deadline: 'hardDeadline',
+                next_follow_up: 'nextFollowUp',
+                status: 'status',
+                priority: 'priority',
+                last_contact: 'lastContact',
+                next_action: 'nextAction',
+                waiting_on: 'waitingOn',
+                ramy_required: 'ramyRequired',
+                ramy_decision_by: 'ramyDecisionBy',
+                risk_if_delayed: 'riskIfDelayed',
+                source: 'source',
+                notes: 'notes',
+              };
+              for (const [inputKey, targetKey] of Object.entries(mapping)) {
+                if (Object.prototype.hasOwnProperty.call(args, inputKey)) {
+                  changes[targetKey] = args[inputKey];
+                }
+              }
+              const action = await updateActionItem(args.event_id, changes);
+              respondToToolCall(
+                response.call_id,
+                { success: true, action },
+                'Confirm the action register was updated. Mention the new status, next action, follow-up/deadline, or waiting party that changed. Be brief.'
+              );
+            } catch (error) {
+              console.error('Update action error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the action could not be updated and state the error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'daily_executive_brief'
+          ) {
+            try {
+              const brief = await generateDailyExecutiveBrief();
+              respondToToolCall(
+                response.call_id,
+                { success: true, brief },
+                'Read the executive brief naturally and concisely. Lead with anything requiring Ramy’s immediate decision or carrying deadline/financial/legal/project risk. Do not add facts not in the brief.'
+              );
+            } catch (error) {
+              console.error('Daily brief error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the daily executive brief could not be generated and state the error concisely.'
               );
             }
             return;
