@@ -279,7 +279,7 @@ fastify.get('/', async (request, reply) => {
 // <Say> punctuation to improve text-to-speech translation
 fastify.all('/incoming-call', async (request, reply) => {
   const caller = request.body?.From || request.query?.From;
-
+console.log('CALL SECURITY CHECK:', { caller, authorized: caller === RAMY_PHONE_NUMBER });
 if (!caller || caller !== RAMY_PHONE_NUMBER) {
   const deniedResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
