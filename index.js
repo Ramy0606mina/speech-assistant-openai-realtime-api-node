@@ -278,7 +278,18 @@ fastify.get('/', async (request, reply) => {
 // Route for Twilio to handle incoming calls
 // <Say> punctuation to improve text-to-speech translation
 fastify.all('/incoming-call', async (request, reply) => {
-    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
+  const caller = request.body?.From || request.query?.From;
+
+if (!caller || caller !== RAMY_PHONE_NUMBER) {
+  const deniedResponse = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Sorry, this line is private.</Say>
+  <Hangup/>
+</Response>`;
+
+  return reply.type('text/xml').send(deniedResponse);
+}  
+  const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
                           <Response>
                               <Say voice="Google.en-US-Chirp3-HD-Aoede">Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open A I Realtime API</Say>
                               <Pause length="1"/>
