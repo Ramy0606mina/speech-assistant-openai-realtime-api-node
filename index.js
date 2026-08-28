@@ -141,6 +141,7 @@ const getMicrosoftGraphActionsToken = async () => {
         'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: form.toString(),
+      signal: AbortSignal.timeout(12000),
     }
   );
 
@@ -966,6 +967,7 @@ const fetchCalendarView = async ({ startUtc, endUtc, top = 50 }) => {
       Authorization: `Bearer ${token}`,
       Prefer: `outlook.timezone="${MICROSOFT_EASTERN_TIME_ZONE}"`,
     },
+    signal: AbortSignal.timeout(12000),
   });
 
   const data = await response.json();
@@ -1027,6 +1029,140 @@ const checkCalendarAvailability = async ({ startLocal, endLocal }) => {
     endLocal: normalizedEnd,
     available: conflicts.length === 0,
     conflicts,
+  };
+};
+
+const parseLocalDateTimePseudoMs = (value) => {
+  const normalized = ensureLocalDateTime(value, 'local_date_time');
+  const match = normalized.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/
+  );
+  if (!match) throw new Error('Invalid local date/time.');
+  const [, year, month, day, hour, minute, second] = match;
+  return Date.UTC(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hour),
+    Number(minute),
+    Number(second)
+  );
+};
+
+const addDaysToLocalDate = (dateString, days) => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateString || ''))) {
+    throw new Error('Date must use YYYY-MM-DD.');
+  }
+  const [year, month, day] = dateString.split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  date.setUTCDate(date.getUTCDate() + Number(days || 0));
+  return date.toISOString().slice(0, 10);
+};
+
+const validateClockTime = (value, label) => {
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(String(value || ''))) {
+    throw new Error(`${label} must use HH:mm in 24-hour Montreal local time.`);
+  }
+  return value;
+};
+
+const findCalendarAvailability = async ({
+  startDate,
+  endDate,
+  durationMinutes = 30,
+  dayStart = '09:00',
+  dayEnd = '17:00',
+  maxSlots = 5,
+  includeWeekends = false,
+}) => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(startDate || ''))) {
+    throw new Error('start_date must use YYYY-MM-DD.');
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(endDate || ''))) {
+    throw new Error('end_date must use YYYY-MM-DD.');
+  }
+
+  validateClockTime(dayStart, 'day_start');
+  validateClockTime(dayEnd, 'day_end');
+
+  const duration = Math.min(Math.max(Number(durationMinutes) || 30, 15), 240);
+  const limit = Math.min(Math.max(Number(maxSlots) || 5, 1), 12);
+
+  const rangeStartLocal = `${startDate}T00:00:00`;
+  const dayAfterEnd = addDaysToLocalDate(endDate, 1);
+  const rangeEndLocal = `${dayAfterEnd}T00:00:00`;
+
+  const rangeStartMs = parseLocalDateTimePseudoMs(rangeStartLocal);
+  const rangeEndMs = parseLocalDateTimePseudoMs(rangeEndLocal);
+  if (rangeEndMs <= rangeStartMs) {
+    throw new Error('end_date must be on or after start_date.');
+  }
+  if (rangeEndMs - rangeStartMs > 31 * 24 * 60 * 60 * 1000) {
+    throw new Error('Availability searches are limited to 31 days at a time.');
+  }
+
+  const events = (
+    await fetchCalendarView({
+      startUtc: montrealLocalToUtcIso(rangeStartLocal),
+      endUtc: montrealLocalToUtcIso(rangeEndLocal),
+      top: 100,
+    })
+  )
+    .map(simplifyCalendarEvent)
+    .filter((event) => !event.isCancelled && event.showAs !== 'free')
+    .map((event) => ({
+      ...event,
+      startMs: parseLocalDateTimePseudoMs(event.startLocal),
+      endMs: parseLocalDateTimePseudoMs(event.endLocal),
+    }));
+
+  const slots = [];
+  let currentDate = startDate;
+  while (currentDate <= endDate && slots.length < limit) {
+    const [year, month, day] = currentDate.split('-').map(Number);
+    const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+    const isWeekend = weekday === 0 || weekday === 6;
+
+    if (includeWeekends || !isWeekend) {
+      const windowStart = `${currentDate}T${dayStart}:00`;
+      const windowEnd = `${currentDate}T${dayEnd}:00`;
+      let cursorMs = parseLocalDateTimePseudoMs(windowStart);
+      const windowEndMs = parseLocalDateTimePseudoMs(windowEnd);
+      const durationMs = duration * 60 * 1000;
+      const stepMs = 30 * 60 * 1000;
+
+      while (cursorMs + durationMs <= windowEndMs && slots.length < limit) {
+        const candidateEndMs = cursorMs + durationMs;
+        const conflict = events.some(
+          (event) => event.startMs < candidateEndMs && event.endMs > cursorMs
+        );
+
+        if (!conflict) {
+          const startIso = new Date(cursorMs).toISOString().slice(0, 19);
+          const endIso = new Date(candidateEndMs).toISOString().slice(0, 19);
+          slots.push({
+            startLocal: startIso,
+            endLocal: endIso,
+            startMontreal: formatGraphEasternDateTime(startIso),
+            endMontreal: formatGraphEasternDateTime(endIso),
+            durationMinutes: duration,
+          });
+        }
+        cursorMs += stepMs;
+      }
+    }
+
+    currentDate = addDaysToLocalDate(currentDate, 1);
+  }
+
+  return {
+    startDate,
+    endDate,
+    durationMinutes: duration,
+    dayStart,
+    dayEnd,
+    includeWeekends: Boolean(includeWeekends),
+    slots,
   };
 };
 
@@ -2155,8 +2291,21 @@ Use daily_executive_brief when Ramy asks for his morning brief, daily brief, wha
 LIVE CALENDAR RULES
 
 Use check_calendar whenever Ramy asks what is on his calendar, what meetings he has, or asks about a specific date or period.
-Use check_availability whenever Ramy asks whether he is free at a particular time.
+Use check_availability whenever Ramy asks whether he is free at one specific time.
+Use find_availability whenever Ramy asks for several possible times, asks for his availability over a day/week/date range, or asks you to reply to someone with his availability. Do NOT ask Ramy to tell you his availability when his live calendar can answer it.
+If no meeting duration is stated for an availability request, default to 30 minutes. Unless Ramy or the email specifies otherwise, search normal business hours from 9:00 AM to 5:00 PM Montreal time and offer 3 to 5 useful slots. Respect any duration, day, or time constraints stated in the email or by Ramy.
 All spoken calendar times are Montreal local time unless Ramy explicitly specifies another time zone.
+If Ramy asks whether you have calendar access, answer directly that you have live access to his Minaco calendar through the authorized calendar tools. Do not call a tool merely to explain that access.
+
+CALENDAR-AWARE EMAIL TASKS
+
+If Ramy asks you to respond to someone and provide his availability, complete the workflow yourself using live systems:
+1. Identify the exact email. If he names the sender, use that name to identify/search the live email rather than asking Ramy for the email address if the message can be found.
+2. Read the full email when its contents or requested meeting constraints matter.
+3. Use find_availability for the requested period and derive suitable open slots from Ramy's live calendar.
+4. Prepare the reply using those actual available times.
+5. Read back the reply and wait for Ramy's explicit "Send it" confirmation before sending.
+If Ramy says "respond to Francis", "reply to Joannie", or otherwise names the person he wants to answer, treat that as reply-to-sender unless he explicitly asks for reply-all. If he only says "reply to this email" or "respond to this message" and the intended scope is unclear, ask sender-only or reply-all.
 
 For a NEW meeting:
 1. Gather subject, Montreal start time, Montreal end time or duration, and attendee email addresses if attendees are required.
@@ -2193,6 +2342,8 @@ Your role is to reduce Ramy's workload. Be concise, practical, commercially awar
 Prioritize decisions, deadlines and risks, financial or contractual consequences, commitments, follow-ups, then routine information.
 Do not overwhelm Ramy with unnecessary detail.
 If a question is materially ambiguous, ask one short clarification instead of guessing.
+When Ramy gives you a task that can be resolved from connected systems, use the tools yourself instead of asking him for information those systems can provide. Ask Ramy only for a genuinely missing required fact that cannot be retrieved or safely inferred.
+For a multi-step task, acknowledge it in one short natural phrase such as "I'll check that and prepare it," then proceed. Do not leave Ramy wondering whether you understood the task.
 
 AUTHORITY
 
@@ -2201,7 +2352,11 @@ Do not claim to have approved payments, signed contracts, committed Minaco to pr
 
 PHONE STYLE
 
-You are speaking with Ramy by phone. Speak naturally and keep most answers short unless Ramy asks for detail.
+You are speaking with Ramy by phone.
+Speak naturally at a calm executive-assistant pace, roughly 10 to 15 percent slower than a fast conversational assistant. Use short sentences, clear punctuation, and small natural pauses between ideas. Slow down slightly when reading names, dates, dollar amounts, email addresses, meeting times, and action items.
+Do not rush to answer while Ramy is still forming a sentence. Allow normal hesitations and short pauses. Listen for the full thought before responding.
+If Ramy begins speaking while you are talking, stop and listen rather than talking over him.
+Keep most answers short unless Ramy asks for detail.
 Accuracy is more important than sounding helpful.
 `;
 
@@ -2387,7 +2542,12 @@ fastify.register(async (fastifyInstance) => {
             audio: {
               input: {
                 format: { type: 'audio/pcmu' },
-                turn_detection: { type: 'server_vad' },
+                turn_detection: {
+                  type: 'semantic_vad',
+                  eagerness: 'high',
+                  create_response: true,
+                  interrupt_response: true,
+                },
               },
               output: {
                 format: { type: 'audio/pcmu' },
@@ -2792,6 +2952,51 @@ fastify.register(async (fastifyInstance) => {
                     },
                   },
                   required: ['start_local', 'end_local'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'find_availability',
+                description:
+                  'Find several real open time slots from Ramy’s live Minaco calendar across a Montreal-local date range. Use for questions such as what times am I available next week, give someone my availability, or find a few meeting options. Do not ask Ramy to state availability when this tool can calculate it.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    start_date: {
+                      type: 'string',
+                      description: 'First Montreal local date in YYYY-MM-DD.',
+                    },
+                    end_date: {
+                      type: 'string',
+                      description: 'Last Montreal local date in YYYY-MM-DD, inclusive.',
+                    },
+                    duration_minutes: {
+                      type: 'integer',
+                      minimum: 15,
+                      maximum: 240,
+                      description: 'Required meeting duration. Default 30 minutes if unspecified.',
+                    },
+                    day_start: {
+                      type: 'string',
+                      description: 'Earliest acceptable local time in HH:mm. Default 09:00.',
+                    },
+                    day_end: {
+                      type: 'string',
+                      description: 'Latest acceptable local ending boundary in HH:mm. Default 17:00.',
+                    },
+                    max_slots: {
+                      type: 'integer',
+                      minimum: 1,
+                      maximum: 12,
+                      description: 'Maximum open slots to return. Default 5.',
+                    },
+                    include_weekends: {
+                      type: 'boolean',
+                      description: 'Whether Saturday and Sunday may be offered. Default false.',
+                    },
+                  },
+                  required: ['start_date', 'end_date'],
                   additionalProperties: false,
                 },
               },
@@ -3681,6 +3886,38 @@ fastify.register(async (fastifyInstance) => {
                 response.call_id,
                 { success: false, error: error.message },
                 'Tell Ramy the availability check failed and state the returned error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'find_availability'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const result = await findCalendarAvailability({
+                startDate: args.start_date,
+                endDate: args.end_date,
+                durationMinutes: args.duration_minutes ?? 30,
+                dayStart: args.day_start || '09:00',
+                dayEnd: args.day_end || '17:00',
+                maxSlots: args.max_slots ?? 5,
+                includeWeekends: Boolean(args.include_weekends),
+              });
+
+              respondToToolCall(
+                response.call_id,
+                { success: true, timezone: 'Montreal local time', ...result },
+                'Use only these live calendar results. Give Ramy the best 3 to 5 available slots unless he asked for a different number. If this tool is being used to prepare an email reply, continue the reply workflow using these exact available times instead of asking Ramy what his availability is. If there are no slots, say so and ask whether to widen the hours or dates.'
+              );
+            } catch (error) {
+              console.error('Availability range search error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the live calendar availability search failed and state the returned error concisely. Do not freeze or pretend availability was found.'
               );
             }
             return;
