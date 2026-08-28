@@ -1102,14 +1102,31 @@ const montrealLocalToUtcIso = (localDateTime) => {
   return actualUtc.toISOString();
 };
 
+const normalizeGraphLocalDateTime = (value) => {
+  const text = String(value || '').trim();
+  const match = text.match(
+    /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2}))?(?:\.\d+)?$/
+  );
+  if (!match) return text;
+  return `${match[1]}:${match[2] || '00'}`;
+};
+
 const ensureLocalDateTime = (value, label) => {
-  if (
-    typeof value !== 'string' ||
-    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$/.test(value)
-  ) {
+  if (typeof value !== 'string') {
     throw new Error(`${label} must use YYYY-MM-DDTHH:mm:ss Montreal local time.`);
   }
-  return value.length === 16 ? `${value}:00` : value;
+
+  // Microsoft Graph commonly returns Outlook dateTime values with fractional
+  // seconds (for example 2026-09-02T13:30:00.0000000). They still represent
+  // Montreal-local wall time because calendar requests use the Outlook
+  // Eastern time-zone preference. Normalize those values before validating.
+  const normalized = normalizeGraphLocalDateTime(value);
+
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(normalized)) {
+    throw new Error(`${label} must use YYYY-MM-DDTHH:mm:ss Montreal local time.`);
+  }
+
+  return normalized;
 };
 
 const normalizeAttendeeEmails = (attendees = []) => {
@@ -1126,8 +1143,11 @@ const normalizeAttendeeEmails = (attendees = []) => {
 const simplifyCalendarEvent = (event) => ({
   id: event.id,
   subject: event.subject || '(No subject)',
-  startLocal: event.start?.dateTime || '',
-  endLocal: event.end?.dateTime || '',
+  // Normalize Graph's fractional-second Outlook timestamps once at the edge
+  // so every downstream availability calculation receives a stable local
+  // YYYY-MM-DDTHH:mm:ss value.
+  startLocal: normalizeGraphLocalDateTime(event.start?.dateTime || ''),
+  endLocal: normalizeGraphLocalDateTime(event.end?.dateTime || ''),
   startMontreal: formatGraphEasternDateTime(event.start?.dateTime),
   endMontreal: formatGraphEasternDateTime(event.end?.dateTime),
   location: event.location?.displayName || '',
@@ -4682,7 +4702,7 @@ fastify.register(async (fastifyInstance) => {
               respondToToolCall(
                 response.call_id,
                 { success: false, error: error.message },
-                'Tell Ramy the next-week reply workflow failed and state the exact technical error in one sentence. Do not ask him to provide calendar availability or calculate dates.'
+                'Tell Ramy the next-week reply workflow failed and state the exact technical error in one sentence. Do not ask him to provide calendar availability, dates, or Francis's email address. Stay ready for another command.'
               );
             }
             return;
