@@ -1112,6 +1112,130 @@ const validateClockTime = (value, label) => {
   return value;
 };
 
+const normalizeDateOnly = (value) => {
+  const match = String(value || '').trim().match(/^(\d{4}-\d{2}-\d{2})(?:T.*)?$/);
+  return match ? match[1] : '';
+};
+
+const weekdayForDateOnly = (dateString) => {
+  const normalized = normalizeDateOnly(dateString);
+  if (!normalized) throw new Error('Invalid date.');
+  const [year, month, day] = normalized.split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+};
+
+const resolveAvailabilityDateRange = ({
+  startDate,
+  endDate,
+  dateRangeText,
+} = {}) => {
+  const rawStart = String(startDate || '').trim();
+  const rawEnd = String(endDate || '').trim();
+  const normalizedStart = normalizeDateOnly(rawStart);
+  const normalizedEnd = normalizeDateOnly(rawEnd);
+
+  // If the model already supplied real dates, trust them after normalization.
+  if (normalizedStart && normalizedEnd) {
+    if (normalizedEnd < normalizedStart) {
+      throw new Error('The availability end date is before the start date.');
+    }
+    return {
+      startDate: normalizedStart,
+      endDate: normalizedEnd,
+      source: 'explicit_dates',
+    };
+  }
+
+  if (normalizedStart && !rawEnd) {
+    return {
+      startDate: normalizedStart,
+      endDate: normalizedStart,
+      source: 'single_explicit_date',
+    };
+  }
+
+  // If a relative phrase accidentally arrived in start_date/end_date, recover it.
+  const phrase = String(
+    dateRangeText ||
+      (!normalizedStart && rawStart ? rawStart : '') ||
+      (!normalizedEnd && rawEnd ? rawEnd : '') ||
+      ''
+  )
+    .trim()
+    .toLowerCase()
+    .replace(/[–—]/g, '-')
+    .replace(/\s+/g, ' ');
+
+  const today = montrealDateParts();
+  const todayWeekday = weekdayForDateOnly(today); // Sun=0, Mon=1 ... Sat=6
+
+  if (!phrase) {
+    throw new Error(
+      'No usable availability date range was provided. Use YYYY-MM-DD dates or a phrase such as "next week".'
+    );
+  }
+
+  if (phrase === 'today') {
+    return { startDate: today, endDate: today, source: 'today' };
+  }
+
+  if (phrase === 'tomorrow') {
+    const tomorrow = addDaysToLocalDate(today, 1);
+    return { startDate: tomorrow, endDate: tomorrow, source: 'tomorrow' };
+  }
+
+  if (
+    phrase === 'next week' ||
+    phrase === 'next business week' ||
+    phrase === 'the next week' ||
+    phrase === 'following week' ||
+    phrase === 'the following week'
+  ) {
+    // Always resolve to the next Monday-Friday in Montreal.
+    let daysUntilNextMonday = (8 - todayWeekday) % 7;
+    if (daysUntilNextMonday === 0) daysUntilNextMonday = 7;
+    const monday = addDaysToLocalDate(today, daysUntilNextMonday);
+    const friday = addDaysToLocalDate(monday, 4);
+    return { startDate: monday, endDate: friday, source: 'next_week' };
+  }
+
+  if (phrase === 'this week' || phrase === 'the rest of this week') {
+    if (todayWeekday >= 1 && todayWeekday <= 5) {
+      const friday = addDaysToLocalDate(today, 5 - todayWeekday);
+      return { startDate: today, endDate: friday, source: 'this_week' };
+    }
+    // On a weekend, use the immediately upcoming Monday-Friday.
+    const daysUntilMonday = todayWeekday === 6 ? 2 : 1;
+    const monday = addDaysToLocalDate(today, daysUntilMonday);
+    const friday = addDaysToLocalDate(monday, 4);
+    return { startDate: monday, endDate: friday, source: 'this_week_weekend' };
+  }
+
+  const nextDaysMatch = phrase.match(/^next\s+(\d{1,2})\s+days?$/);
+  if (nextDaysMatch) {
+    const count = Math.min(Math.max(Number(nextDaysMatch[1]), 1), 31);
+    return {
+      startDate: today,
+      endDate: addDaysToLocalDate(today, count - 1),
+      source: 'next_n_days',
+    };
+  }
+
+  // Also accept an explicit date range supplied as text.
+  const explicitTextRange = phrase.match(
+    /^(\d{4}-\d{2}-\d{2})\s*(?:to|through|thru|-)\s*(\d{4}-\d{2}-\d{2})$/
+  );
+  if (explicitTextRange) {
+    const [, first, last] = explicitTextRange;
+    if (last < first) throw new Error('The availability end date is before the start date.');
+    return { startDate: first, endDate: last, source: 'text_date_range' };
+  }
+
+  throw new Error(
+    `Could not resolve availability date range "${phrase}". Say "next week", "this week", "today", "tomorrow", "next N days", or provide YYYY-MM-DD dates.`
+  );
+};
+
 const findCalendarAvailability = async ({
   startDate,
   endDate,
@@ -1216,6 +1340,7 @@ const buildAvailabilityReplyDraft = async ({
   personQuery,
   startDate,
   endDate,
+  dateRangeText,
   durationMinutes = 30,
   dayStart = '09:00',
   dayEnd = '17:00',
@@ -1229,6 +1354,12 @@ const buildAvailabilityReplyDraft = async ({
     throw new Error('Reply mode must be sender or all.');
   }
 
+  const resolvedRange = resolveAvailabilityDateRange({
+    startDate,
+    endDate,
+    dateRangeText,
+  });
+
   const [emails, availability] = await Promise.all([
     searchMailboxEmails({
       mailboxAddress: RAMY_MINACO_EMAIL,
@@ -1236,8 +1367,8 @@ const buildAvailabilityReplyDraft = async ({
       limit: 12,
     }),
     findCalendarAvailability({
-      startDate,
-      endDate,
+      startDate: resolvedRange.startDate,
+      endDate: resolvedRange.endDate,
       durationMinutes,
       dayStart,
       dayEnd,
@@ -1323,8 +1454,9 @@ const buildAvailabilityReplyDraft = async ({
     replyMode,
     recipients,
     availability: {
-      startDate,
-      endDate,
+      startDate: resolvedRange.startDate,
+      endDate: resolvedRange.endDate,
+      rangeSource: resolvedRange.source,
       durationMinutes: availability.durationMinutes,
       slots,
     },
@@ -2459,6 +2591,7 @@ LIVE CALENDAR RULES
 Use check_calendar whenever Ramy asks what is on his calendar, what meetings he has, or asks about a specific date or period.
 Use check_availability whenever Ramy asks whether he is free at one specific time.
 Use find_availability whenever Ramy asks for several possible times, asks for his availability over a day/week/date range, or asks you to reply to someone with his availability. Do NOT ask Ramy to tell you his availability when his live calendar can answer it.
+For relative date phrases such as "next week" or "this week", pass the phrase itself in date_range. Do NOT manually calculate start_date/end_date unless Ramy gave explicit calendar dates. The server resolves relative ranges using the current Montreal date.
 If no meeting duration is stated for an availability request, default to 30 minutes. Unless Ramy or the email specifies otherwise, search normal business hours from 9:00 AM to 5:00 PM Montreal time and offer 3 to 5 useful slots. Respect any duration, day, or time constraints stated in the email or by Ramy.
 All spoken calendar times are Montreal local time unless Ramy explicitly specifies another time zone.
 If Ramy asks whether you have calendar access, answer directly that you have live access to his Minaco calendar through the authorized calendar tools. Do not call a tool merely to explain that access.
@@ -3195,13 +3328,17 @@ fastify.register(async (fastifyInstance) => {
                 parameters: {
                   type: 'object',
                   properties: {
+                    date_range: {
+                      type: 'string',
+                      description: 'Relative or explicit period such as next week, this week, tomorrow, next 7 days, or 2026-08-31 to 2026-09-04. Prefer this for relative requests.',
+                    },
                     start_date: {
                       type: 'string',
-                      description: 'First Montreal local date in YYYY-MM-DD.',
+                      description: 'Optional first Montreal local date in YYYY-MM-DD when Ramy gives explicit dates.',
                     },
                     end_date: {
                       type: 'string',
-                      description: 'Last Montreal local date in YYYY-MM-DD, inclusive.',
+                      description: 'Optional last Montreal local date in YYYY-MM-DD, inclusive, when Ramy gives explicit dates.',
                     },
                     duration_minutes: {
                       type: 'integer',
@@ -3228,7 +3365,6 @@ fastify.register(async (fastifyInstance) => {
                       description: 'Whether Saturday and Sunday may be offered. Default false.',
                     },
                   },
-                  required: ['start_date', 'end_date'],
                   additionalProperties: false,
                 },
               },
@@ -3244,13 +3380,17 @@ fastify.register(async (fastifyInstance) => {
                       type: 'string',
                       description: 'Sender name or email, for example Francis.',
                     },
+                    date_range: {
+                      type: 'string',
+                      description: 'Relative or explicit period such as next week, this week, tomorrow, next 7 days, or 2026-08-31 to 2026-09-04. Prefer this for relative requests.',
+                    },
                     start_date: {
                       type: 'string',
-                      description: 'First Montreal local date in YYYY-MM-DD.',
+                      description: 'Optional first Montreal local date in YYYY-MM-DD when Ramy gives explicit dates.',
                     },
                     end_date: {
                       type: 'string',
-                      description: 'Last Montreal local date in YYYY-MM-DD, inclusive.',
+                      description: 'Optional last Montreal local date in YYYY-MM-DD, inclusive, when Ramy gives explicit dates.',
                     },
                     duration_minutes: {
                       type: 'integer',
@@ -3282,7 +3422,7 @@ fastify.register(async (fastifyInstance) => {
                       description: 'sender for reply-to-sender only; all for reply-all. Default sender when Ramy names the person directly.',
                     },
                   },
-                  required: ['person_query', 'start_date', 'end_date'],
+                  required: ['person_query'],
                   additionalProperties: false,
                 },
               },
@@ -4196,6 +4336,7 @@ fastify.register(async (fastifyInstance) => {
                 personQuery: args.person_query,
                 startDate: args.start_date,
                 endDate: args.end_date,
+                dateRangeText: args.date_range,
                 durationMinutes: args.duration_minutes ?? 30,
                 dayStart: args.day_start || '09:00',
                 dayEnd: args.day_end || '17:00',
@@ -4242,7 +4383,7 @@ fastify.register(async (fastifyInstance) => {
               respondToToolCall(
                 response.call_id,
                 { success: false, error: error.message },
-                'Tell Ramy the live email/calendar lookup did not complete. State the error briefly, do not freeze, and remain ready for his next instruction.'
+                'Tell Ramy the availability lookup did not complete. If the error is about a date range, say the date-range resolver failed and that he can simply say next week again; do not ask him to calculate dates. Stay responsive and ready for his next instruction.'
               );
             }
             return;
@@ -4254,9 +4395,14 @@ fastify.register(async (fastifyInstance) => {
           ) {
             try {
               const args = JSON.parse(response.arguments || '{}');
-              const result = await findCalendarAvailability({
+              const resolvedRange = resolveAvailabilityDateRange({
                 startDate: args.start_date,
                 endDate: args.end_date,
+                dateRangeText: args.date_range,
+              });
+              const result = await findCalendarAvailability({
+                startDate: resolvedRange.startDate,
+                endDate: resolvedRange.endDate,
                 durationMinutes: args.duration_minutes ?? 30,
                 dayStart: args.day_start || '09:00',
                 dayEnd: args.day_end || '17:00',
