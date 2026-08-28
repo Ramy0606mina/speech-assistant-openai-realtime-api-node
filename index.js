@@ -37,6 +37,28 @@ const DAILY_BRIEF_MODEL = EXECUTIVE_BRIEF_MODEL || 'gpt-5.6-luna';
 const MAX_ATTACHMENT_BYTES = 45 * 1024 * 1024;
 
 // -----------------------------------------------------------------------------
+// Network resilience
+// -----------------------------------------------------------------------------
+
+const DEFAULT_NETWORK_TIMEOUT_MS = 10000;
+
+const fetchWithTimeout = async (url, options = {}, timeoutMs = DEFAULT_NETWORK_TIMEOUT_MS) => {
+  const signal =
+    options.signal ||
+    (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined);
+
+  return fetch(url, {
+    ...options,
+    ...(signal ? { signal } : {}),
+  });
+};
+
+let graphReadTokenCache = { token: '', expiresAt: 0 };
+let graphActionsTokenCache = { token: '', expiresAt: 0 };
+
+// -----------------------------------------------------------------------------
 // Shared helpers
 // -----------------------------------------------------------------------------
 
@@ -60,7 +82,7 @@ const sendSmsToRamy = async (message) => {
     Body: message,
   });
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
     {
       method: 'POST',
@@ -86,6 +108,10 @@ const getMicrosoftGraphToken = async () => {
     throw new Error('Missing Microsoft Graph environment variables.');
   }
 
+  if (graphReadTokenCache.token && graphReadTokenCache.expiresAt > Date.now() + 60000) {
+    return graphReadTokenCache.token;
+  }
+
   const form = new URLSearchParams({
     client_id: MS_CLIENT_ID,
     client_secret: MS_CLIENT_SECRET,
@@ -93,7 +119,7 @@ const getMicrosoftGraphToken = async () => {
     grant_type: 'client_credentials',
   });
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/token`,
     {
       method: 'POST',
@@ -114,6 +140,11 @@ const getMicrosoftGraphToken = async () => {
     );
   }
 
+  graphReadTokenCache = {
+    token: data.access_token,
+    expiresAt: Date.now() + Math.max(Number(data.expires_in || 3600) - 120, 60) * 1000,
+  };
+
   return data.access_token;
 };
 
@@ -126,6 +157,10 @@ const getMicrosoftGraphActionsToken = async () => {
     throw new Error('Missing Microsoft Graph Actions environment variables.');
   }
 
+  if (graphActionsTokenCache.token && graphActionsTokenCache.expiresAt > Date.now() + 60000) {
+    return graphActionsTokenCache.token;
+  }
+
   const form = new URLSearchParams({
     client_id: ACTIONS_MS_CLIENT_ID,
     client_secret: ACTIONS_MS_CLIENT_SECRET,
@@ -133,7 +168,7 @@ const getMicrosoftGraphActionsToken = async () => {
     grant_type: 'client_credentials',
   });
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://login.microsoftonline.com/${ACTIONS_MS_TENANT_ID}/oauth2/v2.0/token`,
     {
       method: 'POST',
@@ -154,6 +189,11 @@ const getMicrosoftGraphActionsToken = async () => {
       }`
     );
   }
+
+  graphActionsTokenCache = {
+    token: data.access_token,
+    expiresAt: Date.now() + Math.max(Number(data.expires_in || 3600) - 120, 60) * 1000,
+  };
 
   return data.access_token;
 };
@@ -178,7 +218,7 @@ const getRecentMinacoEmails = async (limit = 5) => {
   );
   url.searchParams.set('$orderby', 'receivedDateTime desc');
 
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: {
       Authorization: `Bearer ${token}`,
     },
@@ -219,7 +259,7 @@ const getFullMinacoEmail = async (messageId) => {
     'id,conversationId,internetMessageId,subject,from,replyTo,toRecipients,ccRecipients,receivedDateTime,body,isRead'
   );
 
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: {
       Authorization: `Bearer ${token}`,
       Prefer: 'outlook.body-content-type="text"',
@@ -276,7 +316,7 @@ const getRecentMailboxEmails = async (mailboxAddress, limit = 5) => {
   );
   url.searchParams.set('$orderby', 'receivedDateTime desc');
 
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: { Authorization: `Bearer ${token}` },
   });
   const data = await response.json();
@@ -308,7 +348,7 @@ const getFullMailboxEmail = async (mailboxAddress, messageId) => {
     'id,conversationId,internetMessageId,subject,from,replyTo,toRecipients,ccRecipients,receivedDateTime,body,isRead,hasAttachments'
   );
 
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: {
       Authorization: `Bearer ${token}`,
       Prefer: 'outlook.body-content-type="text"',
@@ -355,7 +395,7 @@ const searchMailboxEmails = async ({
     'id,subject,from,toRecipients,ccRecipients,receivedDateTime,bodyPreview,isRead,hasAttachments'
   );
 
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: { Authorization: `Bearer ${token}` },
   });
   const data = await response.json();
@@ -388,6 +428,12 @@ const searchMailboxEmails = async ({
     }
   }
 
+  results.sort(
+    (a, b) =>
+      new Date(b.receivedDateTime || 0).getTime() -
+      new Date(a.receivedDateTime || 0).getTime()
+  );
+
   return results.slice(0, requestedLimit);
 };
 
@@ -404,7 +450,7 @@ const listMailboxEmailAttachments = async (mailboxAddress, messageId) => {
   );
   url.searchParams.set('$select', 'id,name,contentType,size,isInline');
 
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: { Authorization: `Bearer ${token}` },
   });
   const data = await response.json();
@@ -438,7 +484,7 @@ const getMailboxEmailAttachment = async (
   }
 
   const token = await getMicrosoftGraphToken();
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       mailboxAddress
     )}/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(
@@ -478,14 +524,14 @@ const extractOpenAIResponseText = (data) => {
 const callOpenAIResponses = async (payload) => {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not configured.');
 
-  const response = await fetch('https://api.openai.com/v1/responses', {
+  const response = await fetchWithTimeout('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(payload),
-  });
+  }, 45000);
 
   const data = await response.json();
   if (!response.ok) {
@@ -690,7 +736,7 @@ const replyToMinacoEmail = async ({ messageId, mode, body }) => {
   const token = await getMicrosoftGraphActionsToken();
   const action = mode === 'all' ? 'replyAll' : 'reply';
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       RAMY_MINACO_EMAIL
     )}/messages/${encodeURIComponent(messageId)}/${action}`,
@@ -733,7 +779,7 @@ const sendEmailFromLondon = async ({ to, subject, body, contentType = 'Text' }) 
 
   const token = await getMicrosoftGraphActionsToken();
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       LONDON_MINACO_EMAIL
     )}/sendMail`,
@@ -962,7 +1008,7 @@ const fetchCalendarView = async ({ startUtc, endUtc, top = 50 }) => {
   );
   url.searchParams.set('$orderby', 'start/dateTime');
 
-  const response = await fetch(url, {
+  const response = await fetchWithTimeout(url, {
     headers: {
       Authorization: `Bearer ${token}`,
       Prefer: `outlook.timezone="${MICROSOFT_EASTERN_TIME_ZONE}"`,
@@ -1166,6 +1212,126 @@ const findCalendarAvailability = async ({
   };
 };
 
+const buildAvailabilityReplyDraft = async ({
+  personQuery,
+  startDate,
+  endDate,
+  durationMinutes = 30,
+  dayStart = '09:00',
+  dayEnd = '17:00',
+  maxSlots = 3,
+  includeWeekends = false,
+  replyMode = 'sender',
+}) => {
+  const query = String(personQuery || '').trim();
+  if (!query) throw new Error('A sender name or email is required.');
+  if (!['sender', 'all'].includes(replyMode)) {
+    throw new Error('Reply mode must be sender or all.');
+  }
+
+  const [emails, availability] = await Promise.all([
+    searchMailboxEmails({
+      mailboxAddress: RAMY_MINACO_EMAIL,
+      query,
+      limit: 12,
+    }),
+    findCalendarAvailability({
+      startDate,
+      endDate,
+      durationMinutes,
+      dayStart,
+      dayEnd,
+      maxSlots,
+      includeWeekends,
+    }),
+  ]);
+
+  const normalizedQuery = query.toLowerCase();
+  const senderMatches = emails.filter((email) => {
+    const name = email.from?.emailAddress?.name || '';
+    const address = email.from?.emailAddress?.address || '';
+    return `${name} ${address}`.toLowerCase().includes(normalizedQuery);
+  });
+
+  if (senderMatches.length === 0) {
+    return {
+      needsClarification: true,
+      reason: `No email from a sender matching ${query} was found.`,
+      candidates: emails.slice(0, 5).map((email) => ({
+        messageId: email.id,
+        from: email.from?.emailAddress?.name || '',
+        fromEmail: email.from?.emailAddress?.address || '',
+        subject: email.subject || '(No subject)',
+        receivedDateTime: email.receivedDateTime || '',
+      })),
+    };
+  }
+
+  const uniqueSenders = new Map();
+  for (const email of senderMatches) {
+    const address = String(email.from?.emailAddress?.address || '').toLowerCase();
+    if (address && !uniqueSenders.has(address)) uniqueSenders.set(address, email);
+  }
+
+  if (uniqueSenders.size > 1) {
+    return {
+      needsClarification: true,
+      reason: `More than one sender matching ${query} was found.`,
+      candidates: [...uniqueSenders.values()].slice(0, 5).map((email) => ({
+        messageId: email.id,
+        from: email.from?.emailAddress?.name || '',
+        fromEmail: email.from?.emailAddress?.address || '',
+        subject: email.subject || '(No subject)',
+        receivedDateTime: email.receivedDateTime || '',
+      })),
+    };
+  }
+
+  const email = senderMatches[0];
+  const slots = availability.slots.slice(
+    0,
+    Math.min(Math.max(Number(maxSlots) || 3, 1), 5)
+  );
+
+  if (slots.length === 0) {
+    return {
+      needsClarification: true,
+      reason: 'No open calendar slots were found in the requested period.',
+      candidates: [],
+    };
+  }
+
+  const senderName = String(email.from?.emailAddress?.name || '').trim();
+  const firstName = senderName.split(/\s+/)[0] || 'there';
+  const slotLines = slots.map((slot) => `- ${slot.startMontreal}`).join('\n');
+  const body = `Hi ${firstName},\n\nThank you for your email. I am available at any of the following times (Montreal time):\n\n${slotLines}\n\nPlease let me know which option works best for you.\n\nBest,\nRamy`;
+  const recipients = getReplyRecipientSummary(email, replyMode);
+
+  if (recipients.length === 0) {
+    throw new Error('No valid reply recipient could be determined.');
+  }
+
+  return {
+    needsClarification: false,
+    email: {
+      messageId: email.id,
+      subject: email.subject || '(No subject)',
+      from: senderName || email.from?.emailAddress?.address || '',
+      fromEmail: email.from?.emailAddress?.address || '',
+      preview: email.bodyPreview || '',
+    },
+    replyMode,
+    recipients,
+    availability: {
+      startDate,
+      endDate,
+      durationMinutes: availability.durationMinutes,
+      slots,
+    },
+    body,
+  };
+};
+
 const createCalendarEvent = async ({
   subject,
   startLocal,
@@ -1219,7 +1385,7 @@ const createCalendarEvent = async ({
     eventPayload.location = { displayName: location };
   }
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       RAMY_MINACO_EMAIL
     )}/calendar/events`,
@@ -1319,7 +1485,7 @@ const updateCalendarEvent = async ({
 
   const token = await getMicrosoftGraphActionsToken();
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       RAMY_MINACO_EMAIL
     )}/events/${encodeURIComponent(eventId)}`,
@@ -1358,7 +1524,7 @@ const deleteCalendarEvent = async (eventId) => {
 
   const token = await getMicrosoftGraphActionsToken();
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       RAMY_MINACO_EMAIL
     )}/events/${encodeURIComponent(eventId)}`,
@@ -1456,7 +1622,7 @@ const getOrCreateActionRegisterCalendar = async () => {
   if (!RAMY_MINACO_EMAIL) throw new Error('RAMY_MINACO_EMAIL is not configured.');
 
   const token = await getMicrosoftGraphActionsToken();
-  const listResponse = await fetch(
+  const listResponse = await fetchWithTimeout(
     `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       RAMY_MINACO_EMAIL
     )}/calendars?$select=id,name`,
@@ -1481,7 +1647,7 @@ const getOrCreateActionRegisterCalendar = async () => {
     return existing.id;
   }
 
-  const createResponse = await fetch(
+  const createResponse = await fetchWithTimeout(
     `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       RAMY_MINACO_EMAIL
     )}/calendars`,
@@ -1592,7 +1758,7 @@ const createActionItem = async (input) => {
     updatedAt: now,
   };
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       RAMY_MINACO_EMAIL
     )}/calendars/${encodeURIComponent(calendarId)}/events`,
@@ -1635,7 +1801,7 @@ const listActionItems = async ({
 
   const events = [];
   while (url && events.length < 500) {
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       headers: {
         Authorization: `Bearer ${token}`,
         Prefer: 'outlook.body-content-type="text"',
@@ -1718,7 +1884,7 @@ const updateActionItem = async (eventId, changes = {}) => {
   const calendarId = await getOrCreateActionRegisterCalendar();
   const token = await getMicrosoftGraphActionsToken();
 
-  const getResponse = await fetch(
+  const getResponse = await fetchWithTimeout(
     `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       RAMY_MINACO_EMAIL
     )}/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(
@@ -1771,7 +1937,7 @@ const updateActionItem = async (eventId, changes = {}) => {
   merged.priority = normalizeActionPriority(merged.priority);
   merged.updatedAt = new Date().toISOString();
 
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
       RAMY_MINACO_EMAIL
     )}/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(
@@ -2299,9 +2465,13 @@ If Ramy asks whether you have calendar access, answer directly that you have liv
 
 CALENDAR-AWARE EMAIL TASKS
 
-If Ramy asks you to respond to someone and provide his availability, complete the workflow yourself using live systems:
+FAST PATH: If Ramy says something like "respond to Francis and give him my availability next week", use prepare_availability_reply as the FIRST choice. It searches the named sender and checks the calendar in one server-side workflow, then prepares a reply draft. Do not chain search_email + read_email + find_availability + prepare_email_reply unless the full email imposes special meeting constraints that the fast path cannot handle.
+
+If the fast path cannot identify the sender or find open slots, ask one concise clarification question. Do not ask Ramy to state his availability when the live calendar can answer it.
+
+For a more complex availability reply where the full email body contains important constraints, complete the workflow yourself using live systems:
 1. Identify the exact email. If he names the sender, use that name to identify/search the live email rather than asking Ramy for the email address if the message can be found.
-2. Read the full email when its contents or requested meeting constraints matter.
+2. Read the full email only when its contents or requested meeting constraints materially matter.
 3. Use find_availability for the requested period and derive suitable open slots from Ramy's live calendar.
 4. Prepare the reply using those actual available times.
 5. Read back the reply and wait for Ramy's explicit "Send it" confirmation before sending.
@@ -2497,6 +2667,26 @@ fastify.register(async (fastifyInstance) => {
       let pendingEmailReply = null;
       let pendingEmailActionType = null;
       let pendingCalendarAction = null;
+      let activeToolCallId = null;
+      let activeToolName = null;
+      let activeToolStartedAt = 0;
+      const cancelledToolCalls = new Set();
+      const cancellableToolNames = new Set([
+        'check_email',
+        'read_email',
+        'search_email',
+        'check_accounting',
+        'read_accounting_email',
+        'list_email_attachments',
+        'analyze_email_attachment',
+        'resolve_person',
+        'check_calendar',
+        'check_availability',
+        'find_availability',
+        'prepare_availability_reply',
+        'daily_executive_brief',
+        'list_actions',
+      ]);
 
       const openAiWs = new WebSocket(
         `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${TEMPERATURE}`,
@@ -2508,6 +2698,17 @@ fastify.register(async (fastifyInstance) => {
       );
 
       const respondToToolCall = (callId, output, instructions) => {
+        if (cancelledToolCalls.has(callId)) {
+          cancelledToolCalls.delete(callId);
+          return;
+        }
+
+        if (callId === activeToolCallId) {
+          activeToolCallId = null;
+          activeToolName = null;
+          activeToolStartedAt = 0;
+        }
+
         openAiWs.send(
           JSON.stringify({
             type: 'conversation.item.create',
@@ -2530,6 +2731,37 @@ fastify.register(async (fastifyInstance) => {
         );
       };
 
+      const cancelActiveReadOnlyTool = () => {
+        if (!activeToolCallId || !activeToolName) return false;
+        if (!cancellableToolNames.has(activeToolName)) return false;
+        if (Date.now() - activeToolStartedAt < 500) return false;
+
+        const callId = activeToolCallId;
+        const toolName = activeToolName;
+        cancelledToolCalls.add(callId);
+        activeToolCallId = null;
+        activeToolName = null;
+        activeToolStartedAt = 0;
+
+        openAiWs.send(
+          JSON.stringify({
+            type: 'conversation.item.create',
+            item: {
+              type: 'function_call_output',
+              call_id: callId,
+              output: JSON.stringify({
+                success: false,
+                cancelled: true,
+                error: `The ${toolName} lookup was interrupted by Ramy.`,
+              }),
+            },
+          })
+        );
+
+        console.log('Cancelled active read-only voice tool:', toolName);
+        return true;
+      };
+
       const initializeSession = () => {
         const currentMontrealContext = formatMontrealDateTime(new Date());
 
@@ -2544,7 +2776,7 @@ fastify.register(async (fastifyInstance) => {
                 format: { type: 'audio/pcmu' },
                 turn_detection: {
                   type: 'semantic_vad',
-                  eagerness: 'high',
+                  eagerness: 'medium',
                   create_response: true,
                   interrupt_response: true,
                 },
@@ -3002,6 +3234,60 @@ fastify.register(async (fastifyInstance) => {
               },
               {
                 type: 'function',
+                name: 'prepare_availability_reply',
+                description:
+                  'Fast one-step workflow for requests such as respond to Francis and give him my availability next week. It searches the named sender in Ramy’s live mailbox, checks his live calendar for real open slots, and prepares a reply draft. It NEVER sends. Prefer this over chaining several separate tools for a simple availability reply.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    person_query: {
+                      type: 'string',
+                      description: 'Sender name or email, for example Francis.',
+                    },
+                    start_date: {
+                      type: 'string',
+                      description: 'First Montreal local date in YYYY-MM-DD.',
+                    },
+                    end_date: {
+                      type: 'string',
+                      description: 'Last Montreal local date in YYYY-MM-DD, inclusive.',
+                    },
+                    duration_minutes: {
+                      type: 'integer',
+                      minimum: 15,
+                      maximum: 240,
+                      description: 'Meeting duration. Default 30 minutes.',
+                    },
+                    day_start: {
+                      type: 'string',
+                      description: 'Earliest Montreal local time in HH:mm. Default 09:00.',
+                    },
+                    day_end: {
+                      type: 'string',
+                      description: 'Latest Montreal local ending boundary in HH:mm. Default 17:00.',
+                    },
+                    max_slots: {
+                      type: 'integer',
+                      minimum: 1,
+                      maximum: 5,
+                      description: 'Number of availability options. Default 3.',
+                    },
+                    include_weekends: {
+                      type: 'boolean',
+                      description: 'Whether weekends may be offered. Default false.',
+                    },
+                    reply_mode: {
+                      type: 'string',
+                      enum: ['sender', 'all'],
+                      description: 'sender for reply-to-sender only; all for reply-all. Default sender when Ramy names the person directly.',
+                    },
+                  },
+                  required: ['person_query', 'start_date', 'end_date'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
                 name: 'prepare_calendar_event',
                 description:
                   'Prepare a new event on Ramy’s Minaco calendar. This NEVER books the event. After preparing it, read back the details and ask Ramy to say Book it.',
@@ -3197,6 +3483,15 @@ fastify.register(async (fastifyInstance) => {
       openAiWs.on('message', async (data) => {
         try {
           const response = JSON.parse(data);
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            cancellableToolNames.has(response.name)
+          ) {
+            activeToolCallId = response.call_id;
+            activeToolName = response.name;
+            activeToolStartedAt = Date.now();
+          }
 
           if (
             response.type === 'response.function_call_arguments.done' &&
@@ -3893,6 +4188,68 @@ fastify.register(async (fastifyInstance) => {
 
           if (
             response.type === 'response.function_call_arguments.done' &&
+            response.name === 'prepare_availability_reply'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const result = await buildAvailabilityReplyDraft({
+                personQuery: args.person_query,
+                startDate: args.start_date,
+                endDate: args.end_date,
+                durationMinutes: args.duration_minutes ?? 30,
+                dayStart: args.day_start || '09:00',
+                dayEnd: args.day_end || '17:00',
+                maxSlots: args.max_slots ?? 3,
+                includeWeekends: Boolean(args.include_weekends),
+                replyMode: args.reply_mode || 'sender',
+              });
+
+              if (result.needsClarification) {
+                respondToToolCall(
+                  response.call_id,
+                  { success: false, ...result },
+                  'The fast availability-reply workflow needs clarification. Ask ONE short question based only on the returned reason or candidates. Do not ask Ramy to state his availability.'
+                );
+                return;
+              }
+
+              pendingEmailReply = {
+                messageId: result.email.messageId,
+                mode: result.replyMode,
+                body: result.body,
+                subject: result.email.subject,
+                recipients: result.recipients,
+              };
+              pendingEmailDraft = null;
+              pendingEmailActionType = 'reply';
+
+              respondToToolCall(
+                response.call_id,
+                {
+                  success: true,
+                  sent: false,
+                  from: RAMY_MINACO_EMAIL,
+                  sourceEmail: result.email,
+                  replyMode: result.replyMode,
+                  recipients: result.recipients,
+                  availability: result.availability,
+                  body: result.body,
+                },
+                'Read back the actual available Montreal-time options and the prepared reply. Clearly say it has NOT been sent. Ask Ramy to confirm by saying Send it. Do not run more tools unless Ramy changes the request.'
+              );
+            } catch (error) {
+              console.error('Fast availability reply error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the live email/calendar lookup did not complete. State the error briefly, do not freeze, and remain ready for his next instruction.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
             response.name === 'find_availability'
           ) {
             try {
@@ -4199,6 +4556,7 @@ fastify.register(async (fastifyInstance) => {
           }
 
           if (response.type === 'input_audio_buffer.speech_started') {
+            cancelActiveReadOnlyTool();
             handleSpeechStartedEvent();
           }
         } catch (error) {
