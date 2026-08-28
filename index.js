@@ -718,7 +718,7 @@ const replyToMinacoEmail = async ({ messageId, mode, body }) => {
   };
 };
 
-const sendEmailFromLondon = async ({ to, subject, body }) => {
+const sendEmailFromLondon = async ({ to, subject, body, contentType = 'Text' }) => {
   if (!LONDON_MINACO_EMAIL) {
     throw new Error('LONDON_MINACO_EMAIL is not configured.');
   }
@@ -726,6 +726,9 @@ const sendEmailFromLondon = async ({ to, subject, body }) => {
   if (!to || !subject || !body) {
     throw new Error('Email requires recipient, subject, and body.');
   }
+
+  const normalizedContentType =
+    String(contentType || '').toLowerCase() === 'html' ? 'HTML' : 'Text';
 
   const token = await getMicrosoftGraphActionsToken();
 
@@ -743,7 +746,7 @@ const sendEmailFromLondon = async ({ to, subject, body }) => {
         message: {
           subject,
           body: {
-            contentType: 'Text',
+            contentType: normalizedContentType,
             content: body,
           },
           toRecipients: [
@@ -771,6 +774,7 @@ const sendEmailFromLondon = async ({ to, subject, body }) => {
     from: LONDON_MINACO_EMAIL,
     to,
     subject,
+    contentType: normalizedContentType,
   };
 };
 
@@ -1672,6 +1676,316 @@ const compactEmailForBrief = (email) => ({
   preview: email.bodyPreview || '',
 });
 
+const escapeHtml = (value) =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+
+const stripJsonCodeFence = (value) =>
+  String(value || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
+const formatBriefDisplayDate = (date = new Date()) =>
+  new Intl.DateTimeFormat('en-US', {
+    timeZone: MONTREAL_IANA_TIME_ZONE,
+    weekday: 'long',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  }).format(date);
+
+const formatBriefPreparedTime = (date = new Date()) =>
+  new Intl.DateTimeFormat('en-US', {
+    timeZone: MONTREAL_IANA_TIME_ZONE,
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZoneName: 'short',
+  }).format(date);
+
+const normalizeBriefItem = (item = {}) => ({
+  title: String(item.title || '').trim(),
+  badge: String(item.badge || '').trim(),
+  fact: String(item.fact || '').trim(),
+  nextAction: String(item.nextAction || '').trim(),
+  note: String(item.note || '').trim(),
+});
+
+const normalizeBriefData = (data = {}) => {
+  const array = (value) =>
+    Array.isArray(value) ? value.map(normalizeBriefItem).filter((item) => item.title) : [];
+
+  const schedule = Array.isArray(data.schedule)
+    ? data.schedule
+        .map((item = {}) => ({
+          time: String(item.time || '').trim(),
+          title: String(item.title || '').trim(),
+          detail: String(item.detail || '').trim(),
+        }))
+        .filter((item) => item.time || item.title || item.detail)
+    : [];
+
+  const priorities = Array.isArray(data.londonPriorities)
+    ? data.londonPriorities.map((item) => String(item || '').trim()).filter(Boolean)
+    : [];
+
+  return {
+    attentionSummary: String(data.attentionSummary || '').trim(),
+    urgentDecisions: array(data.urgentDecisions),
+    deadlinesRisks: array(data.deadlinesRisks),
+    schedule,
+    scheduleSummary: String(data.scheduleSummary || '').trim(),
+    followUps: array(data.followUps),
+    accounting: array(data.accounting),
+    londonPriorities: priorities,
+    closing: String(data.closing || '').trim(),
+  };
+};
+
+const briefItemCardHtml = (item, accentColor) => {
+  const badge = item.badge
+    ? `<span style="display:inline-block;background:${accentColor};color:#ffffff;font-size:10px;line-height:14px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;padding:3px 8px;border-radius:10px;white-space:nowrap;">${escapeHtml(item.badge)}</span>`
+    : '';
+
+  const fact = item.fact
+    ? `<div style="margin-top:7px;color:#475467;font-size:13px;line-height:19px;"><span style="font-weight:700;color:#344054;">Fact:</span> ${escapeHtml(item.fact)}</div>`
+    : '';
+
+  const nextAction = item.nextAction
+    ? `<div style="margin-top:5px;color:#175cd3;font-size:13px;line-height:19px;"><span style="font-weight:700;">Next action:</span> ${escapeHtml(item.nextAction)}</div>`
+    : '';
+
+  const note = item.note
+    ? `<div style="margin-top:5px;color:#667085;font-size:12px;line-height:18px;">${escapeHtml(item.note)}</div>`
+    : '';
+
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;margin:0 0 10px 0;background:#ffffff;border:1px solid #eaecf0;border-left:4px solid ${accentColor};border-radius:7px;">
+      <tr>
+        <td style="padding:12px 14px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+            <tr>
+              <td style="font-size:14px;line-height:20px;font-weight:700;color:#101828;padding-right:10px;">${escapeHtml(item.title)}</td>
+              <td align="right" valign="top" style="width:1%;">${badge}</td>
+            </tr>
+          </table>
+          ${fact}${nextAction}${note}
+        </td>
+      </tr>
+    </table>`;
+};
+
+const briefSectionHtml = ({ title, subtitle, color, items, emptyText }) => {
+  const content = items.length
+    ? items.map((item) => briefItemCardHtml(item, color)).join('')
+    : `<div style="background:#ffffff;border:1px solid #eaecf0;border-radius:7px;padding:12px 14px;color:#667085;font-size:13px;line-height:19px;">${escapeHtml(emptyText)}</div>`;
+
+  return `
+    <tr>
+      <td style="padding:0 24px 18px 24px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+          <tr>
+            <td style="padding:0 0 9px 0;border-bottom:2px solid ${color};">
+              <span style="font-size:13px;line-height:18px;font-weight:800;letter-spacing:.45px;color:${color};text-transform:uppercase;">${escapeHtml(title)}</span>
+              ${subtitle ? `<span style="display:block;margin-top:2px;color:#667085;font-size:11px;line-height:16px;">${escapeHtml(subtitle)}</span>` : ''}
+            </td>
+          </tr>
+          <tr><td style="padding-top:10px;">${content}</td></tr>
+        </table>
+      </td>
+    </tr>`;
+};
+
+const scheduleSectionHtml = (brief) => {
+  const color = '#175CD3';
+  let content = '';
+
+  if (brief.schedule.length) {
+    content = brief.schedule
+      .map((item) => `
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;margin:0 0 8px 0;background:#ffffff;border:1px solid #eaecf0;border-radius:7px;">
+          <tr>
+            <td valign="top" style="width:92px;padding:11px 12px;color:${color};font-size:13px;line-height:19px;font-weight:800;white-space:nowrap;">${escapeHtml(item.time)}</td>
+            <td style="padding:11px 12px 11px 0;color:#101828;font-size:13px;line-height:19px;"><span style="font-weight:700;">${escapeHtml(item.title)}</span>${item.detail ? `<div style="margin-top:2px;color:#667085;font-size:12px;line-height:18px;">${escapeHtml(item.detail)}</div>` : ''}</td>
+          </tr>
+        </table>`)
+      .join('');
+  } else {
+    content = `<div style="background:#ffffff;border:1px solid #eaecf0;border-radius:7px;padding:12px 14px;color:#667085;font-size:13px;line-height:19px;">${escapeHtml(brief.scheduleSummary || 'No calendar meetings scheduled today.')}</div>`;
+  }
+
+  return `
+    <tr>
+      <td style="padding:0 24px 18px 24px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+          <tr><td style="padding:0 0 9px 0;border-bottom:2px solid ${color};"><span style="font-size:13px;line-height:18px;font-weight:800;letter-spacing:.45px;color:${color};text-transform:uppercase;">Today’s Schedule</span></td></tr>
+          <tr><td style="padding-top:10px;">${content}</td></tr>
+        </table>
+      </td>
+    </tr>`;
+};
+
+const prioritiesSectionHtml = (brief) => {
+  const priorities = brief.londonPriorities.length
+    ? brief.londonPriorities
+    : ['Continue monitoring Minaco email, Accounting, calendar, and tracked follow-ups.'];
+
+  return `
+    <tr>
+      <td style="padding:0 24px 18px 24px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+          <tr><td style="padding:0 0 9px 0;border-bottom:2px solid #344054;"><span style="font-size:13px;line-height:18px;font-weight:800;letter-spacing:.45px;color:#344054;text-transform:uppercase;">London’s Priorities Today</span></td></tr>
+          <tr>
+            <td style="padding-top:10px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;background:#ffffff;border:1px solid #eaecf0;border-radius:7px;">
+                ${priorities
+                  .map((priority, index) => `<tr><td valign="top" style="width:34px;padding:10px 0 10px 13px;color:#344054;font-size:13px;font-weight:800;">${index + 1}.</td><td style="padding:10px 13px 10px 4px;color:#344054;font-size:13px;line-height:19px;${index ? 'border-top:1px solid #f2f4f7;' : ''}">${escapeHtml(priority)}</td></tr>`)
+                  .join('')}
+              </table>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>`;
+};
+
+const renderDailyBriefHtml = (brief, generatedAt = new Date()) => {
+  const displayDate = formatBriefDisplayDate(generatedAt);
+  const preparedTime = formatBriefPreparedTime(generatedAt);
+  const summary = brief.attentionSummary || 'Minaco is being monitored. Key items are summarized below.';
+  const closing = brief.closing || 'Everything else is being tracked by London.';
+
+  const sections = [
+    briefSectionHtml({
+      title: 'Needs Your Decision',
+      subtitle: 'Items that specifically require Ramy',
+      color: '#B42318',
+      items: brief.urgentDecisions,
+      emptyText: 'No immediate decisions requiring your attention.',
+    }),
+    briefSectionHtml({
+      title: 'Deadlines & Financial Risks',
+      subtitle: 'Time-sensitive, financial, contractual, or project exposure',
+      color: '#B54708',
+      items: brief.deadlinesRisks,
+      emptyText: 'No material deadline or financial risk identified in the live data.',
+    }),
+    scheduleSectionHtml(brief),
+    briefSectionHtml({
+      title: 'Follow-Ups / Waiting',
+      subtitle: 'Commitments London is tracking',
+      color: '#6941C6',
+      items: brief.followUps,
+      emptyText: 'No tracked follow-up currently needs attention.',
+    }),
+    briefSectionHtml({
+      title: 'Accounting',
+      subtitle: 'Invoices, payments, statements, taxes, and finance items',
+      color: '#027A48',
+      items: brief.accounting,
+      emptyText: 'No accounting item currently requires attention.',
+    }),
+    prioritiesSectionHtml(brief),
+  ].join('');
+
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>London Executive Brief</title>
+</head>
+<body style="margin:0;padding:0;background:#f2f4f7;font-family:Arial,Helvetica,sans-serif;color:#101828;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;background:#f2f4f7;">
+    <tr>
+      <td align="center" style="padding:24px 10px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:760px;border-collapse:separate;border-spacing:0;background:#f8fafc;border:1px solid #e4e7ec;border-radius:12px;overflow:hidden;">
+          <tr>
+            <td style="background:#102A43;padding:23px 24px 20px 24px;border-bottom:4px solid #C8A96B;">
+              <div style="font-size:11px;line-height:16px;font-weight:700;letter-spacing:1.8px;color:#C8A96B;text-transform:uppercase;">London Assistant · Minaco</div>
+              <div style="margin-top:5px;font-size:24px;line-height:31px;font-weight:800;color:#ffffff;">Daily Executive Brief</div>
+              <div style="margin-top:5px;font-size:12px;line-height:18px;color:#d0d5dd;">${escapeHtml(displayDate)} · Prepared ${escapeHtml(preparedTime)} Montreal</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:18px 24px 20px 24px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;background:#ffffff;border:1px solid #d0d5dd;border-radius:8px;">
+                <tr>
+                  <td style="padding:14px 16px;">
+                    <div style="font-size:11px;line-height:16px;font-weight:800;letter-spacing:.55px;color:#667085;text-transform:uppercase;">Executive Summary</div>
+                    <div style="margin-top:3px;font-size:15px;line-height:22px;font-weight:700;color:#101828;">${escapeHtml(summary)}</div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          ${sections}
+          <tr>
+            <td style="padding:0 24px 24px 24px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:0;background:#102A43;border-radius:8px;">
+                <tr>
+                  <td style="padding:14px 16px;color:#ffffff;font-size:13px;line-height:19px;font-weight:700;">${escapeHtml(closing)}</td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:0 24px 18px 24px;color:#98a2b3;font-size:10px;line-height:15px;">Generated from live Minaco email, Accounting, calendar, and London Action Register data.</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+};
+
+const buildDailyBriefVoiceText = (brief) => {
+  const lines = [];
+  if (brief.attentionSummary) lines.push(brief.attentionSummary);
+
+  const addItems = (heading, items) => {
+    if (!items.length) return;
+    lines.push(heading);
+    for (const item of items) {
+      const parts = [item.title];
+      if (item.fact) parts.push(`Fact: ${item.fact}`);
+      if (item.nextAction) parts.push(`Next action: ${item.nextAction}`);
+      lines.push(parts.join('. '));
+    }
+  };
+
+  addItems('Needs your decision.', brief.urgentDecisions);
+  addItems('Deadlines and financial risks.', brief.deadlinesRisks);
+
+  if (brief.schedule.length) {
+    lines.push('Today’s schedule.');
+    for (const event of brief.schedule) {
+      lines.push(`${event.time}${event.title ? `, ${event.title}` : ''}${event.detail ? `. ${event.detail}` : ''}`);
+    }
+  } else if (brief.scheduleSummary) {
+    lines.push(`Today’s schedule. ${brief.scheduleSummary}`);
+  }
+
+  addItems('Follow-ups.', brief.followUps);
+  addItems('Accounting.', brief.accounting);
+
+  if (brief.londonPriorities.length) {
+    lines.push('London’s priorities today.');
+    brief.londonPriorities.forEach((priority, index) => {
+      lines.push(`${index + 1}. ${priority}`);
+    });
+  }
+
+  if (brief.closing) lines.push(brief.closing);
+  return lines.join('\n');
+};
+
 const generateDailyExecutiveBrief = async () => {
   const today = montrealDateParts();
   const tomorrow = addDaysToDateOnly(today, 1);
@@ -1694,8 +2008,9 @@ const generateDailyExecutiveBrief = async () => {
     }),
   ]);
 
+  const generatedAt = new Date();
   const context = {
-    generatedAtMontreal: formatMontrealDateTime(new Date()),
+    generatedAtMontreal: formatMontrealDateTime(generatedAt),
     today,
     tomorrow,
     calendar: calendarEvents,
@@ -1706,14 +2021,58 @@ const generateDailyExecutiveBrief = async () => {
 
   const data = await callOpenAIResponses({
     model: DAILY_BRIEF_MODEL,
-    instructions:
-      'You are London Assistant preparing Ramy Mina’s concise Minaco executive brief. Use ONLY the supplied live data. Prioritize: urgent decisions, deadlines/risks, financial or contractual consequences, today’s meetings, overdue actions, people waiting on Ramy, and important accounting items. Do not turn every email into an action. Clearly separate facts from recommended next actions. If a section has nothing important, omit it. Keep the brief compact enough to read by phone in about two minutes.',
+    instructions: `You are London Assistant preparing Ramy Mina's Minaco Daily Executive Brief.
+Use ONLY the supplied live data. Never invent names, amounts, dates, deadlines, obligations, or status.
+Prioritize: Ramy decisions, urgent deadlines, financial/contractual/project risk, today's meetings, overdue or promised follow-ups, people waiting on Ramy, and material Accounting items.
+Do not turn every email into an action. Separate verified facts from recommended next actions.
+Return ONLY valid JSON with no Markdown, no code fences, and exactly this shape:
+{
+  "attentionSummary": "one short sentence stating how many/what kind of items need Ramy's attention",
+  "urgentDecisions": [{"title":"...","badge":"ACTION or short label","fact":"...","nextAction":"...","note":"optional"}],
+  "deadlinesRisks": [{"title":"...","badge":"DUE SEP 1 / OVERDUE / FINANCIAL etc","fact":"...","nextAction":"...","note":"optional"}],
+  "schedule": [{"time":"9:30 AM","title":"...","detail":"optional short detail"}],
+  "scheduleSummary": "use only when there are no meetings",
+  "followUps": [{"title":"...","badge":"OVERDUE / SEP 3 / WAITING etc","fact":"...","nextAction":"...","note":"optional"}],
+  "accounting": [{"title":"...","badge":"PAYMENT / TAX / INVOICE etc","fact":"...","nextAction":"...","note":"optional"}],
+  "londonPriorities": ["what London should actively drive today", "..."],
+  "closing": "one reassuring sentence distinguishing Ramy's attention from what London is tracking"
+}
+Keep each fact and next action concise. Put an item in urgentDecisions only if Ramy personally needs to decide, approve, answer, sign, or provide availability. Put financial/tax/invoice/payment risk under deadlinesRisks and/or accounting as appropriate, without duplicating the same wording unnecessarily.`,
     input: `LIVE MINACO DATA:\n${JSON.stringify(context)}`,
   });
 
-  const brief = extractOpenAIResponseText(data);
-  if (!brief) throw new Error('Daily executive brief returned no text.');
-  return brief;
+  const raw = extractOpenAIResponseText(data);
+  if (!raw) throw new Error('Daily executive brief returned no text.');
+
+  let parsed;
+  try {
+    parsed = JSON.parse(stripJsonCodeFence(raw));
+  } catch (error) {
+    console.error('Daily executive brief JSON parse error:', error, 'Raw:', raw);
+    // Safe fallback: preserve the generated content rather than failing the scheduled brief.
+    parsed = {
+      attentionSummary: 'London generated the live brief, but its structured formatting could not be parsed.',
+      urgentDecisions: [],
+      deadlinesRisks: [],
+      schedule: [],
+      scheduleSummary: 'See the detail below.',
+      followUps: [],
+      accounting: [],
+      londonPriorities: [],
+      closing: raw,
+    };
+  }
+
+  const brief = normalizeBriefData(parsed);
+  const voiceText = buildDailyBriefVoiceText(brief);
+  const html = renderDailyBriefHtml(brief, generatedAt);
+
+  return {
+    data: brief,
+    voiceText,
+    html,
+    subject: `LONDON — Executive Brief | ${formatBriefDisplayDate(generatedAt)}`,
+  };
 };
 
 // -----------------------------------------------------------------------------
@@ -1904,8 +2263,9 @@ fastify.post('/daily-brief', async (request, reply) => {
     const brief = await generateDailyExecutiveBrief();
     await sendEmailFromLondon({
       to: RAMY_MINACO_EMAIL,
-      subject: `London — Daily Executive Brief — ${montrealDateParts()}`,
-      body: brief,
+      subject: brief.subject,
+      body: brief.html,
+      contentType: 'HTML',
     });
 
     return reply.send({ success: true, sentTo: RAMY_MINACO_EMAIL });
@@ -3246,7 +3606,7 @@ fastify.register(async (fastifyInstance) => {
               const brief = await generateDailyExecutiveBrief();
               respondToToolCall(
                 response.call_id,
-                { success: true, brief },
+                { success: true, brief: brief.voiceText },
                 'Read the executive brief naturally and concisely. Lead with anything requiring Ramy’s immediate decision or carrying deadline/financial/legal/project risk. Do not add facts not in the brief.'
               );
             } catch (error) {
