@@ -4702,7 +4702,7 @@ fastify.register(async (fastifyInstance) => {
               respondToToolCall(
                 response.call_id,
                 { success: false, error: error.message },
-                'Tell Ramy the next-week reply workflow failed and state the exact technical error in one sentence. Do not ask him to provide calendar availability, dates, or Francis's email address. Stay ready for another command.'
+                "Tell Ramy the next-week reply workflow failed and state the exact technical error in one sentence. Do not ask him to provide calendar availability, dates, or Francis's email address. Stay ready for another command."
               );
             }
             return;
