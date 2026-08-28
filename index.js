@@ -437,6 +437,167 @@ const searchMailboxEmails = async ({
   return results.slice(0, requestedLimit);
 };
 
+const normalizePersonSearchText = (value) =>
+  String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}@._+-]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const getRecentInboxEmails = async ({
+  mailboxAddress,
+  limit = 100,
+} = {}) => {
+  if (!mailboxAddress) throw new Error('Mailbox address is required.');
+
+  const token = await getMicrosoftGraphToken();
+  const requestedLimit = Math.min(Math.max(Number(limit) || 100, 1), 100);
+  const url = new URL(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      mailboxAddress
+    )}/mailFolders/inbox/messages`
+  );
+
+  url.searchParams.set('$top', String(requestedLimit));
+  url.searchParams.set(
+    '$select',
+    'id,conversationId,subject,from,replyTo,toRecipients,ccRecipients,receivedDateTime,bodyPreview,isRead,hasAttachments'
+  );
+  url.searchParams.set('$orderby', 'receivedDateTime desc');
+
+  const response = await fetchWithTimeout(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      `Microsoft Graph inbox lookup failed for ${mailboxAddress}: ${
+        data.error?.message || response.status
+      }`
+    );
+  }
+
+  return data.value || [];
+};
+
+const scoreSenderMatch = (email, personQuery) => {
+  const query = normalizePersonSearchText(personQuery);
+  if (!query) return 0;
+
+  const senderName = normalizePersonSearchText(
+    email.from?.emailAddress?.name || ''
+  );
+  const senderAddress = normalizePersonSearchText(
+    email.from?.emailAddress?.address || ''
+  );
+  const senderText = `${senderName} ${senderAddress}`.trim();
+
+  if (!senderText) return 0;
+  if (senderAddress === query) return 120;
+  if (senderName === query) return 115;
+  if (senderText.includes(query)) return 105;
+
+  const tokens = query.split(' ').filter(Boolean);
+  if (tokens.length && tokens.every((token) => senderText.includes(token))) {
+    return 95;
+  }
+  if (tokens.length === 1 && senderName.split(' ').includes(tokens[0])) {
+    return 90;
+  }
+  return 0;
+};
+
+const findLatestInboundEmailBySender = async ({
+  mailboxAddress,
+  personQuery,
+} = {}) => {
+  const query = String(personQuery || '').trim();
+  if (!query) throw new Error('A sender name or email is required.');
+
+  // First search the actual Inbox and compare only the From field.
+  // This avoids selecting Ramy's own sent message merely because it mentions
+  // the person's name in the subject/body.
+  let candidates = await getRecentInboxEmails({
+    mailboxAddress,
+    limit: 100,
+  });
+
+  let scored = candidates
+    .map((email) => ({
+      email,
+      score: scoreSenderMatch(email, query),
+    }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return (
+        new Date(b.email.receivedDateTime || 0).getTime() -
+        new Date(a.email.receivedDateTime || 0).getTime()
+      );
+    });
+
+  // Fallback to broader mailbox search only if no inbound sender match was
+  // found in the recent Inbox. Still require the From field itself to match.
+  if (scored.length === 0) {
+    const searched = await searchMailboxEmails({
+      mailboxAddress,
+      query,
+      limit: 25,
+    });
+    scored = searched
+      .map((email) => ({
+        email,
+        score: scoreSenderMatch(email, query),
+      }))
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return (
+          new Date(b.email.receivedDateTime || 0).getTime() -
+          new Date(a.email.receivedDateTime || 0).getTime()
+        );
+      });
+  }
+
+  if (scored.length === 0) {
+    return {
+      match: null,
+      candidates: [],
+      reason: `No inbound email from a sender matching ${query} was found.`,
+    };
+  }
+
+  const bestScore = scored[0].score;
+  const strongMatches = scored.filter((entry) => entry.score >= bestScore - 5);
+
+  const uniqueByAddress = new Map();
+  for (const entry of strongMatches) {
+    const address = String(
+      entry.email.from?.emailAddress?.address || ''
+    ).toLowerCase();
+    if (address && !uniqueByAddress.has(address)) {
+      uniqueByAddress.set(address, entry.email);
+    }
+  }
+
+  if (uniqueByAddress.size > 1) {
+    return {
+      match: null,
+      reason: `More than one inbound sender matching ${query} was found.`,
+      candidates: [...uniqueByAddress.values()].slice(0, 5),
+    };
+  }
+
+  return {
+    match: scored[0].email,
+    candidates: [],
+    reason: '',
+  };
+};
+
 const listMailboxEmailAttachments = async (mailboxAddress, messageId) => {
   if (!mailboxAddress || !messageId) {
     throw new Error('Mailbox address and message id are required.');
@@ -1256,7 +1417,7 @@ const findCalendarAvailability = async ({
   validateClockTime(dayEnd, 'day_end');
 
   const duration = Math.min(Math.max(Number(durationMinutes) || 30, 15), 240);
-  const limit = Math.min(Math.max(Number(maxSlots) || 5, 1), 12);
+  const limit = Math.min(Math.max(Number(maxSlots) || 5, 1), 200);
 
   const rangeStartLocal = `${startDate}T00:00:00`;
   const dayAfterEnd = addDaysToLocalDate(endDate, 1);
@@ -1336,6 +1497,104 @@ const findCalendarAvailability = async ({
   };
 };
 
+
+const selectRepresentativeAvailabilitySlots = (slots, maxSlots = 3) => {
+  const limit = Math.min(Math.max(Number(maxSlots) || 3, 1), 5);
+  if (!Array.isArray(slots) || slots.length === 0) return [];
+
+  const byDate = new Map();
+  for (const slot of slots) {
+    const date = String(slot.startLocal || '').slice(0, 10);
+    if (!date) continue;
+    if (!byDate.has(date)) byDate.set(date, []);
+    byDate.get(date).push(slot);
+  }
+
+  const targetMinutes = [10 * 60, 13 * 60 + 30, 15 * 60, 9 * 60 + 30, 14 * 60 + 30];
+  const chosen = [];
+  const usedKeys = new Set();
+
+  const slotMinutes = (slot) => {
+    const match = String(slot.startLocal || '').match(/T(\d{2}):(\d{2})/);
+    return match ? Number(match[1]) * 60 + Number(match[2]) : 0;
+  };
+
+  // Prefer one useful option on different days before offering multiple
+  // choices on the same day.
+  let dayIndex = 0;
+  for (const [, daySlots] of [...byDate.entries()].sort(([a], [b]) =>
+    a.localeCompare(b)
+  )) {
+    if (chosen.length >= limit) break;
+    const target = targetMinutes[dayIndex % targetMinutes.length];
+    const sorted = [...daySlots].sort(
+      (a, b) =>
+        Math.abs(slotMinutes(a) - target) -
+        Math.abs(slotMinutes(b) - target)
+    );
+    if (sorted[0]) {
+      const key = `${sorted[0].startLocal}|${sorted[0].endLocal}`;
+      chosen.push(sorted[0]);
+      usedKeys.add(key);
+    }
+    dayIndex += 1;
+  }
+
+  if (chosen.length < limit) {
+    for (const slot of slots) {
+      if (chosen.length >= limit) break;
+      const key = `${slot.startLocal}|${slot.endLocal}`;
+      if (usedKeys.has(key)) continue;
+
+      // Avoid stacking nearly identical half-hour options when possible.
+      const tooClose = chosen.some((existing) => {
+        const sameDate =
+          String(existing.startLocal || '').slice(0, 10) ===
+          String(slot.startLocal || '').slice(0, 10);
+        if (!sameDate) return false;
+        return Math.abs(slotMinutes(existing) - slotMinutes(slot)) < 90;
+      });
+      if (tooClose) continue;
+
+      chosen.push(slot);
+      usedKeys.add(key);
+    }
+  }
+
+  return chosen.slice(0, limit);
+};
+
+const looksFrench = (value) => {
+  const text = ` ${String(value || '').toLowerCase()} `;
+  const markers = [
+    ' bonjour ',
+    ' merci ',
+    ' votre ',
+    ' vous ',
+    ' pour ',
+    ' concernant ',
+    ' disponibilité ',
+    ' disponibilite ',
+    ' cordialement ',
+    ' veuillez ',
+  ];
+  return markers.filter((marker) => text.includes(marker)).length >= 2;
+};
+
+const formatLocalSlotForReply = (startLocal, locale = 'en-CA') => {
+  const normalized = ensureLocalDateTime(startLocal, 'slot_start');
+  const pseudoMs = parseLocalDateTimePseudoMs(normalized);
+  return new Intl.DateTimeFormat(locale, {
+    timeZone: 'UTC',
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: locale.startsWith('en'),
+  }).format(new Date(pseudoMs));
+};
+
 const buildAvailabilityReplyDraft = async ({
   personQuery,
   startDate,
@@ -1360,11 +1619,13 @@ const buildAvailabilityReplyDraft = async ({
     dateRangeText,
   });
 
-  const [emails, availability] = await Promise.all([
-    searchMailboxEmails({
+  // Resolve the actual inbound sender and calendar openings in parallel.
+  // The sender lookup checks Inbox From metadata rather than a broad message
+  // keyword result, so it cannot accidentally choose Ramy's own sent message.
+  const [senderLookup, availability] = await Promise.all([
+    findLatestInboundEmailBySender({
       mailboxAddress: RAMY_MINACO_EMAIL,
-      query,
-      limit: 12,
+      personQuery: query,
     }),
     findCalendarAvailability({
       startDate: resolvedRange.startDate,
@@ -1372,23 +1633,17 @@ const buildAvailabilityReplyDraft = async ({
       durationMinutes,
       dayStart,
       dayEnd,
-      maxSlots,
+      // Collect enough candidates to spread recommendations across days.
+      maxSlots: 100,
       includeWeekends,
     }),
   ]);
 
-  const normalizedQuery = query.toLowerCase();
-  const senderMatches = emails.filter((email) => {
-    const name = email.from?.emailAddress?.name || '';
-    const address = email.from?.emailAddress?.address || '';
-    return `${name} ${address}`.toLowerCase().includes(normalizedQuery);
-  });
-
-  if (senderMatches.length === 0) {
+  if (!senderLookup.match) {
     return {
       needsClarification: true,
-      reason: `No email from a sender matching ${query} was found.`,
-      candidates: emails.slice(0, 5).map((email) => ({
+      reason: senderLookup.reason || `No inbound email from ${query} was found.`,
+      candidates: (senderLookup.candidates || []).slice(0, 5).map((email) => ({
         messageId: email.id,
         from: email.from?.emailAddress?.name || '',
         fromEmail: email.from?.emailAddress?.address || '',
@@ -1398,30 +1653,10 @@ const buildAvailabilityReplyDraft = async ({
     };
   }
 
-  const uniqueSenders = new Map();
-  for (const email of senderMatches) {
-    const address = String(email.from?.emailAddress?.address || '').toLowerCase();
-    if (address && !uniqueSenders.has(address)) uniqueSenders.set(address, email);
-  }
-
-  if (uniqueSenders.size > 1) {
-    return {
-      needsClarification: true,
-      reason: `More than one sender matching ${query} was found.`,
-      candidates: [...uniqueSenders.values()].slice(0, 5).map((email) => ({
-        messageId: email.id,
-        from: email.from?.emailAddress?.name || '',
-        fromEmail: email.from?.emailAddress?.address || '',
-        subject: email.subject || '(No subject)',
-        receivedDateTime: email.receivedDateTime || '',
-      })),
-    };
-  }
-
-  const email = senderMatches[0];
-  const slots = availability.slots.slice(
-    0,
-    Math.min(Math.max(Number(maxSlots) || 3, 1), 5)
+  const email = senderLookup.match;
+  const slots = selectRepresentativeAvailabilitySlots(
+    availability.slots,
+    maxSlots
   );
 
   if (slots.length === 0) {
@@ -1434,12 +1669,34 @@ const buildAvailabilityReplyDraft = async ({
 
   const senderName = String(email.from?.emailAddress?.name || '').trim();
   const firstName = senderName.split(/\s+/)[0] || 'there';
-  const slotLines = slots.map((slot) => `- ${slot.startMontreal}`).join('\n');
-  const body = `Hi ${firstName},\n\nThank you for your email. I am available at any of the following times (Montreal time):\n\n${slotLines}\n\nPlease let me know which option works best for you.\n\nBest,\nRamy`;
   const recipients = getReplyRecipientSummary(email, replyMode);
 
   if (recipients.length === 0) {
     throw new Error('No valid reply recipient could be determined.');
+  }
+
+  const sourceText = `${email.subject || ''}\n${email.bodyPreview || ''}`;
+  const useFrench = looksFrench(sourceText);
+
+  let body;
+  if (useFrench) {
+    const slotLines = slots
+      .map(
+        (slot, index) =>
+          `${index + 1}. ${formatLocalSlotForReply(slot.startLocal, 'fr-CA')}`
+      )
+      .join('\n');
+
+    body = `Bonjour ${firstName},\n\nMerci pour votre courriel. Voici trois plages de disponibilité pour la semaine prochaine, heure de Montréal :\n\n${slotLines}\n\nMerci de me confirmer la plage qui vous convient le mieux.\n\nCordialement,\nRamy`;
+  } else {
+    const slotLines = slots
+      .map(
+        (slot, index) =>
+          `${index + 1}. ${formatLocalSlotForReply(slot.startLocal, 'en-CA')}`
+      )
+      .join('\n');
+
+    body = `Hi ${firstName},\n\nThank you for your email. Here are three available times for next week, Montreal time:\n\n${slotLines}\n\nPlease let me know which option works best for you.\n\nBest,\nRamy`;
   }
 
   return {
@@ -1449,6 +1706,7 @@ const buildAvailabilityReplyDraft = async ({
       subject: email.subject || '(No subject)',
       from: senderName || email.from?.emailAddress?.address || '',
       fromEmail: email.from?.emailAddress?.address || '',
+      receivedDateTime: email.receivedDateTime || '',
       preview: email.bodyPreview || '',
     },
     replyMode,
@@ -2593,12 +2851,16 @@ Use check_availability whenever Ramy asks whether he is free at one specific tim
 Use find_availability whenever Ramy asks for several possible times, asks for his availability over a day/week/date range, or asks you to reply to someone with his availability. Do NOT ask Ramy to tell you his availability when his live calendar can answer it.
 For relative date phrases such as "next week" or "this week", pass the phrase itself in date_range. Do NOT manually calculate start_date/end_date unless Ramy gave explicit calendar dates. The server resolves relative ranges using the current Montreal date.
 If no meeting duration is stated for an availability request, default to 30 minutes. Unless Ramy or the email specifies otherwise, search normal business hours from 9:00 AM to 5:00 PM Montreal time and offer 3 to 5 useful slots. Respect any duration, day, or time constraints stated in the email or by Ramy.
+
+AVAILABILITY TRUTH RULE: Never say you checked Ramy's calendar unless the current calendar tool call returned success. Never invent, recycle, or infer calendar openings after a failed tool call. If a calendar or availability tool fails, say it failed. When proposing availability, use the exact returned slots only. Do not turn separate exact slots into a broad range with contradictory exceptions.
 All spoken calendar times are Montreal local time unless Ramy explicitly specifies another time zone.
 If Ramy asks whether you have calendar access, answer directly that you have live access to his Minaco calendar through the authorized calendar tools. Do not call a tool merely to explain that access.
 
 CALENDAR-AWARE EMAIL TASKS
 
-FAST PATH: If Ramy says something like "respond to Francis and give him my availability next week", use prepare_availability_reply as the FIRST choice. It searches the named sender and checks the calendar in one server-side workflow, then prepares a reply draft. Do not chain search_email + read_email + find_availability + prepare_email_reply unless the full email imposes special meeting constraints that the fast path cannot handle.
+FAST PATH FOR NEXT WEEK: If Ramy says something like "respond to Francis and give him my availability next week", use prepare_next_week_availability_reply as the FIRST choice. This dedicated tool calculates the next Monday-Friday on the server in Montreal time, finds the latest actual inbound email from that sender, checks the live calendar, chooses three useful openings across different days when possible, and prepares the reply. It does not depend on you calculating or formatting dates.
+
+For availability periods other than next week, use prepare_availability_reply. Do not chain search_email + read_email + find_availability + prepare_email_reply unless the full email imposes special meeting constraints that the fast path cannot handle.
 
 If the fast path cannot identify the sender or find open slots, ask one concise clarification question. Do not ask Ramy to state his availability when the live calendar can answer it.
 
@@ -2817,6 +3079,7 @@ fastify.register(async (fastifyInstance) => {
         'check_availability',
         'find_availability',
         'prepare_availability_reply',
+        'prepare_next_week_availability_reply',
         'daily_executive_brief',
         'list_actions',
       ]);
@@ -3365,6 +3628,44 @@ fastify.register(async (fastifyInstance) => {
                       description: 'Whether Saturday and Sunday may be offered. Default false.',
                     },
                   },
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'prepare_next_week_availability_reply',
+                description:
+                  'Dedicated fast path for requests such as respond to Francis and give him three availabilities for next week. The server itself resolves next Monday-Friday in Montreal time, finds the latest inbound email FROM that sender, checks Ramy’s live calendar, and prepares a reply. It NEVER sends. Use this instead of prepare_availability_reply whenever the user explicitly says next week.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    person_query: {
+                      type: 'string',
+                      description:
+                        'Sender name or email exactly as Ramy identifies the person, for example Francis.',
+                    },
+                    duration_minutes: {
+                      type: 'integer',
+                      minimum: 15,
+                      maximum: 240,
+                      description:
+                        'Meeting duration. Default 30 minutes if Ramy does not specify one.',
+                    },
+                    max_slots: {
+                      type: 'integer',
+                      minimum: 1,
+                      maximum: 5,
+                      description:
+                        'Number of availability options. Default 3.',
+                    },
+                    reply_mode: {
+                      type: 'string',
+                      enum: ['sender', 'all'],
+                      description:
+                        'sender for reply-to-sender only; all for reply-all. Default sender.',
+                    },
+                  },
+                  required: ['person_query'],
                   additionalProperties: false,
                 },
               },
@@ -4321,6 +4622,67 @@ fastify.register(async (fastifyInstance) => {
                 response.call_id,
                 { success: false, error: error.message },
                 'Tell Ramy the availability check failed and state the returned error concisely.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'prepare_next_week_availability_reply'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const result = await buildAvailabilityReplyDraft({
+                personQuery: args.person_query,
+                dateRangeText: 'next week',
+                durationMinutes: args.duration_minutes ?? 30,
+                dayStart: '09:00',
+                dayEnd: '17:00',
+                maxSlots: args.max_slots ?? 3,
+                includeWeekends: false,
+                replyMode: args.reply_mode || 'sender',
+              });
+
+              if (result.needsClarification) {
+                respondToToolCall(
+                  response.call_id,
+                  { success: false, ...result },
+                  'The next-week availability workflow needs one clarification about the sender or recipient. Ask ONE short question based only on the returned reason or candidates. Do not ask Ramy for dates or for his availability.'
+                );
+                return;
+              }
+
+              pendingEmailReply = {
+                messageId: result.email.messageId,
+                mode: result.replyMode,
+                body: result.body,
+                subject: result.email.subject,
+                recipients: result.recipients,
+              };
+              pendingEmailDraft = null;
+              pendingEmailActionType = 'reply';
+
+              respondToToolCall(
+                response.call_id,
+                {
+                  success: true,
+                  sent: false,
+                  from: RAMY_MINACO_EMAIL,
+                  sourceEmail: result.email,
+                  replyMode: result.replyMode,
+                  recipients: result.recipients,
+                  availability: result.availability,
+                  body: result.body,
+                },
+                'This is the completed next-week availability reply. Read back the three exact Montreal-time options and the prepared reply. Clearly say it has NOT been sent and ask Ramy to say Send it. Do not run another availability or email search unless Ramy changes the request.'
+              );
+            } catch (error) {
+              console.error('Next-week availability reply error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the next-week reply workflow failed and state the exact technical error in one sentence. Do not ask him to provide calendar availability or calculate dates.'
               );
             }
             return;
