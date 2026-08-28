@@ -2812,6 +2812,7 @@ Verified Minaco identities:
 
 When Ramy asks what his email address is without specifying another company, answer ramy.mina@minaco.ca.
 When Ramy asks who you are, say: "I am London Assistant, your executive assistant for Minaco."
+Ramy's first name is spelled RAMY with a Y. When writing his name or signing an email, always use "Ramy", never "Rami".
 
 ACCURACY IS YOUR HIGHEST PRIORITY
 
@@ -2838,7 +2839,8 @@ For a REPLY to an email in Ramy's Minaco inbox:
 5. Read back whether it is sender-only or reply-all, the recipients, subject, and complete reply text. Clearly say it has NOT been sent yet.
 6. Ask Ramy to confirm by saying "Send it."
 
-Use send_confirmed_email ONLY after Ramy explicitly confirms the currently pending NEW email or REPLY with "Send it" or an unmistakable equivalent in direct response to your confirmation request.
+Use send_confirmed_email ONLY after Ramy explicitly confirms the currently pending NEW email or REPLY with a direct send command such as "Send it", "Yes, send it", "Send the email", or "Go ahead and send it" in a NEW user turn after you read the draft back.
+IMPORTANT: "Thank you", "thanks", "okay", "perfect", "sounds good", "yes", silence, or moving to another topic are NOT permission to send. Never interpret politeness or acknowledgment as authorization. The server independently validates the user's spoken confirmation and will refuse the send tool without an explicit send phrase.
 Never claim an email or reply was sent unless the send tool confirms success.
 Never invent a recipient email address. If Ramy gives only a person's name for a new email and you do not have a verified email address, ask for the email address.
 
@@ -2914,7 +2916,7 @@ For CANCELLING:
 5. Use confirm_calendar_action only after explicit confirmation.
 
 If more than one calendar event could match Ramy's request, do not guess. Tell him the matching events and ask which one he means.
-Never call confirm_calendar_action unless there is a pending prepared action and Ramy has explicitly confirmed it.
+Never call confirm_calendar_action unless there is a pending prepared action and Ramy has explicitly confirmed it in a NEW user turn after you read the proposed calendar action back. The server independently validates the spoken confirmation. Polite acknowledgments such as "thank you", "okay", "perfect", or "yes" alone are NOT authorization.
 Never claim a meeting was booked, changed, or cancelled unless Microsoft Graph confirms success.
 
 SMS
@@ -2957,6 +2959,8 @@ const LOG_EVENT_TYPES = [
   'input_audio_buffer.committed',
   'input_audio_buffer.speech_stopped',
   'input_audio_buffer.speech_started',
+  'conversation.item.input_audio_transcription.completed',
+  'conversation.item.input_audio_transcription.failed',
   'session.created',
   'session.updated',
 ];
@@ -3082,6 +3086,11 @@ fastify.register(async (fastifyInstance) => {
       let pendingEmailReply = null;
       let pendingEmailActionType = null;
       let pendingCalendarAction = null;
+      let latestUserSpeechStartedAt = 0;
+      let lastUserTranscript = '';
+      let lastUserTranscriptSpeechStartedAt = 0;
+      let emailConfirmationArmedAt = 0;
+      let calendarConfirmationArmedAt = 0;
       let activeToolCallId = null;
       let activeToolName = null;
       let activeToolStartedAt = 0;
@@ -3178,6 +3187,58 @@ fastify.register(async (fastifyInstance) => {
         return true;
       };
 
+      const normalizeConfirmationTranscript = (value) =>
+        String(value || '')
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+      const isExplicitEmailSendConfirmation = (value) => {
+        const text = normalizeConfirmationTranscript(value);
+        return /^(?:yes\s+)?(?:please\s+)?send\s+(?:it|the\s+email|the\s+reply)(?:\s+please)?$/.test(text) ||
+          /^go\s+ahead(?:\s+and)?\s+send\s+(?:it|the\s+email|the\s+reply)$/.test(text);
+      };
+
+      const isExplicitCalendarConfirmation = (value, actionType) => {
+        const text = normalizeConfirmationTranscript(value);
+        if (actionType === 'create') {
+          return /^(?:yes\s+)?(?:please\s+)?book\s+it(?:\s+please)?$/.test(text) ||
+            /^go\s+ahead(?:\s+and)?\s+book\s+it$/.test(text);
+        }
+        if (actionType === 'update') {
+          return /^(?:yes\s+)?(?:please\s+)?(?:reschedule\s+it|make\s+the\s+change)(?:\s+please)?$/.test(text) ||
+            /^go\s+ahead(?:\s+and)?\s+(?:reschedule\s+it|make\s+the\s+change)$/.test(text);
+        }
+        if (actionType === 'cancel') {
+          return /^(?:yes\s+)?(?:please\s+)?cancel\s+it(?:\s+please)?$/.test(text) ||
+            /^go\s+ahead(?:\s+and)?\s+cancel\s+it$/.test(text);
+        }
+        return false;
+      };
+
+      const waitForUserConfirmationTranscript = async (armedAt, timeoutMs = 2200) => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          if (
+            lastUserTranscript &&
+            lastUserTranscriptSpeechStartedAt > armedAt
+          ) {
+            return lastUserTranscript;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        return '';
+      };
+
+      const armEmailConfirmation = () => {
+        emailConfirmationArmedAt = Date.now();
+      };
+
+      const armCalendarConfirmation = () => {
+        calendarConfirmationArmedAt = Date.now();
+      };
+
       const initializeSession = () => {
         const currentMontrealContext = formatMontrealDateTime(new Date());
 
@@ -3190,6 +3251,10 @@ fastify.register(async (fastifyInstance) => {
             audio: {
               input: {
                 format: { type: 'audio/pcmu' },
+                transcription: {
+                  model: 'gpt-4o-mini-transcribe',
+                  prompt: 'Ramy Mina, Minaco, London Assistant, Francis Deslauriers, Curé-Labelle, Laval, Joannie, Addenda 01',
+                },
                 turn_detection: {
                   type: 'semantic_vad',
                   eagerness: 'medium',
@@ -3315,7 +3380,7 @@ fastify.register(async (fastifyInstance) => {
                 type: 'function',
                 name: 'send_confirmed_email',
                 description:
-                  'Send the currently pending prepared email action, either a new London email or a reply from Ramy’s mailbox. Use ONLY after Ramy explicitly confirms by saying Send it or an unmistakable equivalent.',
+                  'Send the currently pending prepared email action. Use ONLY after Ramy explicitly says Send it, Yes send it, Send the email/reply, or Go ahead and send it in a new user turn after the draft was read back. The server validates the actual user transcript; thanks, okay, perfect, yes alone, or other acknowledgments are never sufficient.',
                 parameters: {
                   type: 'object',
                   properties: {},
@@ -3945,6 +4010,16 @@ fastify.register(async (fastifyInstance) => {
         try {
           const response = JSON.parse(data);
 
+          if (response.type === 'conversation.item.input_audio_transcription.completed') {
+            lastUserTranscript = String(response.transcript || '').trim();
+            lastUserTranscriptSpeechStartedAt = latestUserSpeechStartedAt;
+            console.log('USER TRANSCRIPT:', lastUserTranscript);
+          }
+
+          if (response.type === 'conversation.item.input_audio_transcription.failed') {
+            console.error('User transcription failed:', response.error || response);
+          }
+
           if (
             response.type === 'response.function_call_arguments.done' &&
             cancellableToolNames.has(response.name)
@@ -3959,6 +4034,28 @@ fastify.register(async (fastifyInstance) => {
             response.name === 'send_confirmed_email'
           ) {
             try {
+              if (!pendingEmailActionType || (!pendingEmailReply && !pendingEmailDraft)) {
+                throw new Error('There is no pending email action to send.');
+              }
+
+              const confirmationTranscript = await waitForUserConfirmationTranscript(
+                emailConfirmationArmedAt
+              );
+
+              if (!isExplicitEmailSendConfirmation(confirmationTranscript)) {
+                respondToToolCall(
+                  response.call_id,
+                  {
+                    success: false,
+                    sent: false,
+                    confirmationRequired: true,
+                    heard: confirmationTranscript || null,
+                  },
+                  'Do NOT call another tool. Tell Ramy the email was NOT sent because an explicit send command was not heard. Ask him to say exactly Send it if he wants to send. Thank you, okay, perfect, sounds good, and yes alone do not count.'
+                );
+                return;
+              }
+
               if (pendingEmailActionType === 'reply') {
                 if (!pendingEmailReply) {
                   throw new Error('There is no pending email reply to send.');
@@ -3969,6 +4066,7 @@ fastify.register(async (fastifyInstance) => {
                 pendingEmailReply = null;
                 pendingEmailDraft = null;
                 pendingEmailActionType = null;
+                emailConfirmationArmedAt = 0;
 
                 respondToToolCall(
                   response.call_id,
@@ -3993,6 +4091,7 @@ fastify.register(async (fastifyInstance) => {
                 pendingEmailDraft = null;
                 pendingEmailReply = null;
                 pendingEmailActionType = null;
+                emailConfirmationArmedAt = 0;
 
                 respondToToolCall(
                   response.call_id,
@@ -4038,6 +4137,7 @@ fastify.register(async (fastifyInstance) => {
               };
               pendingEmailReply = null;
               pendingEmailActionType = 'new';
+              armEmailConfirmation();
 
               respondToToolCall(
                 response.call_id,
@@ -4188,6 +4288,7 @@ fastify.register(async (fastifyInstance) => {
               };
               pendingEmailDraft = null;
               pendingEmailActionType = 'reply';
+              armEmailConfirmation();
 
               respondToToolCall(
                 response.call_id,
@@ -4682,6 +4783,7 @@ fastify.register(async (fastifyInstance) => {
               };
               pendingEmailDraft = null;
               pendingEmailActionType = 'reply';
+              armEmailConfirmation();
 
               respondToToolCall(
                 response.call_id,
@@ -4745,6 +4847,7 @@ fastify.register(async (fastifyInstance) => {
               };
               pendingEmailDraft = null;
               pendingEmailActionType = 'reply';
+              armEmailConfirmation();
 
               respondToToolCall(
                 response.call_id,
@@ -4842,6 +4945,7 @@ fastify.register(async (fastifyInstance) => {
                   body: args.body || '',
                 },
               };
+              armCalendarConfirmation();
 
               respondToToolCall(
                 response.call_id,
@@ -4916,6 +5020,7 @@ fastify.register(async (fastifyInstance) => {
                 eventSubject: args.event_subject || '',
                 payload,
               };
+              armCalendarConfirmation();
 
               respondToToolCall(
                 response.call_id,
@@ -4956,6 +5061,7 @@ fastify.register(async (fastifyInstance) => {
                   eventId: args.event_id,
                 },
               };
+              armCalendarConfirmation();
 
               respondToToolCall(
                 response.call_id,
@@ -4987,6 +5093,30 @@ fastify.register(async (fastifyInstance) => {
               }
 
               const action = { ...pendingCalendarAction };
+              const confirmationTranscript = await waitForUserConfirmationTranscript(
+                calendarConfirmationArmedAt
+              );
+
+              if (!isExplicitCalendarConfirmation(confirmationTranscript, action.type)) {
+                const expected =
+                  action.type === 'create'
+                    ? 'Book it'
+                    : action.type === 'update'
+                      ? 'Reschedule it or Make the change'
+                      : 'Cancel it';
+                respondToToolCall(
+                  response.call_id,
+                  {
+                    success: false,
+                    completed: false,
+                    confirmationRequired: true,
+                    heard: confirmationTranscript || null,
+                  },
+                  `Do NOT call another tool. Tell Ramy the calendar was NOT changed because an explicit confirmation was not heard. Ask him to say ${expected}. Polite acknowledgments do not count.`
+                );
+                return;
+              }
+
               let result;
 
               if (action.type === 'create') {
@@ -5000,6 +5130,7 @@ fastify.register(async (fastifyInstance) => {
               }
 
               pendingCalendarAction = null;
+              calendarConfirmationArmedAt = 0;
 
               respondToToolCall(
                 response.call_id,
@@ -5084,6 +5215,7 @@ fastify.register(async (fastifyInstance) => {
           }
 
           if (response.type === 'input_audio_buffer.speech_started') {
+            latestUserSpeechStartedAt = Date.now();
             cancelActiveReadOnlyTool();
             handleSpeechStartedEvent();
           }
