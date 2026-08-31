@@ -3,7 +3,7 @@ import WebSocket from 'ws';
 import dotenv from 'dotenv';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 
 // Load environment variables from .env file
 dotenv.config();
@@ -37,6 +37,8 @@ const ACTION_REGISTER_CALENDAR_NAME = 'London Action Register';
 const DOCUMENT_ANALYSIS_MODEL = OPENAI_DOCUMENT_MODEL || 'gpt-5.6';
 const DAILY_BRIEF_MODEL = EXECUTIVE_BRIEF_MODEL || 'gpt-5.6-luna';
 const TASK_INBOX_ANALYSIS_MODEL = TASK_INBOX_MODEL || DOCUMENT_ANALYSIS_MODEL;
+const ACTION_MESSAGE_MODEL = process.env.ACTION_MESSAGE_MODEL || 'gpt-5.6-luna';
+const MAX_MESSAGING_REPLY_CHARS = 1450;
 const MAX_ATTACHMENT_BYTES = 45 * 1024 * 1024;
 const MAX_TASK_ATTACHMENTS = 10;
 const MAX_TASK_TOTAL_BYTES = 45 * 1024 * 1024;
@@ -105,6 +107,92 @@ const sendSmsToRamy = async (message) => {
     throw new Error(`Twilio SMS failed: ${data.message || response.status}`);
   }
 
+  return data;
+};
+
+
+const normalizePhoneIdentity = (value) => {
+  const raw = String(value || '').trim().toLowerCase();
+  const withoutChannel = raw.startsWith('whatsapp:') ? raw.slice('whatsapp:'.length) : raw;
+  const digits = withoutChannel.replace(/[^0-9+]/g, '');
+  if (!digits) return '';
+  if (digits.startsWith('+')) return `+${digits.slice(1).replace(/\D/g, '')}`;
+  return `+${digits.replace(/\D/g, '')}`;
+};
+
+const isAuthorizedRamyMessagingSender = (value) => {
+  const sender = normalizePhoneIdentity(value);
+  const ramy = normalizePhoneIdentity(RAMY_PHONE_NUMBER);
+  return Boolean(sender && ramy && sender === ramy);
+};
+
+const twilioPublicWebhookUrl = (request) => {
+  const forwardedProto = String(request.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const forwardedHost = String(request.headers['x-forwarded-host'] || '').split(',')[0].trim();
+  const protocol = forwardedProto || 'https';
+  const host = forwardedHost || request.headers.host;
+  return `${protocol}://${host}${request.raw.url}`;
+};
+
+const validateTwilioFormWebhook = (request) => {
+  if (!TWILIO_AUTH_TOKEN) return false;
+  const signature = String(request.headers['x-twilio-signature'] || '').trim();
+  if (!signature) return false;
+
+  const params = request.body && typeof request.body === 'object' ? request.body : {};
+  let payload = twilioPublicWebhookUrl(request);
+  for (const key of Object.keys(params).sort()) {
+    const value = params[key];
+    if (Array.isArray(value)) {
+      for (const item of [...value].map(String).sort()) payload += `${key}${item}`;
+    } else if (value != null) {
+      payload += `${key}${String(value)}`;
+    }
+  }
+
+  const expected = createHmac('sha1', TWILIO_AUTH_TOKEN)
+    .update(payload, 'utf8')
+    .digest('base64');
+
+  const a = Buffer.from(expected);
+  const b = Buffer.from(signature);
+  return a.length === b.length && timingSafeEqual(a, b);
+};
+
+const sendTwilioChannelMessage = async ({ to, from, body }) => {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+    throw new Error('Missing Twilio messaging credentials.');
+  }
+  if (!to || !from) throw new Error('Twilio To and From addresses are required.');
+
+  const auth = Buffer.from(
+    `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
+  ).toString('base64');
+
+  const cleanBody = String(body || '').trim().slice(0, MAX_MESSAGING_REPLY_CHARS);
+  const form = new URLSearchParams({
+    To: String(to),
+    From: String(from),
+    Body: cleanBody || 'Updated.',
+  });
+
+  const response = await fetchWithTimeout(
+    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: form.toString(),
+    },
+    12000
+  );
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(`Twilio messaging send failed: ${data.message || response.status}`);
+  }
   return data;
 };
 
@@ -2764,6 +2852,348 @@ const updateActionItem = async (eventId, changes = {}) => {
   return { eventId: data.id || eventId, ...merged };
 };
 
+
+// -----------------------------------------------------------------------------
+// Unified quick Action Register updates for SMS, WhatsApp, and Voice
+// -----------------------------------------------------------------------------
+
+const messagingState = new Map();
+const processedMessagingSids = new Map();
+const MESSAGING_STATE_TTL_MS = 6 * 60 * 60 * 1000;
+const MESSAGING_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
+
+const pruneMessagingState = () => {
+  const now = Date.now();
+  for (const [key, value] of messagingState.entries()) {
+    if (!value?.updatedAt || now - value.updatedAt > MESSAGING_STATE_TTL_MS) {
+      messagingState.delete(key);
+    }
+  }
+  for (const [key, timestamp] of processedMessagingSids.entries()) {
+    if (now - timestamp > MESSAGING_DEDUPE_TTL_MS) processedMessagingSids.delete(key);
+  }
+};
+
+const messagingKey = (channel, sender) =>
+  `${String(channel || 'sms').toLowerCase()}:${normalizePhoneIdentity(sender)}`;
+
+const actionCompactForParser = (action, index) => ({
+  index: index + 1,
+  title: action.title,
+  project: action.project,
+  status: action.status,
+  priority: action.priority,
+  owner: action.owner,
+  waitingOn: action.waitingOn,
+  nextFollowUp: action.nextFollowUp,
+  hardDeadline: action.hardDeadline,
+  nextAction: action.nextAction,
+  ramyRequired: action.ramyRequired,
+});
+
+const messagingActionLine = (action, index) => {
+  const detail = [];
+  if (action.status) detail.push(action.status);
+  if (action.waitingOn) detail.push(`waiting on ${action.waitingOn}`);
+  if (action.nextFollowUp) detail.push(`follow-up ${action.nextFollowUp}`);
+  if (action.hardDeadline) detail.push(`deadline ${action.hardDeadline}`);
+  return `${index + 1}. ${action.title}${detail.length ? ` — ${detail.join('; ')}` : ''}`;
+};
+
+const formatActionListForMessaging = (actions, heading = 'Open actions') => {
+  const visible = actions.slice(0, 8);
+  if (!visible.length) return `${heading}: none.`;
+  return `${heading}:\n${visible.map(messagingActionLine).join('\n')}\nReply naturally, e.g. “1 done”, “2 waiting on Anass until Friday”, or “add task: call Makar tomorrow”.`;
+};
+
+const parseDateOnlySafe = (value) => {
+  const match = String(value || '').trim().match(/^(\d{4}-\d{2}-\d{2})$/);
+  return match ? match[1] : '';
+};
+
+const nextWeekdayFromMontrealToday = (weekday, forceNext = false) => {
+  const today = montrealDateParts();
+  const current = weekdayForDateOnly(today);
+  let delta = (weekday - current + 7) % 7;
+  if (delta === 0 && forceNext) delta = 7;
+  return addDaysToLocalDate(today, delta);
+};
+
+const resolveSimpleActionDateText = (value) => {
+  const raw = String(value || '').trim();
+  const exact = parseDateOnlySafe(raw);
+  if (exact) return exact;
+  const phrase = raw.toLowerCase().replace(/[.,]/g, '').replace(/\s+/g, ' ').trim();
+  if (!phrase) return '';
+  if (phrase === 'today') return montrealDateParts();
+  if (phrase === 'tomorrow') return addDaysToLocalDate(montrealDateParts(), 1);
+  if (phrase === 'next week') {
+    return resolveAvailabilityDateRange({ dateRangeText: 'next week' }).startDate;
+  }
+  const names = {
+    sunday: 0,
+    monday: 1,
+    tuesday: 2,
+    wednesday: 3,
+    thursday: 4,
+    friday: 5,
+    saturday: 6,
+  };
+  const weekdayMatch = phrase.match(/^(next\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/);
+  if (weekdayMatch) {
+    return nextWeekdayFromMontrealToday(names[weekdayMatch[2]], Boolean(weekdayMatch[1]));
+  }
+  return '';
+};
+
+const normalizedMessagingChanges = (changes = {}) => {
+  const out = {};
+  const copy = (input, output = input) => {
+    if (Object.prototype.hasOwnProperty.call(changes, input) && changes[input] !== null) {
+      out[output] = changes[input];
+    }
+  };
+  copy('status');
+  copy('priority');
+  copy('owner');
+  copy('next_action', 'nextAction');
+  copy('waiting_on', 'waitingOn');
+  copy('ramy_required', 'ramyRequired');
+  copy('risk_if_delayed', 'riskIfDelayed');
+  copy('notes');
+
+  for (const [input, output] of [
+    ['next_follow_up', 'nextFollowUp'],
+    ['hard_deadline', 'hardDeadline'],
+    ['promised_date', 'promisedDate'],
+    ['ramy_decision_by', 'ramyDecisionBy'],
+  ]) {
+    if (!Object.prototype.hasOwnProperty.call(changes, input) || changes[input] == null) continue;
+    const raw = String(changes[input]).trim();
+    const resolved = resolveSimpleActionDateText(raw) || parseDateOnlySafe(raw);
+    if (resolved) out[output] = resolved;
+  }
+  return out;
+};
+
+const parseMessagingActionCommand = async ({ text, actions, recentList }) => {
+  const context = {
+    currentMontrealDate: montrealDateParts(),
+    currentMontrealDateTime: formatMontrealDateTime(new Date()),
+    openActions: actions.map(actionCompactForParser),
+    recentNumberedList: Array.isArray(recentList)
+      ? recentList.map((action, index) => ({ index: index + 1, title: action.title }))
+      : [],
+    message: String(text || '').trim(),
+  };
+
+  const response = await callOpenAIResponses(
+    {
+      model: ACTION_MESSAGE_MODEL,
+      instructions: `You are London's Action Register command parser for Ramy Mina. Interpret a short SMS, WhatsApp, or voice status update and return ONLY valid JSON, no Markdown.
+The current Montreal date/time and current open actions are supplied.
+Ramy should be able to write naturally: “Joannie done”, “waiting on Anass until Friday”, “follow up with Franco next Tuesday”, “add task: call Makar tomorrow”, “cancel the EV item”, “what's overdue?”, or several updates in one message.
+Do not guess which action Ramy means when two actions are genuinely plausible. In that case return a clarify operation.
+Only mark COMPLETED when Ramy clearly says done/completed/finished/resolved/closed. Only mark CANCELLED when he clearly cancels/drops it.
+“Waiting on NAME” normally means WAITING - EXTERNAL, waitingOn NAME, ramyRequired false. “Waiting on me/Ramy/my decision” means WAITING - RAMY and ramyRequired true.
+“Follow up DATE” sets next_follow_up to a date. Return dates as YYYY-MM-DD whenever possible using the supplied Montreal date. If the user uses a simple phrase such as tomorrow, Friday, next Friday, or next week, you may return that phrase and the server will resolve it.
+If Ramy says he personally needs to decide/approve/review, use WAITING - RAMY and ramy_required true.
+For new tasks, title must be a concise outcome/action, not the entire message. Do not invent deadlines or people.
+If Ramy asks a status question, return a list operation rather than changing anything.
+Use target_index to refer ONLY to the numbered openActions list. Never invent an index.
+Return this exact JSON shape:
+{
+  "operations": [
+    {
+      "type": "update|create|list|clarify|noop",
+      "target_index": 1,
+      "changes": {
+        "status": null,
+        "priority": null,
+        "owner": null,
+        "next_follow_up": null,
+        "hard_deadline": null,
+        "promised_date": null,
+        "next_action": null,
+        "waiting_on": null,
+        "ramy_required": null,
+        "ramy_decision_by": null,
+        "risk_if_delayed": null,
+        "notes": null
+      },
+      "create": {
+        "title": null,
+        "project": null,
+        "category": null,
+        "owner": "London",
+        "promised_date": null,
+        "hard_deadline": null,
+        "next_follow_up": null,
+        "status": "ACTIVE",
+        "priority": "NORMAL",
+        "next_action": null,
+        "waiting_on": null,
+        "ramy_required": false,
+        "ramy_decision_by": null,
+        "risk_if_delayed": null,
+        "notes": null
+      },
+      "list_filter": "open|overdue|waiting_ramy|waiting_external|critical|all",
+      "clarification": null
+    }
+  ]
+}
+Maximum 6 operations. If the message is just politeness or unrelated, return one noop operation.`,
+      input: JSON.stringify(context),
+    },
+    22000
+  );
+
+  const raw = extractOpenAIResponseText(response);
+  if (!raw) throw new Error('London could not interpret the update.');
+  const parsed = JSON.parse(stripJsonCodeFence(raw));
+  return Array.isArray(parsed.operations) ? parsed.operations.slice(0, 6) : [];
+};
+
+const actionListByFilter = (actions, filter) => {
+  const normalized = String(filter || 'open').toLowerCase();
+  if (normalized === 'overdue') return actions.filter((a) => a.overdue);
+  if (normalized === 'waiting_ramy') return actions.filter((a) => a.status === 'WAITING - RAMY');
+  if (normalized === 'waiting_external') return actions.filter((a) => a.status === 'WAITING - EXTERNAL');
+  if (normalized === 'critical') return actions.filter((a) => ['CRITICAL', 'HIGH'].includes(a.priority));
+  return actions;
+};
+
+const processQuickActionInstruction = async ({ text, channel = 'voice', sender = RAMY_PHONE_NUMBER }) => {
+  const cleanText = String(text || '').trim();
+  if (!cleanText) return { success: false, reply: 'I did not receive an update to process.' };
+
+  pruneMessagingState();
+  const key = messagingKey(channel, sender);
+  const state = messagingState.get(key) || { recentList: [], lastEventId: '', updatedAt: Date.now() };
+  const lower = cleanText.toLowerCase().trim();
+
+  const allOpen = await listActionItems({ includeClosed: false, limit: 100 });
+
+  // Very fast common list commands do not need an AI interpretation round-trip.
+  let directListFilter = '';
+  if (/^(open|open tasks|tasks|status|what'?s open|what is open)$/i.test(cleanText)) directListFilter = 'open';
+  if (/overdue/i.test(lower) && /^(what|show|list|overdue)/i.test(lower)) directListFilter = 'overdue';
+  if (/waiting on me|waiting on ramy|my decisions|needs my decision/i.test(lower)) directListFilter = 'waiting_ramy';
+  if (directListFilter) {
+    const selected = actionListByFilter(allOpen, directListFilter).slice(0, 8);
+    state.recentList = selected;
+    state.updatedAt = Date.now();
+    messagingState.set(key, state);
+    return { success: true, reply: formatActionListForMessaging(selected, directListFilter === 'overdue' ? 'Overdue actions' : 'Open actions'), actions: selected };
+  }
+
+  // Numbered shortcuts after London has listed items: "1 done", "2 cancel".
+  const numbered = cleanText.match(/^\s*(\d{1,2})\s+(done|completed?|finished|cancel(?:led)?|drop(?:ped)?)\s*[.!]?\s*$/i);
+  if (numbered && state.recentList?.length) {
+    const idx = Number(numbered[1]) - 1;
+    const target = state.recentList[idx];
+    if (!target) return { success: false, reply: `I don't have item ${numbered[1]} in the last list. Ask me for open tasks again.` };
+    const status = /cancel|drop/i.test(numbered[2]) ? 'CANCELLED' : 'COMPLETED';
+    const updated = await updateActionItem(target.eventId, {
+      status,
+      lastContact: montrealDateParts(),
+      nextAction: status === 'COMPLETED' ? 'Completed.' : 'Cancelled by Ramy.',
+      waitingOn: '',
+      ramyRequired: false,
+    });
+    state.lastEventId = updated.eventId;
+    state.updatedAt = Date.now();
+    messagingState.set(key, state);
+    return { success: true, reply: `Updated: ${updated.title} — ${status}.`, action: updated };
+  }
+
+  const operations = await parseMessagingActionCommand({
+    text: cleanText,
+    actions: allOpen,
+    recentList: state.recentList,
+  });
+
+  if (!operations.length) return { success: false, reply: 'I could not identify an Action Register update in that message.' };
+
+  const confirmations = [];
+  for (const operation of operations) {
+    const type = String(operation?.type || '').toLowerCase();
+
+    if (type === 'noop') continue;
+
+    if (type === 'clarify') {
+      confirmations.push(String(operation.clarification || 'Which action do you mean?'));
+      continue;
+    }
+
+    if (type === 'list') {
+      const selected = actionListByFilter(allOpen, operation.list_filter).slice(0, 8);
+      state.recentList = selected;
+      confirmations.push(formatActionListForMessaging(selected, 'Action Register'));
+      continue;
+    }
+
+    if (type === 'update') {
+      const index = Number(operation.target_index);
+      const target = Number.isInteger(index) && index >= 1 ? allOpen[index - 1] : null;
+      if (!target) {
+        confirmations.push('I could not safely match one of those updates to an open action. Please name the item more specifically.');
+        continue;
+      }
+      const changes = normalizedMessagingChanges(operation.changes || {});
+      changes.lastContact = montrealDateParts();
+      const updated = await updateActionItem(target.eventId, changes);
+      state.lastEventId = updated.eventId;
+      const summary = [`Updated: ${updated.title}`];
+      if (changes.status) summary.push(updated.status);
+      if (changes.waitingOn) summary.push(`waiting on ${updated.waitingOn}`);
+      if (changes.nextFollowUp) summary.push(`follow-up ${updated.nextFollowUp}`);
+      if (changes.hardDeadline) summary.push(`deadline ${updated.hardDeadline}`);
+      if (changes.nextAction && !changes.status) summary.push(updated.nextAction);
+      confirmations.push(`${summary.join(' — ')}.`);
+      continue;
+    }
+
+    if (type === 'create') {
+      const create = operation.create || {};
+      if (!String(create.title || '').trim()) {
+        confirmations.push('I understood that you want a new task, but I need the task itself stated more clearly.');
+        continue;
+      }
+      const action = await createActionItem({
+        title: create.title,
+        project: create.project,
+        category: create.category,
+        owner: create.owner || 'London',
+        promisedDate: resolveSimpleActionDateText(create.promised_date) || create.promised_date || '',
+        hardDeadline: resolveSimpleActionDateText(create.hard_deadline) || create.hard_deadline || '',
+        nextFollowUp: resolveSimpleActionDateText(create.next_follow_up) || create.next_follow_up || '',
+        status: create.status || 'ACTIVE',
+        priority: create.priority || 'NORMAL',
+        nextAction: create.next_action,
+        waitingOn: create.waiting_on,
+        ramyRequired: Boolean(create.ramy_required),
+        ramyDecisionBy: resolveSimpleActionDateText(create.ramy_decision_by) || create.ramy_decision_by || '',
+        riskIfDelayed: create.risk_if_delayed,
+        source: String(channel || 'message').toUpperCase(),
+        notes: create.notes || `Created from ${channel}: ${cleanText}`,
+      });
+      state.lastEventId = action.eventId;
+      confirmations.push(`Added: ${action.title}${action.nextFollowUp ? ` — follow-up ${action.nextFollowUp}` : ''}.`);
+    }
+  }
+
+  state.updatedAt = Date.now();
+  messagingState.set(key, state);
+
+  const reply = confirmations.filter(Boolean).join('\n').slice(0, MAX_MESSAGING_REPLY_CHARS);
+  return {
+    success: Boolean(reply),
+    reply: reply || 'No Action Register change was needed.',
+  };
+};
+
 // -----------------------------------------------------------------------------
 // Daily executive brief
 // -----------------------------------------------------------------------------
@@ -4041,8 +4471,10 @@ MASTER ACTION & FOLLOW-UP REGISTER
 
 Use create_action when Ramy explicitly asks you to track, remember, follow up, add an action, or when he clearly instructs you that a business outcome must be monitored. Do not create action items merely because an email contains information.
 Use list_actions when Ramy asks what is overdue, what he is waiting for, what needs his decision, what London must follow up on, or for a project/action status.
-Use update_action when Ramy tells you an action changed, someone replied, a follow-up occurred, a deadline changed, an item is completed/cancelled, or the next action changes.
+Use quick_action_update as the FIRST choice for simple natural-language status updates such as “Joannie done”, “waiting on Anass until Friday”, “follow up with Franco next Tuesday”, “add task: call Makar tomorrow”, “cancel the EV follow-up”, or several quick updates in one sentence. The server matches the live Action Register and makes the update in one step, which is faster than chaining list_actions + update_action.
+Use update_action when you already have the exact event id or when a precise field edit is needed after listing actions.
 The register fields are outcome, project, owner, dates, status, priority, next action, waiting on, Ramy requirement, risk, source, and notes. Preserve the distinction between promised date, hard deadline, and next follow-up.
+Ramy may also send the same natural-language updates by SMS or WhatsApp. Those channels feed the same Action Register and acknowledge the resulting update briefly. Do not require special command syntax.
 
 DAILY EXECUTIVE BRIEF
 
@@ -4285,6 +4717,85 @@ fastify.get('/task-inbox/status/:jobId', async (request, reply) => {
 
   return reply.send({ success: true, job });
 });
+
+
+// Unified inbound SMS + WhatsApp command hub.
+// Configure Twilio SMS and WhatsApp "A message comes in" webhooks to POST here.
+const handleIncomingExecutiveMessage = async (request, reply) => {
+  const body = request.body && typeof request.body === 'object' ? request.body : {};
+  const from = String(body.From || request.query?.From || '').trim();
+  const to = String(body.To || request.query?.To || '').trim();
+  const messageBody = String(body.Body || request.query?.Body || '').trim();
+  const messageSid = String(body.MessageSid || body.SmsMessageSid || '').trim();
+  const numMedia = Number(body.NumMedia || 0);
+  const channel = from.toLowerCase().startsWith('whatsapp:') || to.toLowerCase().startsWith('whatsapp:')
+    ? 'whatsapp'
+    : 'sms';
+
+  const validSignature = validateTwilioFormWebhook(request);
+  const authorizedSender = isAuthorizedRamyMessagingSender(from);
+  console.log('MESSAGING SECURITY CHECK:', {
+    channel,
+    sender: normalizePhoneIdentity(from),
+    signatureValid: validSignature,
+    authorizedSender,
+    messageSid,
+  });
+
+  // Always return valid TwiML quickly; do not leave Twilio waiting while Graph/OpenAI runs.
+  const emptyTwiml = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+
+  if (!validSignature || !authorizedSender) {
+    return reply.type('text/xml').code(403).send(emptyTwiml);
+  }
+
+  pruneMessagingState();
+  if (messageSid && processedMessagingSids.has(messageSid)) {
+    return reply.type('text/xml').send(emptyTwiml);
+  }
+  if (messageSid) processedMessagingSids.set(messageSid, Date.now());
+
+  reply.type('text/xml').send(emptyTwiml);
+
+  setImmediate(async () => {
+    try {
+      let result;
+      if (!messageBody && numMedia > 0) {
+        result = {
+          success: false,
+          reply: 'I received the attachment. For document or spreadsheet analysis, email it to london@minaco.ca so I can process the full file safely.',
+        };
+      } else {
+        result = await processQuickActionInstruction({
+          text: messageBody,
+          channel,
+          sender: from,
+        });
+      }
+
+      await sendTwilioChannelMessage({
+        to: from,
+        from: to || (channel === 'sms' ? TWILIO_PHONE_NUMBER : ''),
+        body: result.reply,
+      });
+    } catch (error) {
+      console.error('Inbound executive messaging failure:', error);
+      try {
+        await sendTwilioChannelMessage({
+          to: from,
+          from: to || (channel === 'sms' ? TWILIO_PHONE_NUMBER : ''),
+          body: `I received your ${channel === 'whatsapp' ? 'WhatsApp' : 'text'} but could not update the Action Register: ${error.message}`,
+        });
+      } catch (notifyError) {
+        console.error('Inbound executive messaging failure notification failed:', notifyError);
+      }
+    }
+  });
+};
+
+fastify.all('/incoming-message', handleIncomingExecutiveMessage);
+fastify.all('/incoming-sms', handleIncomingExecutiveMessage);
+fastify.all('/incoming-whatsapp', handleIncomingExecutiveMessage);
 
 fastify.all('/incoming-call', async (request, reply) => {
   const caller = request.body?.From || request.query?.From;
@@ -4824,6 +5335,23 @@ fastify.register(async (fastifyInstance) => {
                     },
                   },
                   required: ['query'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'quick_action_update',
+                description:
+                  'Fast natural-language Action Register update. Use as the first choice for simple phrases like Joannie done, waiting on Anass until Friday, follow up next Tuesday, add task call Makar tomorrow, cancel this item, or several quick updates in one instruction. The server matches and updates the live register in one step.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    instruction: {
+                      type: 'string',
+                      description: 'Ramy’s natural-language action/status update exactly as intended.',
+                    },
+                  },
+                  required: ['instruction'],
                   additionalProperties: false,
                 },
               },
@@ -5865,6 +6393,33 @@ fastify.register(async (fastifyInstance) => {
                 response.call_id,
                 { success: false, error: error.message },
                 'Tell Ramy the contact could not be resolved from verified Minaco data and ask for the email address if needed.'
+              );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'quick_action_update'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const result = await processQuickActionInstruction({
+                text: args.instruction,
+                channel: 'voice',
+                sender: RAMY_PHONE_NUMBER,
+              });
+              respondToToolCall(
+                response.call_id,
+                result,
+                'Tell Ramy exactly what the Action Register update result says, briefly. If it asks a clarification question, ask only that question. Do not add new facts.'
+              );
+            } catch (error) {
+              console.error('Quick action update error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, error: error.message },
+                'Tell Ramy the quick Action Register update failed and state the error concisely.'
               );
             }
             return;
