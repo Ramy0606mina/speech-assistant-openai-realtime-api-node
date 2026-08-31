@@ -24,6 +24,8 @@ const {
   LONDON_MINACO_EMAIL,
   ACCOUNTING_MINACO_EMAIL,
   DAILY_BRIEF_SECRET,
+  TASK_INBOX_SECRET,
+  TASK_INBOX_MODEL,
   OPENAI_DOCUMENT_MODEL,
   EXECUTIVE_BRIEF_MODEL,
 } = process.env;
@@ -34,7 +36,10 @@ const ACCOUNTING_MAILBOX = ACCOUNTING_MINACO_EMAIL || 'accounting@minaco.ca';
 const ACTION_REGISTER_CALENDAR_NAME = 'London Action Register';
 const DOCUMENT_ANALYSIS_MODEL = OPENAI_DOCUMENT_MODEL || 'gpt-5.6';
 const DAILY_BRIEF_MODEL = EXECUTIVE_BRIEF_MODEL || 'gpt-5.6-luna';
+const TASK_INBOX_ANALYSIS_MODEL = TASK_INBOX_MODEL || DOCUMENT_ANALYSIS_MODEL;
 const MAX_ATTACHMENT_BYTES = 45 * 1024 * 1024;
+const MAX_TASK_ATTACHMENTS = 10;
+const MAX_TASK_TOTAL_BYTES = 45 * 1024 * 1024;
 
 // -----------------------------------------------------------------------------
 // Network resilience
@@ -682,7 +687,7 @@ const extractOpenAIResponseText = (data) => {
   return chunks.join('\n').trim();
 };
 
-const callOpenAIResponses = async (payload) => {
+const callOpenAIResponses = async (payload, timeoutMs = 45000) => {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is not configured.');
 
   const response = await fetchWithTimeout('https://api.openai.com/v1/responses', {
@@ -692,7 +697,7 @@ const callOpenAIResponses = async (payload) => {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(payload),
-  }, 45000);
+  }, timeoutMs);
 
   const data = await response.json();
   if (!response.ok) {
@@ -923,6 +928,393 @@ const replyToMinacoEmail = async ({ messageId, mode, body }) => {
     from: RAMY_MINACO_EMAIL,
     mode,
     messageId,
+  };
+};
+
+
+// -----------------------------------------------------------------------------
+// Delegated email-thread review jobs
+// -----------------------------------------------------------------------------
+
+const delegatedThreadReviewJobs = new Map();
+
+const pruneDelegatedThreadReviewJobs = () => {
+  if (delegatedThreadReviewJobs.size <= 50) return;
+  const entries = [...delegatedThreadReviewJobs.entries()].sort(
+    (a, b) => Number(a[1]?.createdAt || 0) - Number(b[1]?.createdAt || 0)
+  );
+  for (const [jobId] of entries.slice(0, delegatedThreadReviewJobs.size - 50)) {
+    delegatedThreadReviewJobs.delete(jobId);
+  }
+};
+
+const getMailboxConversationThread = async (
+  mailboxAddress,
+  conversationId,
+  limit = 50
+) => {
+  if (!mailboxAddress || !conversationId) {
+    throw new Error('Mailbox address and conversation id are required.');
+  }
+
+  const token = await getMicrosoftGraphToken();
+  const escapedConversationId = String(conversationId).replace(/'/g, "''");
+  const url = new URL(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(
+      mailboxAddress
+    )}/messages`
+  );
+
+  url.searchParams.set('$filter', `conversationId eq '${escapedConversationId}'`);
+  url.searchParams.set('$top', String(Math.min(Math.max(Number(limit) || 50, 1), 50)));
+  url.searchParams.set(
+    '$select',
+    'id,conversationId,subject,from,replyTo,toRecipients,ccRecipients,receivedDateTime,body,hasAttachments'
+  );
+
+  const response = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Prefer: 'outlook.body-content-type="text"',
+      },
+    },
+    15000
+  );
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(
+      `Microsoft Graph conversation lookup failed: ${
+        data.error?.message || response.status
+      }`
+    );
+  }
+
+  return (data.value || []).sort(
+    (a, b) =>
+      new Date(a.receivedDateTime || 0).getTime() -
+      new Date(b.receivedDateTime || 0).getTime()
+  );
+};
+
+const compactThreadForAnalysis = (messages = []) => {
+  const maxTotalChars = 140000;
+  const maxBodyCharsPerMessage = 24000;
+  let totalChars = 0;
+  const chunks = [];
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index] || {};
+    const from = message.from?.emailAddress || {};
+    const to = simplifyEmailRecipients(message.toRecipients)
+      .map((item) => item.name ? `${item.name} <${item.address}>` : item.address)
+      .join(', ');
+    const cc = simplifyEmailRecipients(message.ccRecipients)
+      .map((item) => item.name ? `${item.name} <${item.address}>` : item.address)
+      .join(', ');
+    let body = String(message.body?.content || '').trim();
+    if (body.length > maxBodyCharsPerMessage) {
+      body = `${body.slice(0, maxBodyCharsPerMessage)}\n[Body truncated for analysis size]`;
+    }
+
+    const chunk = [
+      `MESSAGE ${index + 1}`,
+      `Received: ${message.receivedDateTime || ''}`,
+      `From: ${from.name || ''}${from.address ? ` <${from.address}>` : ''}`,
+      `To: ${to}`,
+      `CC: ${cc}`,
+      `Subject: ${message.subject || ''}`,
+      `Has attachments: ${Boolean(message.hasAttachments)}`,
+      'Body:',
+      body,
+    ].join('\n');
+
+    if (totalChars + chunk.length > maxTotalChars) {
+      chunks.push('[Earlier/later thread content omitted because the conversation exceeded the analysis size limit.]');
+      break;
+    }
+
+    chunks.push(chunk);
+    totalChars += chunk.length;
+  }
+
+  return chunks.join('\n\n---\n\n');
+};
+
+const escapeDelegatedHtml = (value) =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const normalizeStringArray = (value) =>
+  (Array.isArray(value) ? value : [])
+    .map((item) => String(item || '').trim())
+    .filter(Boolean);
+
+const renderDelegatedThreadReviewHtml = ({
+  review,
+  seedSubject,
+  lookupQuery,
+  focus,
+}) => {
+  const summary = String(review.executiveSummary || '').trim();
+  const supplierPoints = normalizeStringArray(review.supplierPosition);
+  const positivePoints = normalizeStringArray(review.positivePoints);
+  const questions = normalizeStringArray(review.questionsBeforeSigning);
+  const limitations = String(review.limitations || '').trim();
+  const recommendation = String(review.recommendation || '').trim();
+  const risks = Array.isArray(review.risks) ? review.risks : [];
+
+  const list = (items) =>
+    items.length
+      ? `<ul style="margin:7px 0 0 18px;padding:0;">${items
+          .map(
+            (item) =>
+              `<li style="margin:0 0 7px 0;line-height:20px;">${escapeDelegatedHtml(item)}</li>`
+          )
+          .join('')}</ul>`
+      : '<div style="margin-top:6px;color:#667085;">None identified from the available thread.</div>';
+
+  const riskHtml = risks.length
+    ? risks
+        .map((risk) => {
+          const level = String(risk?.level || 'Review').toUpperCase();
+          const color = level === 'HIGH' ? '#B42318' : level === 'MEDIUM' ? '#B54708' : '#175CD3';
+          return `<div style="border:1px solid #eaecf0;border-left:4px solid ${color};border-radius:7px;padding:11px 13px;margin:8px 0;background:#fff;">
+            <div style="font-weight:700;color:#101828;">${escapeDelegatedHtml(risk?.title || 'Risk')}</div>
+            <div style="margin-top:4px;color:#475467;line-height:20px;">${escapeDelegatedHtml(risk?.detail || '')}</div>
+          </div>`;
+        })
+        .join('')
+    : '<div style="margin-top:6px;color:#667085;">No specific risk was identified from the available thread.</div>';
+
+  const section = (title, color, body) => `
+    <tr><td style="padding:0 24px 18px;">
+      <div style="padding-bottom:8px;border-bottom:2px solid ${color};font-size:13px;font-weight:800;letter-spacing:.45px;color:${color};">${escapeDelegatedHtml(title)}</div>
+      <div style="padding-top:8px;font-size:13px;line-height:20px;color:#344054;">${body}</div>
+    </td></tr>`;
+
+  return `<!doctype html><html><body style="margin:0;background:#f2f4f7;font-family:Arial,Helvetica,sans-serif;color:#101828;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:24px 10px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:760px;background:#f8fafc;border:1px solid #e4e7ec;border-radius:12px;overflow:hidden;">
+        <tr><td style="background:#102A43;padding:22px 24px;border-bottom:4px solid #C8A96B;">
+          <div style="font-size:11px;font-weight:700;letter-spacing:1.8px;color:#C8A96B;">LONDON ASSISTANT · MINACO</div>
+          <div style="margin-top:5px;font-size:23px;font-weight:800;color:#fff;">Email Thread Review</div>
+          <div style="margin-top:5px;font-size:12px;color:#d0d5dd;">${escapeDelegatedHtml(seedSubject || lookupQuery || 'Supplier correspondence')}</div>
+          ${focus ? `<div style="margin-top:4px;font-size:12px;color:#d0d5dd;">Focus: ${escapeDelegatedHtml(focus)}</div>` : ''}
+        </td></tr>
+        <tr><td style="padding:18px 24px;">
+          <div style="background:#fff;border:1px solid #d0d5dd;border-radius:8px;padding:14px 16px;">
+            <div style="font-size:11px;font-weight:800;letter-spacing:.5px;color:#667085;">EXECUTIVE SUMMARY</div>
+            <div style="margin-top:4px;font-size:14px;line-height:21px;font-weight:700;color:#101828;">${escapeDelegatedHtml(summary || 'See the detailed review below.')}</div>
+          </div>
+        </td></tr>
+        ${section('WHAT THE SUPPLIER / THREAD SAYS', '#175CD3', list(supplierPoints))}
+        ${section('RISKS / POINTS TO PROTECT BEFORE SIGNING', '#B42318', riskHtml)}
+        ${section('POSITIVE POINTS', '#027A48', list(positivePoints))}
+        ${section('QUESTIONS TO CLOSE BEFORE SIGNING', '#B54708', list(questions))}
+        ${section('LONDON\'S VIEW', '#6941C6', `<div>${escapeDelegatedHtml(recommendation || 'No recommendation could be formed from the available thread.')}</div>`)}
+        ${limitations ? section('LIMITATIONS', '#667085', `<div>${escapeDelegatedHtml(limitations)}</div>`) : ''}
+      </table>
+    </td></tr></table>
+  </body></html>`;
+};
+
+const findThreadSeedEmail = async ({ mailboxAddress, lookupQuery }) => {
+  const query = String(lookupQuery || '').trim();
+  if (!query) throw new Error('An email sender, company, or thread search term is required.');
+
+  try {
+    const senderResult = await findLatestInboundEmailBySender({
+      mailboxAddress,
+      personQuery: query,
+    });
+    if (senderResult.match) return senderResult.match;
+  } catch (error) {
+    console.warn('Delegated thread sender lookup warning:', error.message);
+  }
+
+  const searched = await searchMailboxEmails({
+    mailboxAddress,
+    query,
+    limit: 10,
+  });
+  if (!searched.length) {
+    throw new Error(`No email thread matching ${query} was found.`);
+  }
+  return searched[0];
+};
+
+const runDelegatedThreadReviewJob = async ({
+  jobId,
+  lookupQuery,
+  focus,
+  instruction,
+  outputLanguage,
+}) => {
+  const job = delegatedThreadReviewJobs.get(jobId);
+  if (job) {
+    job.status = 'running';
+    job.startedAt = Date.now();
+  }
+
+  let seedSubject = lookupQuery;
+
+  try {
+    const seed = await findThreadSeedEmail({
+      mailboxAddress: RAMY_MINACO_EMAIL,
+      lookupQuery,
+    });
+    const fullSeed = await getFullMailboxEmail(RAMY_MINACO_EMAIL, seed.id);
+    seedSubject = fullSeed.subject || seed.subject || lookupQuery;
+
+    if (!fullSeed.conversationId) {
+      throw new Error('The selected email does not expose a conversation id for thread retrieval.');
+    }
+
+    const thread = await getMailboxConversationThread(
+      RAMY_MINACO_EMAIL,
+      fullSeed.conversationId,
+      50
+    );
+    if (!thread.length) {
+      throw new Error('The email conversation thread could not be retrieved.');
+    }
+
+    const threadText = compactThreadForAnalysis(thread);
+    const userInstruction =
+      String(instruction || '').trim() ||
+      'Summarize the complete thread and identify any material commercial, operational, service, warranty, support, responsibility, pricing, schedule, or contractual risks Ramy should understand before signing.';
+    const language = String(outputLanguage || 'English').trim() || 'English';
+
+    const data = await callOpenAIResponses({
+      model: DOCUMENT_ANALYSIS_MODEL,
+      instructions: `You are London Assistant performing a delegated executive review of a live Minaco email conversation for Ramy Mina.
+Use ONLY the supplied thread. Do not invent missing terms or facts.
+The requested output language is ${language}.
+Distinguish clearly between facts stated in the thread and your commercial inference.
+If the actual agreement/contract is not included, say that the email thread alone cannot establish all signing risks.
+Return ONLY valid JSON with exactly this shape:
+{
+  "executiveSummary": "short executive summary",
+  "supplierPosition": ["fact from the thread", "..."],
+  "risks": [{"level":"High|Medium|Low","title":"short title","detail":"why it matters and what to protect"}],
+  "positivePoints": ["positive or reassuring point", "..."],
+  "questionsBeforeSigning": ["specific question or confirmation to obtain", "..."],
+  "recommendation": "London's concise commercial view and recommended next step",
+  "limitations": "what cannot be concluded from this thread alone"
+}`,
+      input: `RAMY'S INSTRUCTION:\n${userInstruction}\n\nFOCUS PERSON / SUPPLIER (if any):\n${focus || 'Not specified'}\n\nLIVE EMAIL THREAD:\n${threadText}`,
+    });
+
+    const raw = extractOpenAIResponseText(data);
+    if (!raw) throw new Error('The delegated email-thread analysis returned no text.');
+
+    let review;
+    try {
+      review = JSON.parse(stripJsonCodeFence(raw));
+    } catch (error) {
+      throw new Error('The delegated email-thread analysis could not be parsed into a structured review.');
+    }
+
+    const html = renderDelegatedThreadReviewHtml({
+      review,
+      seedSubject,
+      lookupQuery,
+      focus,
+    });
+
+    await sendEmailFromLondon({
+      to: RAMY_MINACO_EMAIL,
+      subject: `LONDON — Email Thread Review | ${seedSubject || lookupQuery}`,
+      body: html,
+      contentType: 'HTML',
+    });
+
+    if (job) {
+      job.status = 'completed';
+      job.completedAt = Date.now();
+      job.subject = seedSubject;
+    }
+
+    console.log('DELEGATED THREAD REVIEW COMPLETED:', {
+      jobId,
+      lookupQuery,
+      subject: seedSubject,
+    });
+  } catch (error) {
+    console.error('DELEGATED THREAD REVIEW FAILED:', {
+      jobId,
+      lookupQuery,
+      error: error.message,
+    });
+
+    if (job) {
+      job.status = 'failed';
+      job.completedAt = Date.now();
+      job.error = error.message;
+    }
+
+    try {
+      await sendEmailFromLondon({
+        to: RAMY_MINACO_EMAIL,
+        subject: `LONDON — Delegated Email Review Could Not Complete | ${seedSubject || lookupQuery}`,
+        body: `London could not complete the delegated email-thread review.\n\nTechnical error: ${error.message}\n\nNo external email was sent.`,
+        contentType: 'Text',
+      });
+    } catch (notifyError) {
+      console.error('Delegated review failure notification email also failed:', notifyError);
+    }
+  } finally {
+    pruneDelegatedThreadReviewJobs();
+  }
+};
+
+const queueDelegatedThreadReviewJob = ({
+  lookupQuery,
+  focus = '',
+  instruction = '',
+  outputLanguage = 'English',
+}) => {
+  const query = String(lookupQuery || '').trim();
+  if (!query) throw new Error('An email sender, company, or thread search term is required.');
+  if (!RAMY_MINACO_EMAIL) throw new Error('RAMY_MINACO_EMAIL is not configured.');
+
+  const jobId = `thread-review-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+
+  delegatedThreadReviewJobs.set(jobId, {
+    jobId,
+    status: 'queued',
+    createdAt: Date.now(),
+    lookupQuery: query,
+    focus: String(focus || '').trim(),
+  });
+
+  setImmediate(() => {
+    runDelegatedThreadReviewJob({
+      jobId,
+      lookupQuery: query,
+      focus,
+      instruction,
+      outputLanguage,
+    }).catch((error) => {
+      console.error('Unexpected delegated thread review job failure:', error);
+    });
+  });
+
+  return {
+    success: true,
+    queued: true,
+    jobId,
+    lookupQuery: query,
+    emailDestination: RAMY_MINACO_EMAIL,
   };
 };
 
@@ -2787,6 +3179,776 @@ Keep each fact and next action concise. Put an item in urgentDecisions only if R
   };
 };
 
+
+// -----------------------------------------------------------------------------
+// Automatic London Task Inbox
+// -----------------------------------------------------------------------------
+
+const taskInboxJobs = new Map();
+const processedTaskInboxKeys = new Map();
+
+const normalizeTaskSender = (value) =>
+  String(value || '')
+    .trim()
+    .replace(/^mailto:/i, '')
+    .toLowerCase();
+
+const pruneTaskInboxState = () => {
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+  for (const [key, value] of processedTaskInboxKeys.entries()) {
+    if (Number(value?.createdAt || 0) < cutoff) {
+      processedTaskInboxKeys.delete(key);
+    }
+  }
+
+  if (taskInboxJobs.size > 100) {
+    const entries = [...taskInboxJobs.entries()].sort(
+      (a, b) => Number(a[1]?.createdAt || 0) - Number(b[1]?.createdAt || 0)
+    );
+    for (const [jobId] of entries.slice(0, taskInboxJobs.size - 100)) {
+      taskInboxJobs.delete(jobId);
+    }
+  }
+};
+
+const taskSubjectWithoutPrefixes = (subject) =>
+  String(subject || 'Untitled task')
+    .replace(/^(re|fw|fwd)\s*:\s*/i, '')
+    .trim() || 'Untitled task';
+
+const findLondonTaskInboxEmail = async ({
+  messageId,
+  subject,
+}) => {
+  if (!LONDON_MINACO_EMAIL) {
+    throw new Error('LONDON_MINACO_EMAIL is not configured.');
+  }
+  if (!RAMY_MINACO_EMAIL) {
+    throw new Error('RAMY_MINACO_EMAIL is not configured.');
+  }
+
+  const expectedSender = normalizeTaskSender(RAMY_MINACO_EMAIL);
+  const wantedSubject = String(subject || '').trim().toLowerCase();
+
+  if (messageId) {
+    try {
+      const direct = await getFullMailboxEmail(LONDON_MINACO_EMAIL, messageId);
+      const directSender = normalizeTaskSender(
+        direct.from?.emailAddress?.address
+      );
+      if (directSender !== expectedSender) {
+        throw new Error(
+          `The task email sender is not authorized: ${
+            direct.from?.emailAddress?.address || 'unknown sender'
+          }.`
+        );
+      }
+      return direct;
+    } catch (error) {
+      console.warn(
+        'TASK INBOX direct message-id lookup warning:',
+        error.message
+      );
+    }
+  }
+
+  const recent = await getRecentInboxEmails({
+    mailboxAddress: LONDON_MINACO_EMAIL,
+    limit: 100,
+  });
+
+  const authorized = recent.filter(
+    (email) =>
+      normalizeTaskSender(email.from?.emailAddress?.address) === expectedSender
+  );
+
+  const exactSubjectMatches = wantedSubject
+    ? authorized.filter(
+        (email) =>
+          String(email.subject || '').trim().toLowerCase() === wantedSubject
+      )
+    : [];
+
+  const candidate =
+    exactSubjectMatches[0] ||
+    authorized[0];
+
+  if (!candidate?.id) {
+    throw new Error(
+      'London could not locate a recent task email from Ramy in the London inbox.'
+    );
+  }
+
+  return getFullMailboxEmail(LONDON_MINACO_EMAIL, candidate.id);
+};
+
+const buildTaskInboxFileInputs = async ({
+  messageId,
+  attachments,
+}) => {
+  const content = [];
+  const reviewedFiles = [];
+  const skippedFiles = [];
+  let totalBytes = 0;
+
+  const usableAttachments = (Array.isArray(attachments) ? attachments : [])
+    .filter((attachment) => !attachment.isInline)
+    .slice(0, MAX_TASK_ATTACHMENTS);
+
+  for (const meta of usableAttachments) {
+    if (!meta?.attachmentId) continue;
+
+    const size = Number(meta.size) || 0;
+    if (size > MAX_ATTACHMENT_BYTES) {
+      skippedFiles.push(
+        `${meta.name || 'Unnamed attachment'} — larger than the 45 MB single-file limit`
+      );
+      continue;
+    }
+    if (totalBytes + size > MAX_TASK_TOTAL_BYTES) {
+      skippedFiles.push(
+        `${meta.name || 'Unnamed attachment'} — skipped because the task attachments exceeded the 45 MB combined analysis limit`
+      );
+      continue;
+    }
+
+    const attachment = await getMailboxEmailAttachment(
+      LONDON_MINACO_EMAIL,
+      messageId,
+      meta.attachmentId
+    );
+
+    if (!attachment?.contentBytes) {
+      skippedFiles.push(
+        `${attachment?.name || meta.name || 'Unnamed attachment'} — file bytes were not available`
+      );
+      continue;
+    }
+
+    const filename = attachment.name || meta.name || 'attachment';
+    const contentType =
+      attachment.contentType || meta.contentType || 'application/octet-stream';
+    const dataUri = `data:${contentType};base64,${attachment.contentBytes}`;
+
+    if (contentType.toLowerCase().startsWith('image/')) {
+      content.push({
+        type: 'input_image',
+        image_url: dataUri,
+        detail: 'auto',
+      });
+    } else {
+      content.push({
+        type: 'input_file',
+        filename,
+        file_data: dataUri,
+        detail: 'auto',
+      });
+    }
+
+    totalBytes += Number(attachment.size) || size || 0;
+    reviewedFiles.push(filename);
+  }
+
+  return {
+    content,
+    reviewedFiles,
+    skippedFiles,
+    totalBytes,
+  };
+};
+
+const normalizeTaskReport = (value = {}) => {
+  const array = (candidate) => (Array.isArray(candidate) ? candidate : []);
+  const object = (candidate) =>
+    candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+      ? candidate
+      : {};
+
+  const table = object(value.comparisonTable);
+  const draft = object(value.draftResponse);
+
+  return {
+    taskTitle: String(value.taskTitle || '').trim(),
+    executiveConclusion: String(value.executiveConclusion || '').trim(),
+    status: String(value.status || 'Complete').trim(),
+    keyFindings: array(value.keyFindings),
+    comparisonTable: {
+      columns: array(table.columns).map((item) => String(item || '').trim()),
+      rows: array(table.rows).map((row) =>
+        array(row).map((cell) => String(cell ?? '').trim())
+      ),
+    },
+    risks: array(value.risks),
+    missingInformation: array(value.missingInformation).map((item) =>
+      String(item || '').trim()
+    ),
+    recommendedNextActions: array(value.recommendedNextActions).map((item) =>
+      String(item || '').trim()
+    ),
+    draftResponse: {
+      included: Boolean(draft.included),
+      recipient: String(draft.recipient || '').trim(),
+      subject: String(draft.subject || '').trim(),
+      body: String(draft.body || '').trim(),
+    },
+    ramyActionRequired: Boolean(value.ramyActionRequired),
+    ramyNextAction: String(value.ramyNextAction || '').trim(),
+    limitations: String(value.limitations || '').trim(),
+  };
+};
+
+const renderTaskInboxReportHtml = ({
+  report,
+  taskSubject,
+  reviewedFiles,
+  skippedFiles,
+  receivedAt,
+}) => {
+  const section = (title, color, body) => `
+    <tr><td style="padding:0 24px 18px;">
+      <div style="padding-bottom:8px;border-bottom:2px solid ${color};font-size:13px;font-weight:800;letter-spacing:.45px;color:${color};">${escapeDelegatedHtml(title)}</div>
+      <div style="padding-top:9px;font-size:13px;line-height:20px;color:#344054;">${body}</div>
+    </td></tr>`;
+
+  const list = (items, emptyText = 'None identified.') => {
+    const normalized = (Array.isArray(items) ? items : [])
+      .map((item) => String(item || '').trim())
+      .filter(Boolean);
+    if (!normalized.length) {
+      return `<div style="color:#667085;">${escapeDelegatedHtml(emptyText)}</div>`;
+    }
+    return `<ul style="margin:4px 0 0 18px;padding:0;">${normalized
+      .map(
+        (item) =>
+          `<li style="margin:0 0 7px 0;line-height:20px;">${escapeDelegatedHtml(item)}</li>`
+      )
+      .join('')}</ul>`;
+  };
+
+  const findings = (Array.isArray(report.keyFindings)
+    ? report.keyFindings
+    : []
+  )
+    .map((item) => {
+      if (typeof item === 'string') {
+        return `<div style="border:1px solid #eaecf0;border-radius:7px;padding:11px 13px;margin:8px 0;background:#fff;">${escapeDelegatedHtml(item)}</div>`;
+      }
+      const importance = String(item?.importance || 'Normal').toUpperCase();
+      const color =
+        importance === 'HIGH'
+          ? '#B42318'
+          : importance === 'MEDIUM'
+          ? '#B54708'
+          : '#175CD3';
+      return `<div style="border:1px solid #eaecf0;border-left:4px solid ${color};border-radius:7px;padding:11px 13px;margin:8px 0;background:#fff;">
+        <div style="font-weight:700;color:#101828;">${escapeDelegatedHtml(
+          item?.title || 'Finding'
+        )}</div>
+        <div style="margin-top:4px;color:#475467;line-height:20px;">${escapeDelegatedHtml(
+          item?.detail || ''
+        )}</div>
+      </div>`;
+    })
+    .join('');
+
+  const risks = (Array.isArray(report.risks) ? report.risks : [])
+    .map((risk) => {
+      const level = String(risk?.level || 'Review').toUpperCase();
+      const color =
+        level === 'HIGH'
+          ? '#B42318'
+          : level === 'MEDIUM'
+          ? '#B54708'
+          : '#175CD3';
+      return `<div style="border:1px solid #eaecf0;border-left:4px solid ${color};border-radius:7px;padding:11px 13px;margin:8px 0;background:#fff;">
+        <div style="font-weight:700;color:#101828;">${escapeDelegatedHtml(
+          risk?.title || 'Risk'
+        )}</div>
+        <div style="margin-top:4px;color:#475467;line-height:20px;">${escapeDelegatedHtml(
+          risk?.detail || ''
+        )}</div>
+      </div>`;
+    })
+    .join('');
+
+  let tableHtml = '';
+  const columns = report.comparisonTable?.columns || [];
+  const rows = report.comparisonTable?.rows || [];
+  if (columns.length && rows.length) {
+    const header = columns
+      .map(
+        (column) =>
+          `<th align="left" style="padding:8px 9px;background:#102A43;color:#fff;font-size:11px;line-height:16px;border:1px solid #344054;">${escapeDelegatedHtml(
+            column
+          )}</th>`
+      )
+      .join('');
+    const body = rows
+      .map(
+        (row) =>
+          `<tr>${columns
+            .map(
+              (_, index) =>
+                `<td valign="top" style="padding:8px 9px;font-size:11px;line-height:16px;color:#344054;border:1px solid #eaecf0;background:#fff;">${escapeDelegatedHtml(
+                  row[index] ?? ''
+                )}</td>`
+            )
+            .join('')}</tr>`
+      )
+      .join('');
+    tableHtml = `<div style="overflow-x:auto;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;"><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table></div>`;
+  }
+
+  const draftHtml = report.draftResponse?.included
+    ? `<div style="background:#fff;border:1px solid #d0d5dd;border-radius:7px;padding:12px 14px;">
+        ${
+          report.draftResponse.recipient
+            ? `<div><b>Proposed recipient:</b> ${escapeDelegatedHtml(
+                report.draftResponse.recipient
+              )}</div>`
+            : ''
+        }
+        ${
+          report.draftResponse.subject
+            ? `<div style="margin-top:4px;"><b>Subject:</b> ${escapeDelegatedHtml(
+                report.draftResponse.subject
+              )}</div>`
+            : ''
+        }
+        <div style="margin-top:9px;white-space:pre-wrap;">${escapeDelegatedHtml(
+          report.draftResponse.body
+        )}</div>
+        <div style="margin-top:9px;color:#B42318;font-weight:700;">Draft only — nothing has been sent externally.</div>
+      </div>`
+    : '';
+
+  const fileLines = [
+    ...(reviewedFiles || []).map((name) => `Reviewed: ${name}`),
+    ...(skippedFiles || []).map((name) => `Not reviewed: ${name}`),
+  ];
+
+  return `<!doctype html><html><body style="margin:0;background:#f2f4f7;font-family:Arial,Helvetica,sans-serif;color:#101828;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:24px 10px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:900px;background:#f8fafc;border:1px solid #e4e7ec;border-radius:12px;overflow:hidden;">
+        <tr><td style="background:#102A43;padding:22px 24px;border-bottom:4px solid #C8A96B;">
+          <div style="font-size:11px;font-weight:700;letter-spacing:1.8px;color:#C8A96B;">LONDON ASSISTANT · MINACO</div>
+          <div style="margin-top:5px;font-size:23px;font-weight:800;color:#fff;">Task Analysis Complete</div>
+          <div style="margin-top:5px;font-size:13px;color:#d0d5dd;">${escapeDelegatedHtml(
+            report.taskTitle || taskSubject || 'Task'
+          )}</div>
+          ${
+            receivedAt
+              ? `<div style="margin-top:3px;font-size:11px;color:#98A2B3;">Task received: ${escapeDelegatedHtml(
+                  formatMontrealDateTime(new Date(receivedAt))
+                )}</div>`
+              : ''
+          }
+        </td></tr>
+        <tr><td style="padding:18px 24px;">
+          <div style="background:#fff;border:1px solid #d0d5dd;border-radius:8px;padding:14px 16px;">
+            <div style="font-size:11px;font-weight:800;letter-spacing:.5px;color:#667085;">EXECUTIVE CONCLUSION</div>
+            <div style="margin-top:4px;font-size:14px;line-height:21px;font-weight:700;color:#101828;">${escapeDelegatedHtml(
+              report.executiveConclusion || 'See detailed analysis below.'
+            )}</div>
+          </div>
+        </td></tr>
+        ${section(
+          'KEY FINDINGS',
+          '#175CD3',
+          findings || '<div style="color:#667085;">No material finding was identified.</div>'
+        )}
+        ${
+          tableHtml
+            ? section('DETAILED COMPARISON / ANALYSIS', '#344054', tableHtml)
+            : ''
+        }
+        ${section(
+          'RISKS / ISSUES TO PROTECT',
+          '#B42318',
+          risks || '<div style="color:#667085;">No specific risk was identified from the supplied material.</div>'
+        )}
+        ${section(
+          'MISSING / UNVERIFIED INFORMATION',
+          '#B54708',
+          list(report.missingInformation, 'No material information gap was identified.')
+        )}
+        ${section(
+          'RECOMMENDED NEXT ACTIONS',
+          '#027A48',
+          list(report.recommendedNextActions, 'No further action is recommended from the supplied material.')
+        )}
+        ${
+          report.ramyActionRequired
+            ? section(
+                'RAMY ACTION REQUIRED',
+                '#6941C6',
+                `<div style="font-weight:700;">${escapeDelegatedHtml(
+                  report.ramyNextAction || 'Review the analysis and decide the next step.'
+                )}</div>`
+              )
+            : ''
+        }
+        ${
+          draftHtml
+            ? section('DRAFT RESPONSE — FOR RAMY REVIEW ONLY', '#6941C6', draftHtml)
+            : ''
+        }
+        ${
+          report.limitations
+            ? section(
+                'LIMITATIONS',
+                '#667085',
+                `<div>${escapeDelegatedHtml(report.limitations)}</div>`
+              )
+            : ''
+        }
+        ${section(
+          'SOURCE FILES',
+          '#667085',
+          list(fileLines, 'No file attachment was included with this task.')
+        )}
+      </table>
+    </td></tr></table>
+  </body></html>`;
+};
+
+const sendTaskInboxAcknowledgement = async ({
+  taskSubject,
+  attachmentNames,
+  jobId,
+}) => {
+  const files = (attachmentNames || []).filter(Boolean);
+  const fileText = files.length
+    ? `<div style="margin-top:8px;color:#475467;font-size:13px;"><b>Files received:</b> ${files
+        .map(escapeDelegatedHtml)
+        .join(', ')}</div>`
+    : '<div style="margin-top:8px;color:#667085;font-size:13px;">No file attachment was detected.</div>';
+
+  const html = `<!doctype html><html><body style="margin:0;background:#f2f4f7;font-family:Arial,Helvetica,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:22px 10px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:720px;background:#fff;border:1px solid #e4e7ec;border-radius:10px;overflow:hidden;">
+      <tr><td style="background:#102A43;padding:18px 20px;border-bottom:4px solid #C8A96B;">
+        <div style="font-size:11px;font-weight:700;letter-spacing:1.6px;color:#C8A96B;">LONDON ASSISTANT · MINACO</div>
+        <div style="margin-top:4px;font-size:20px;font-weight:800;color:#fff;">Task Received</div>
+      </td></tr>
+      <tr><td style="padding:18px 20px;color:#344054;font-size:13px;line-height:20px;">
+        <div><b>${escapeDelegatedHtml(taskSubject || 'Task')}</b></div>
+        <div style="margin-top:7px;">I received your task and have started the analysis. I will email you the completed review when it is finished.</div>
+        ${fileText}
+        <div style="margin-top:10px;color:#667085;">No external email or commitment will be sent from this task unless you separately authorize it.</div>
+      </td></tr>
+    </table>
+  </td></tr></table>
+  </body></html>`;
+
+  await sendEmailFromLondon({
+    to: RAMY_MINACO_EMAIL,
+    subject: `LONDON — Task Received | ${taskSubjectWithoutPrefixes(taskSubject)}`,
+    body: html,
+    contentType: 'HTML',
+  });
+
+  console.log('TASK INBOX ACKNOWLEDGED:', { jobId, taskSubject });
+};
+
+const runTaskInboxJob = async ({
+  jobId,
+  messageId,
+  subject,
+}) => {
+  const job = taskInboxJobs.get(jobId);
+  let actionEventId = null;
+  let actualSubject = taskSubjectWithoutPrefixes(subject);
+
+  try {
+    if (job) {
+      job.status = 'running';
+      job.startedAt = Date.now();
+    }
+
+    const taskEmail = await findLondonTaskInboxEmail({
+      messageId,
+      subject,
+    });
+
+    const actualSender = normalizeTaskSender(
+      taskEmail.from?.emailAddress?.address
+    );
+    if (actualSender !== normalizeTaskSender(RAMY_MINACO_EMAIL)) {
+      throw new Error('The task email was not sent by the authorized Ramy Minaco mailbox.');
+    }
+
+    actualSubject = taskSubjectWithoutPrefixes(taskEmail.subject || subject);
+    const taskInstruction = String(taskEmail.body?.content || '').trim();
+
+    const attachments = taskEmail.hasAttachments
+      ? await listMailboxEmailAttachments(LONDON_MINACO_EMAIL, taskEmail.id)
+      : [];
+    const visibleAttachments = attachments.filter((item) => !item.isInline);
+
+    try {
+      const action = await createActionItem({
+        title: `Task Inbox — ${actualSubject}`,
+        project: '',
+        category: 'Executive Assistant Task',
+        owner: 'London',
+        status: 'ACTIVE',
+        priority: 'NORMAL',
+        lastContact: montrealDateParts(),
+        nextAction: 'Analyze the task email and attachments, then report back to Ramy.',
+        waitingOn: 'London',
+        ramyRequired: false,
+        source: `London Task Inbox | ${taskEmail.internetMessageId || taskEmail.id}`,
+        notes: `Automatically triggered from an email sent by Ramy to ${LONDON_MINACO_EMAIL}.`,
+      });
+      actionEventId = action.eventId;
+      if (job) job.actionEventId = actionEventId;
+    } catch (error) {
+      console.warn('TASK INBOX action-register warning:', error.message);
+    }
+
+    await sendTaskInboxAcknowledgement({
+      taskSubject: actualSubject,
+      attachmentNames: visibleAttachments.map((item) => item.name),
+      jobId,
+    });
+
+    const fileInputs = await buildTaskInboxFileInputs({
+      messageId: taskEmail.id,
+      attachments: visibleAttachments,
+    });
+
+    const userContent = [...fileInputs.content];
+    userContent.push({
+      type: 'input_text',
+      text: `RAMY'S TASK EMAIL
+Subject: ${actualSubject}
+From: ${taskEmail.from?.emailAddress?.name || ''} <${taskEmail.from?.emailAddress?.address || ''}>
+Received: ${taskEmail.receivedDateTime || ''}
+
+TASK INSTRUCTIONS / EMAIL BODY:
+${taskInstruction || '[No task instruction text was found in the email body.]'}
+
+FILES PROVIDED:
+${fileInputs.reviewedFiles.length ? fileInputs.reviewedFiles.join('\n') : '[No analyzable file attachments were included.]'}
+
+FILES NOT ANALYZED:
+${fileInputs.skippedFiles.length ? fileInputs.skippedFiles.join('\n') : '[None]'}`,
+    });
+
+    const data = await callOpenAIResponses(
+      {
+        model: TASK_INBOX_ANALYSIS_MODEL,
+        instructions: `You are London Assistant performing an autonomous internal task assigned directly by Ramy Mina through the verified London Task Inbox.
+
+Use ONLY the task email and supplied attachments. Analyze the actual files, including every relevant Excel worksheet/tab when the task asks for spreadsheet review. Do not silently skip worksheets, rows, units, calculations, assumptions, dates, or material discrepancies requested by Ramy.
+
+Be objective. Do not manufacture a challenge or conclusion. If the source material supports the counterparty, say so. If the evidence is incomplete, identify exactly what is missing rather than guessing.
+
+Important authority rules:
+- This is an INTERNAL analysis for Ramy.
+- Never contact an external party.
+- Never send a reply to a lender, supplier, tenant, consultant, or other third party from this task.
+- If Ramy requested a response, prepare it only as a DRAFT for his review.
+- Never approve payments, sign, commit pricing, settle disputes, or make legal/financial commitments.
+
+For comparison or compliance work, independently reconstruct the calculations from source files before comparing them with another party's findings.
+For Excel tasks, use sheet/tab names and source values where material.
+If Ramy requests a line-by-line, unit-by-unit, or tab-by-tab review, include all requested material rows in the comparison table rather than only examples.
+
+Return ONLY valid JSON, with no Markdown or code fences, using exactly this shape:
+{
+  "taskTitle": "short descriptive task title",
+  "executiveConclusion": "clear overall conclusion",
+  "status": "Complete or Needs information",
+  "keyFindings": [
+    {"importance":"High|Medium|Low","title":"short finding","detail":"supported detail"}
+  ],
+  "comparisonTable": {
+    "columns": ["column 1","column 2","..."],
+    "rows": [["cell","cell","..."]]
+  },
+  "risks": [
+    {"level":"High|Medium|Low","title":"risk title","detail":"why it matters"}
+  ],
+  "missingInformation": ["specific missing or unverifiable item"],
+  "recommendedNextActions": ["specific recommended action"],
+  "draftResponse": {
+    "included": false,
+    "recipient": "",
+    "subject": "",
+    "body": ""
+  },
+  "ramyActionRequired": false,
+  "ramyNextAction": "",
+  "limitations": "what cannot be concluded from the supplied material"
+}`,
+        input: [
+          {
+            role: 'user',
+            content: userContent,
+          },
+        ],
+      },
+      120000
+    );
+
+    const raw = extractOpenAIResponseText(data);
+    if (!raw) {
+      throw new Error('The Task Inbox analysis returned no text.');
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(stripJsonCodeFence(raw));
+    } catch (error) {
+      throw new Error(
+        'The Task Inbox analysis could not be parsed into a structured report.'
+      );
+    }
+
+    const report = normalizeTaskReport(parsed);
+    const html = renderTaskInboxReportHtml({
+      report,
+      taskSubject: actualSubject,
+      reviewedFiles: fileInputs.reviewedFiles,
+      skippedFiles: fileInputs.skippedFiles,
+      receivedAt: taskEmail.receivedDateTime,
+    });
+
+    await sendEmailFromLondon({
+      to: RAMY_MINACO_EMAIL,
+      subject: `LONDON — Task Complete | ${actualSubject}`,
+      body: html,
+      contentType: 'HTML',
+    });
+
+    if (actionEventId) {
+      try {
+        await updateActionItem(actionEventId, {
+          status: report.ramyActionRequired ? 'WAITING - RAMY' : 'COMPLETED',
+          lastContact: montrealDateParts(),
+          nextAction: report.ramyActionRequired
+            ? report.ramyNextAction || 'Review London’s completed analysis and decide the next step.'
+            : 'Completed analysis emailed to Ramy.',
+          waitingOn: report.ramyActionRequired ? 'Ramy' : '',
+          ramyRequired: Boolean(report.ramyActionRequired),
+          notes: `Task Inbox analysis completed. Files reviewed: ${
+            fileInputs.reviewedFiles.join(', ') || 'none'
+          }. ${
+            fileInputs.skippedFiles.length
+              ? `Files not analyzed: ${fileInputs.skippedFiles.join(', ')}.`
+              : ''
+          }`,
+        });
+      } catch (error) {
+        console.warn('TASK INBOX completion action-register warning:', error.message);
+      }
+    }
+
+    if (job) {
+      job.status = 'completed';
+      job.completedAt = Date.now();
+      job.taskSubject = actualSubject;
+      job.reportSentTo = RAMY_MINACO_EMAIL;
+    }
+
+    console.log('TASK INBOX COMPLETED:', {
+      jobId,
+      taskSubject: actualSubject,
+      files: fileInputs.reviewedFiles,
+    });
+  } catch (error) {
+    console.error('TASK INBOX FAILED:', {
+      jobId,
+      taskSubject: actualSubject,
+      error: error.message,
+    });
+
+    if (actionEventId) {
+      try {
+        await updateActionItem(actionEventId, {
+          status: 'BLOCKED',
+          lastContact: montrealDateParts(),
+          nextAction: 'Review the Task Inbox failure and provide missing information or retry.',
+          waitingOn: 'Ramy',
+          ramyRequired: true,
+          riskIfDelayed: 'The delegated task did not complete.',
+          notes: `Task Inbox failure: ${error.message}`,
+        });
+      } catch (updateError) {
+        console.error(
+          'TASK INBOX failure action-register update also failed:',
+          updateError
+        );
+      }
+    }
+
+    try {
+      await sendEmailFromLondon({
+        to: RAMY_MINACO_EMAIL,
+        subject: `LONDON — Task Could Not Complete | ${actualSubject}`,
+        body: `London received the task but could not complete it.\n\nTechnical issue: ${error.message}\n\nNo external email or commitment was sent.`,
+        contentType: 'Text',
+      });
+    } catch (notifyError) {
+      console.error('TASK INBOX failure notification also failed:', notifyError);
+    }
+
+    if (job) {
+      job.status = 'failed';
+      job.completedAt = Date.now();
+      job.error = error.message;
+    }
+  } finally {
+    pruneTaskInboxState();
+  }
+};
+
+const queueTaskInboxJob = ({
+  messageId,
+  subject,
+  dedupeKey,
+}) => {
+  const jobId = `task-inbox-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+
+  taskInboxJobs.set(jobId, {
+    jobId,
+    status: 'queued',
+    createdAt: Date.now(),
+    messageId: String(messageId || '').trim(),
+    taskSubject: taskSubjectWithoutPrefixes(subject),
+  });
+
+  if (dedupeKey) {
+    processedTaskInboxKeys.set(dedupeKey, {
+      jobId,
+      createdAt: Date.now(),
+    });
+  }
+
+  setImmediate(() => {
+    runTaskInboxJob({
+      jobId,
+      messageId,
+      subject,
+    }).catch((error) => {
+      console.error('Unexpected Task Inbox background failure:', error);
+    });
+  });
+
+  return {
+    success: true,
+    queued: true,
+    jobId,
+    taskSubject: taskSubjectWithoutPrefixes(subject),
+  };
+};
+
+
 // -----------------------------------------------------------------------------
 // Fastify / London voice configuration
 // -----------------------------------------------------------------------------
@@ -2846,6 +4008,26 @@ Never invent a recipient email address. If Ramy gives only a person's name for a
 
 
 ADVANCED EMAIL, ATTACHMENTS, AND CONTACTS
+
+LONDON TASK INBOX
+
+Emails that Ramy sends directly to london@minaco.ca can be treated as task assignments by the automatic Task Inbox workflow. That background workflow is separate from the live phone call: Power Automate triggers the server, the server verifies the sender is ramy.mina@minaco.ca, acknowledges the task, analyzes the complete task email and supported attachments, records the work in the Action Register, and emails the completed internal analysis back to Ramy.
+If Ramy asks whether a task email reached London, use search_email with mailbox "london" to verify the live London inbox. Do not claim a task has started or completed unless the live mailbox or task workflow confirms it.
+Task Inbox work may prepare a draft response for Ramy's review, but it must never send externally or make a commitment on its own.
+
+
+DELEGATED EMAIL REVIEW / BACKGROUND WORK
+
+For a multi-step request where Ramy asks you to read or review an email thread, summarize/analyze/translate it, give your view or identify risks, AND email the result to Ramy, use delegate_email_thread_review immediately instead of chaining several synchronous voice tools.
+This delegated tool may send the finished analysis ONLY to Ramy's own verified Minaco email address. It can never email an external recipient. Ramy's explicit request in the same turn to "send me an email", "email me the summary", or equivalent is authorization for this self-email only; do not ask for a second Send it confirmation for the delegated self-email.
+Once delegate_email_thread_review confirms the job is queued, tell Ramy briefly that the task has been handed off and he may hang up; the completed review will be emailed to him. Do NOT keep him waiting on the call and do NOT continue a synchronous search/read/analyze chain for the same task.
+If no delegated job has actually been queued, never claim you will continue working after the call ends.
+External replies or emails to anyone other than Ramy still require the normal prepared-draft and explicit Send it confirmation workflow.
+
+DELAY / RESPONSIVENESS
+
+If Ramy asks why you were slow to respond, never invent a reason such as a flight delay or another event. Say only that there was a connection or processing delay unless a live tool or system error provides a verified cause.
+When a delegated job has been queued, remain responsive to Ramy immediately; the long analysis is no longer part of the live voice turn.
 
 Use search_email when Ramy asks you to find an older email, search by person/company/topic, or search a specific period. Search can target Ramy's mailbox or Accounting.
 Use check_accounting when Ramy asks about current invoices, statements, payment reminders, deposits, supplier credits, overdue notices, insurance, taxes, financing charges, or other accounting-mailbox items.
@@ -2984,6 +4166,7 @@ fastify.get('/', async (request, reply) => {
       'action register',
       'accounting mailbox',
       'daily executive brief',
+      'automatic task inbox',
     ],
   });
 });
@@ -3017,6 +4200,90 @@ fastify.post('/daily-brief', async (request, reply) => {
     console.error('Scheduled daily brief error:', error);
     return reply.code(500).send({ success: false, error: error.message });
   }
+});
+
+
+// Automatic task endpoint. Power Automate should call this when a new email
+// arrives in london@minaco.ca. Only task emails from Ramy's verified Minaco
+// address are accepted. The endpoint returns quickly while the analysis runs
+// as a delegated server job.
+fastify.post('/task-inbox', async (request, reply) => {
+  try {
+    if (!TASK_INBOX_SECRET) {
+      return reply.code(503).send({
+        success: false,
+        error: 'TASK_INBOX_SECRET is not configured, so automatic task intake is disabled.',
+      });
+    }
+
+    const suppliedSecret = request.headers['x-london-task-secret'];
+    if (!suppliedSecret || suppliedSecret !== TASK_INBOX_SECRET) {
+      return reply.code(401).send({ success: false, error: 'Unauthorized.' });
+    }
+
+    const payload = request.body || {};
+    const fromAddress = normalizeTaskSender(
+      payload.from_address || payload.from || payload.sender || ''
+    );
+
+    if (!fromAddress || fromAddress !== normalizeTaskSender(RAMY_MINACO_EMAIL)) {
+      return reply.code(403).send({
+        success: false,
+        error: 'This message is not an authorized task instruction from Ramy.',
+      });
+    }
+
+    const messageId = String(
+      payload.message_id || payload.messageId || payload.id || ''
+    ).trim();
+    const internetMessageId = String(
+      payload.internet_message_id || payload.internetMessageId || ''
+    ).trim();
+    const subject = String(payload.subject || 'Untitled task').trim();
+    const received = String(
+      payload.received_date_time || payload.receivedDateTime || ''
+    ).trim();
+
+    const dedupeKey =
+      internetMessageId ||
+      messageId ||
+      `${fromAddress}|${subject.toLowerCase()}|${received}`;
+
+    const alreadyProcessed = processedTaskInboxKeys.get(dedupeKey);
+    if (alreadyProcessed?.jobId) {
+      return reply.code(202).send({
+        success: true,
+        queued: true,
+        duplicate: true,
+        jobId: alreadyProcessed.jobId,
+      });
+    }
+
+    const queued = queueTaskInboxJob({
+      messageId,
+      subject,
+      dedupeKey,
+    });
+
+    return reply.code(202).send(queued);
+  } catch (error) {
+    console.error('TASK INBOX endpoint error:', error);
+    return reply.code(500).send({ success: false, error: error.message });
+  }
+});
+
+fastify.get('/task-inbox/status/:jobId', async (request, reply) => {
+  const suppliedSecret = request.headers['x-london-task-secret'];
+  if (!TASK_INBOX_SECRET || suppliedSecret !== TASK_INBOX_SECRET) {
+    return reply.code(401).send({ success: false, error: 'Unauthorized.' });
+  }
+
+  const job = taskInboxJobs.get(request.params.jobId);
+  if (!job) {
+    return reply.code(404).send({ success: false, error: 'Task job not found.' });
+  }
+
+  return reply.send({ success: true, job });
 });
 
 fastify.all('/incoming-call', async (request, reply) => {
@@ -3307,6 +4574,39 @@ fastify.register(async (fastifyInstance) => {
               },
               {
                 type: 'function',
+                name: 'delegate_email_thread_review',
+                description:
+                  'Queue a background review of a live Minaco email conversation and email the completed summary/analysis to Ramy himself. Use for multi-step requests such as read the thread from Lias, review Hussein supplier response, summarize it in English, identify risks before signing, and email me your analysis. This tool returns immediately and sends only to Ramy, never to an external recipient.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    lookup_query: {
+                      type: 'string',
+                      description:
+                        'Sender, company, email address, subject, or thread search term used to identify the live email conversation, for example Lias.',
+                    },
+                    focus: {
+                      type: 'string',
+                      description:
+                        'Optional person, supplier, or issue within the thread to focus on, for example Hussein or heat-pump service and warranty.',
+                    },
+                    instruction: {
+                      type: 'string',
+                      description:
+                        'What Ramy wants done with the thread, including summary, translation, commercial assessment, risks, questions, or recommendation.',
+                    },
+                    output_language: {
+                      type: 'string',
+                      description:
+                        'Language for the emailed review. Default English unless Ramy asks otherwise.',
+                    },
+                  },
+                  required: ['lookup_query', 'instruction'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
                 name: 'read_email',
                 description:
                   'Retrieve the complete live body and recipient details of one specific email in Ramy’s Minaco mailbox. Use whenever Ramy asks to read, translate, summarize, analyze, or respond based on the full email rather than a preview.',
@@ -3391,14 +4691,14 @@ fastify.register(async (fastifyInstance) => {
                 type: 'function',
                 name: 'search_email',
                 description:
-                  'Search historical live email by person, company, subject, or keywords. Can search Ramy or Accounting. Use when the desired email may not be in the latest inbox list.',
+                  'Search historical live email by person, company, subject, or keywords. Can search Ramy, Accounting, or London Task Inbox. Use when the desired email may not be in the latest inbox list.',
                 parameters: {
                   type: 'object',
                   properties: {
                     mailbox: {
                       type: 'string',
-                      enum: ['ramy', 'accounting'],
-                      description: 'Mailbox to search. Default ramy.',
+                      enum: ['ramy', 'accounting', 'london'],
+                      description: 'Mailbox to search: ramy, accounting, or london. Default ramy.',
                     },
                     query: {
                       type: 'string',
@@ -3468,8 +4768,8 @@ fastify.register(async (fastifyInstance) => {
                   properties: {
                     mailbox: {
                       type: 'string',
-                      enum: ['ramy', 'accounting'],
-                      description: 'Mailbox containing the email.',
+                      enum: ['ramy', 'accounting', 'london'],
+                      description: 'Mailbox containing the email: ramy, accounting, or london.',
                     },
                     message_id: {
                       type: 'string',
@@ -3490,8 +4790,8 @@ fastify.register(async (fastifyInstance) => {
                   properties: {
                     mailbox: {
                       type: 'string',
-                      enum: ['ramy', 'accounting'],
-                      description: 'Mailbox containing the email.',
+                      enum: ['ramy', 'accounting', 'london'],
+                      description: 'Mailbox containing the email: ramy, accounting, or london.',
                     },
                     message_id: {
                       type: 'string',
@@ -4027,6 +5327,35 @@ fastify.register(async (fastifyInstance) => {
             activeToolCallId = response.call_id;
             activeToolName = response.name;
             activeToolStartedAt = Date.now();
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'delegate_email_thread_review'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const queued = queueDelegatedThreadReviewJob({
+                lookupQuery: args.lookup_query,
+                focus: args.focus || '',
+                instruction: args.instruction || '',
+                outputLanguage: args.output_language || 'English',
+              });
+
+              respondToToolCall(
+                response.call_id,
+                queued,
+                `Tell Ramy the delegated email-thread review has been queued successfully and the completed review will be emailed to ${RAMY_MINACO_EMAIL}. Tell him he may hang up now if he wants. Keep this to one or two short sentences. Do not say the review is already complete.`
+              );
+            } catch (error) {
+              console.error('Delegate email thread review queue error:', error);
+              respondToToolCall(
+                response.call_id,
+                { success: false, queued: false, error: error.message },
+                'Tell Ramy the delegated review could not be queued and state the returned error concisely. Do not claim any background work will continue.'
+              );
+            }
+            return;
           }
 
           if (
