@@ -5068,14 +5068,38 @@ fastify.register(async (fastifyInstance) => {
         'list_actions',
       ]);
 
-      const openAiWs = new WebSocket(
-        `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${TEMPERATURE}`,
-        {
-          headers: {
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
-          },
+      let openAiWs = null;
+      let openAiGeneration = 0;
+      let reconnectAttempts = 0;
+      let reconnectTimer = null;
+      let heartbeatTimer = null;
+      let watchdogTimer = null;
+      let lastOpenAiEventAt = Date.now();
+      let lastOpenAiPongAt = Date.now();
+      let lastAssistantAudioAt = 0;
+      let awaitingResponseSince = 0;
+      let callClosed = false;
+      let sessionReady = false;
+      const pendingAudioFrames = [];
+
+      const OPENAI_HEARTBEAT_MS = 10000;
+      const OPENAI_PONG_TIMEOUT_MS = 25000;
+      const VOICE_TOOL_TIMEOUT_MS = 18000;
+      const RESPONSE_STALL_TIMEOUT_MS = 20000;
+      const MAX_OPENAI_RECONNECT_ATTEMPTS = 4;
+      const MAX_BUFFERED_AUDIO_FRAMES = 150;
+
+      const safeOpenAiSend = (payload) => {
+        if (!openAiWs || openAiWs.readyState !== WebSocket.OPEN) return false;
+        const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
+        try {
+          safeOpenAiSend(data);
+          return true;
+        } catch (error) {
+          console.error('OPENAI_SOCKET send failed:', error.message);
+          return false;
         }
-      );
+      };
 
       const respondToToolCall = (callId, output, instructions) => {
         if (cancelledToolCalls.has(callId)) {
@@ -5089,7 +5113,7 @@ fastify.register(async (fastifyInstance) => {
           activeToolStartedAt = 0;
         }
 
-        openAiWs.send(
+        safeOpenAiSend(
           JSON.stringify({
             type: 'conversation.item.create',
             item: {
@@ -5101,7 +5125,7 @@ fastify.register(async (fastifyInstance) => {
           })
         );
 
-        openAiWs.send(
+        safeOpenAiSend(
           JSON.stringify({
             type: 'response.create',
             response: {
@@ -5123,7 +5147,7 @@ fastify.register(async (fastifyInstance) => {
         activeToolName = null;
         activeToolStartedAt = 0;
 
-        openAiWs.send(
+        safeOpenAiSend(
           JSON.stringify({
             type: 'conversation.item.create',
             item: {
@@ -5957,7 +5981,7 @@ fastify.register(async (fastifyInstance) => {
         };
 
         console.log('Sending session update');
-        openAiWs.send(JSON.stringify(sessionUpdate));
+        safeOpenAiSend(JSON.stringify(sessionUpdate));
       };
 
       const handleSpeechStartedEvent = () => {
@@ -5978,7 +6002,7 @@ fastify.register(async (fastifyInstance) => {
               content_index: 0,
               audio_end_ms: elapsedTime,
             };
-            openAiWs.send(JSON.stringify(truncateEvent));
+            safeOpenAiSend(JSON.stringify(truncateEvent));
           }
 
           connection.send(
@@ -6007,19 +6031,59 @@ fastify.register(async (fastifyInstance) => {
         markQueue.push('responsePart');
       };
 
-      openAiWs.on('open', () => {
-        console.log('Connected to the OpenAI Realtime API');
-        setTimeout(initializeSession, 100);
-      });
-
-      openAiWs.on('message', async (data) => {
+      const handleOpenAiMessage = async (data) => {
         try {
           const response = JSON.parse(data);
+          lastOpenAiEventAt = Date.now();
+
+          if (response.type === 'input_audio_buffer.speech_stopped') {
+            awaitingResponseSince = Date.now();
+          }
+
+          if (response.type === 'response.output_audio.delta' && response.delta) {
+            lastAssistantAudioAt = Date.now();
+            awaitingResponseSince = 0;
+          }
+
+          if (response.type === 'response.done') {
+            awaitingResponseSince = 0;
+          }
 
           if (response.type === 'conversation.item.input_audio_transcription.completed') {
             lastUserTranscript = String(response.transcript || '').trim();
             lastUserTranscriptSpeechStartedAt = latestUserSpeechStartedAt;
             console.log('USER TRANSCRIPT:', lastUserTranscript);
+
+            const normalizedStop = lastUserTranscript
+              .toLowerCase()
+              .replace(/[^a-z0-9\s]/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+
+            if (/^(stop|stop london|cancel|never mind|nevermind)$/.test(normalizedStop)) {
+              console.log('VOICE_STOP received from Ramy');
+              cancelActiveReadOnlyTool();
+              safeOpenAiSend({ type: 'response.cancel' });
+              if (streamSid && connection.readyState === WebSocket.OPEN) {
+                try {
+                  connection.send(JSON.stringify({ event: 'clear', streamSid }));
+                } catch (error) {
+                  console.warn('TWILIO clear on stop failed:', error.message);
+                }
+              }
+              markQueue = [];
+              lastAssistantItem = null;
+              responseStartTimestampTwilio = null;
+              awaitingResponseSince = 0;
+              setTimeout(() => {
+                safeOpenAiSend({
+                  type: 'response.create',
+                  response: {
+                    instructions: 'Ramy said stop. Say only: Stopped. Then wait for his next instruction.',
+                  },
+                });
+              }, 100);
+            }
           }
 
           if (response.type === 'conversation.item.input_audio_transcription.failed') {
@@ -7289,7 +7353,244 @@ fastify.register(async (fastifyInstance) => {
             data
           );
         }
-      });
+      };
+
+      const stopOpenAiTimers = () => {
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
+      };
+
+      const scheduleOpenAiReconnect = (reason) => {
+        if (callClosed || reconnectTimer) return;
+
+        if (reconnectAttempts >= MAX_OPENAI_RECONNECT_ATTEMPTS) {
+          console.error('RECONNECT exhausted:', {
+            attempts: reconnectAttempts,
+            reason,
+          });
+          try {
+            if (connection.readyState === WebSocket.OPEN) {
+              connection.close(1011, 'London voice connection unavailable');
+            }
+          } catch (error) {
+            console.error('TWILIO close after reconnect exhaustion failed:', error.message);
+          }
+          return;
+        }
+
+        reconnectAttempts += 1;
+        const delay = Math.min(500 * 2 ** (reconnectAttempts - 1), 4000);
+        console.warn('RECONNECT scheduled:', {
+          attempt: reconnectAttempts,
+          delayMs: delay,
+          reason,
+        });
+
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          connectOpenAi(`reconnect:${reason}`);
+        }, delay);
+      };
+
+      const attachOpenAiSocketHandlers = (ws, generation, connectionReason) => {
+        ws.on('open', () => {
+          if (generation !== openAiGeneration || callClosed) {
+            try { ws.close(); } catch {}
+            return;
+          }
+
+          console.log('OPENAI_SOCKET open:', {
+            generation,
+            reason: connectionReason,
+            reconnectAttempts,
+          });
+          sessionReady = false;
+          lastOpenAiEventAt = Date.now();
+          lastOpenAiPongAt = Date.now();
+
+          setTimeout(() => {
+            if (generation !== openAiGeneration || ws.readyState !== WebSocket.OPEN) return;
+            initializeSession();
+            sessionReady = true;
+
+            setTimeout(() => {
+              if (generation !== openAiGeneration || ws.readyState !== WebSocket.OPEN) return;
+              while (pendingAudioFrames.length) {
+                const payload = pendingAudioFrames.shift();
+                safeOpenAiSend({
+                  type: 'input_audio_buffer.append',
+                  audio: payload,
+                });
+              }
+
+              if (connectionReason !== 'initial') {
+                safeOpenAiSend({
+                  type: 'response.create',
+                  response: {
+                    instructions:
+                      'The realtime voice connection briefly dropped and has now recovered. Tell Ramy in one short sentence that you are back and ask him to repeat the last instruction. Do not claim any interrupted tool or external action completed.',
+                  },
+                });
+              }
+            }, 350);
+          }, 100);
+
+          // Reset the reconnect counter only after the replacement socket stays stable.
+          setTimeout(() => {
+            if (
+              generation === openAiGeneration &&
+              openAiWs === ws &&
+              ws.readyState === WebSocket.OPEN
+            ) {
+              reconnectAttempts = 0;
+            }
+          }, 15000);
+
+          if (heartbeatTimer) clearInterval(heartbeatTimer);
+          heartbeatTimer = setInterval(() => {
+            if (generation !== openAiGeneration || callClosed) return;
+            if (ws.readyState !== WebSocket.OPEN) return;
+
+            const now = Date.now();
+            if (now - lastOpenAiPongAt > OPENAI_PONG_TIMEOUT_MS) {
+              console.error('WATCHDOG OpenAI pong timeout:', {
+                generation,
+                msSincePong: now - lastOpenAiPongAt,
+              });
+              try { ws.terminate(); } catch {}
+              return;
+            }
+
+            try {
+              ws.ping();
+            } catch (error) {
+              console.error('OPENAI_SOCKET ping failed:', error.message);
+              try { ws.terminate(); } catch {}
+            }
+          }, OPENAI_HEARTBEAT_MS);
+          if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+        });
+
+        ws.on('pong', () => {
+          if (generation === openAiGeneration) {
+            lastOpenAiPongAt = Date.now();
+          }
+        });
+
+        ws.on('message', handleOpenAiMessage);
+
+        ws.on('close', (code, reasonBuffer) => {
+          if (generation !== openAiGeneration) return;
+          sessionReady = false;
+          if (heartbeatTimer) {
+            clearInterval(heartbeatTimer);
+            heartbeatTimer = null;
+          }
+
+          const reason = Buffer.isBuffer(reasonBuffer)
+            ? reasonBuffer.toString('utf8')
+            : String(reasonBuffer || '');
+          console.warn('OPENAI_SOCKET closed:', { generation, code, reason });
+
+          if (activeToolCallId && cancellableToolNames.has(activeToolName)) {
+            cancelledToolCalls.add(activeToolCallId);
+            activeToolCallId = null;
+            activeToolName = null;
+            activeToolStartedAt = 0;
+          }
+
+          if (!callClosed) scheduleOpenAiReconnect(`close:${code}`);
+        });
+
+        ws.on('error', (error) => {
+          if (generation !== openAiGeneration) return;
+          console.error('OPENAI_SOCKET error:', {
+            generation,
+            message: error.message,
+          });
+          // ws will normally emit close after error. Force termination so the
+          // reconnect path is deterministic if the socket remains half-open.
+          try {
+            if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
+          } catch {}
+        });
+      };
+
+      const connectOpenAi = (reason = 'initial') => {
+        if (callClosed) return;
+
+        openAiGeneration += 1;
+        const generation = openAiGeneration;
+        sessionReady = false;
+
+        console.log('OPENAI_SOCKET connecting:', { generation, reason });
+        const ws = new WebSocket(
+          `wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature=${TEMPERATURE}`,
+          {
+            headers: {
+              Authorization: `Bearer ${OPENAI_API_KEY}`,
+            },
+            handshakeTimeout: 12000,
+          }
+        );
+        openAiWs = ws;
+        attachOpenAiSocketHandlers(ws, generation, reason);
+      };
+
+      watchdogTimer = setInterval(() => {
+        if (callClosed) return;
+        const now = Date.now();
+
+        if (
+          activeToolCallId &&
+          activeToolName &&
+          cancellableToolNames.has(activeToolName) &&
+          activeToolStartedAt &&
+          now - activeToolStartedAt > VOICE_TOOL_TIMEOUT_MS
+        ) {
+          const timedOutTool = activeToolName;
+          console.error('WATCHDOG tool timeout:', {
+            tool: timedOutTool,
+            ms: now - activeToolStartedAt,
+          });
+          const cancelled = cancelActiveReadOnlyTool();
+          if (cancelled) {
+            safeOpenAiSend({
+              type: 'response.create',
+              response: {
+                instructions: `The live ${timedOutTool} lookup timed out. Tell Ramy concisely that the lookup did not complete and that you are still responsive. Do not invent a result.`,
+              },
+            });
+          }
+        }
+
+        if (
+          awaitingResponseSince &&
+          now - awaitingResponseSince > RESPONSE_STALL_TIMEOUT_MS &&
+          now - lastOpenAiEventAt > 8000 &&
+          openAiWs &&
+          openAiWs.readyState === WebSocket.OPEN
+        ) {
+          console.error('WATCHDOG response stall:', {
+            awaitingMs: now - awaitingResponseSince,
+            msSinceOpenAiEvent: now - lastOpenAiEventAt,
+            msSinceAssistantAudio: lastAssistantAudioAt
+              ? now - lastAssistantAudioAt
+              : null,
+          });
+          awaitingResponseSince = 0;
+          try { openAiWs.terminate(); } catch {}
+        }
+      }, 2000);
+      if (typeof watchdogTimer.unref === 'function') watchdogTimer.unref();
+
+      connectOpenAi('initial');
 
       connection.on('message', (message) => {
         try {
@@ -7303,13 +7604,16 @@ fastify.register(async (fastifyInstance) => {
                   `Received media message with timestamp: ${latestMediaTimestamp}ms`
                 );
               }
-              if (openAiWs.readyState === WebSocket.OPEN) {
-                openAiWs.send(
-                  JSON.stringify({
-                    type: 'input_audio_buffer.append',
-                    audio: data.media.payload,
-                  })
-                );
+              if (openAiWs && openAiWs.readyState === WebSocket.OPEN && sessionReady) {
+                safeOpenAiSend({
+                  type: 'input_audio_buffer.append',
+                  audio: data.media.payload,
+                });
+              } else {
+                pendingAudioFrames.push(data.media.payload);
+                if (pendingAudioFrames.length > MAX_BUFFERED_AUDIO_FRAMES) {
+                  pendingAudioFrames.shift();
+                }
               }
               break;
 
@@ -7334,16 +7638,20 @@ fastify.register(async (fastifyInstance) => {
       });
 
       connection.on('close', () => {
-        if (openAiWs.readyState === WebSocket.OPEN) openAiWs.close();
-        console.log('Client disconnected.');
+        callClosed = true;
+        stopOpenAiTimers();
+        if (watchdogTimer) {
+          clearInterval(watchdogTimer);
+          watchdogTimer = null;
+        }
+        if (openAiWs && openAiWs.readyState !== WebSocket.CLOSED) {
+          try { openAiWs.close(1000, 'Twilio client disconnected'); } catch {}
+        }
+        console.log('TWILIO client disconnected.');
       });
 
-      openAiWs.on('close', () => {
-        console.log('Disconnected from the OpenAI Realtime API');
-      });
-
-      openAiWs.on('error', (error) => {
-        console.error('Error in the OpenAI WebSocket:', error);
+      connection.on('error', (error) => {
+        console.error('TWILIO socket error:', error.message || error);
       });
     }
   );
