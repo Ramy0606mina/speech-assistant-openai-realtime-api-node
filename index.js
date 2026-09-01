@@ -5093,7 +5093,7 @@ fastify.register(async (fastifyInstance) => {
         if (!openAiWs || openAiWs.readyState !== WebSocket.OPEN) return false;
         const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
         try {
-          safeOpenAiSend(data);
+          openAiWs.send(data);
           return true;
         } catch (error) {
           console.error('OPENAI_SOCKET send failed:', error.message);
