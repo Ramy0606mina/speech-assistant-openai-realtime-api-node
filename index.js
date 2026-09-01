@@ -7348,7 +7348,12 @@ fastify.register(async (fastifyInstance) => {
 
           if (response.type === 'input_audio_buffer.speech_started') {
             latestUserSpeechStartedAt = Date.now();
-            cancelActiveReadOnlyTool();
+
+            // Barge-in should stop London's spoken response, but it must NOT
+            // cancel an email/calendar/brief lookup merely because Ramy begins
+            // speaking. Read-only tools continue in the background unless Ramy
+            // explicitly says stop/cancel/never mind, which is handled by the
+            // transcript-based stop command logic.
             handleSpeechStartedEvent();
           }
         } catch (error) {
