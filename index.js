@@ -3073,6 +3073,17 @@ const processQuickActionInstruction = async ({ text, channel = 'voice', sender =
   const state = messagingState.get(key) || { recentList: [], lastEventId: '', updatedAt: Date.now() };
   const lower = cleanText.toLowerCase().trim();
 
+  // Ordinary conversation should not be treated as an Action Register update.
+  if (/^(hi|hello|hey|hey london|hi london|hello london)[.!?\s]*$/i.test(cleanText)) {
+    return { success: true, reply: 'Hi Ramy. I’m here — what do you need?' };
+  }
+  if (/^(thanks|thank you|thx|perfect|great)[.!?\s]*$/i.test(cleanText)) {
+    return { success: true, reply: 'You’re welcome.' };
+  }
+  if (/^(are you there|you there|london|london\?)[.!?\s]*$/i.test(cleanText)) {
+    return { success: true, reply: 'Yes, I’m here.' };
+  }
+
   const allOpen = await listActionItems({ includeClosed: false, limit: 100 });
 
   // Very fast common list commands do not need an AI interpretation round-trip.
@@ -4728,15 +4739,29 @@ const handleIncomingExecutiveMessage = async (request, reply) => {
   const messageBody = String(body.Body || request.query?.Body || '').trim();
   const messageSid = String(body.MessageSid || body.SmsMessageSid || '').trim();
   const numMedia = Number(body.NumMedia || 0);
-  const channel = from.toLowerCase().startsWith('whatsapp:') || to.toLowerCase().startsWith('whatsapp:')
-    ? 'whatsapp'
-    : 'sms';
+  const waId = String(body.WaId || request.query?.WaId || '').trim();
+  const profileName = String(body.ProfileName || request.query?.ProfileName || '').trim();
+
+  // Twilio normally prefixes WhatsApp addresses with "whatsapp:", but WaId/ProfileName
+  // provide a second reliable signal. This prevents a WhatsApp message from being
+  // accidentally classified and answered as SMS.
+  const isWhatsApp =
+    Boolean(waId) ||
+    Boolean(profileName) ||
+    from.toLowerCase().startsWith('whatsapp:') ||
+    to.toLowerCase().startsWith('whatsapp:');
+
+  const channel = isWhatsApp ? 'whatsapp' : 'sms';
 
   const validSignature = validateTwilioFormWebhook(request);
-  const authorizedSender = isAuthorizedRamyMessagingSender(from);
+  const authorizedSender = isAuthorizedRamyMessagingSender(from || waId);
   console.log('MESSAGING SECURITY CHECK:', {
     channel,
-    sender: normalizePhoneIdentity(from),
+    sender: normalizePhoneIdentity(from || waId),
+    waId: waId || '',
+    profileName: profileName || '',
+    rawFrom: from,
+    rawTo: to,
     signatureValid: validSignature,
     authorizedSender,
     messageSid,
@@ -4773,17 +4798,37 @@ const handleIncomingExecutiveMessage = async (request, reply) => {
         });
       }
 
+      const replyTo =
+        channel === 'whatsapp'
+          ? `whatsapp:${normalizePhoneIdentity(from || waId)}`
+          : normalizePhoneIdentity(from);
+
+      const replyFrom =
+        channel === 'whatsapp'
+          ? `whatsapp:${normalizePhoneIdentity(to || TWILIO_PHONE_NUMBER)}`
+          : normalizePhoneIdentity(to || TWILIO_PHONE_NUMBER);
+
       await sendTwilioChannelMessage({
-        to: from,
-        from: to || (channel === 'sms' ? TWILIO_PHONE_NUMBER : ''),
+        to: replyTo,
+        from: replyFrom,
         body: result.reply,
       });
     } catch (error) {
       console.error('Inbound executive messaging failure:', error);
       try {
+        const errorReplyTo =
+          channel === 'whatsapp'
+            ? `whatsapp:${normalizePhoneIdentity(from || waId)}`
+            : normalizePhoneIdentity(from);
+
+        const errorReplyFrom =
+          channel === 'whatsapp'
+            ? `whatsapp:${normalizePhoneIdentity(to || TWILIO_PHONE_NUMBER)}`
+            : normalizePhoneIdentity(to || TWILIO_PHONE_NUMBER);
+
         await sendTwilioChannelMessage({
-          to: from,
-          from: to || (channel === 'sms' ? TWILIO_PHONE_NUMBER : ''),
+          to: errorReplyTo,
+          from: errorReplyFrom,
           body: `I received your ${channel === 'whatsapp' ? 'WhatsApp' : 'text'} but could not update the Action Register: ${error.message}`,
         });
       } catch (notifyError) {
