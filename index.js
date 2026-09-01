@@ -3205,6 +3205,129 @@ const processQuickActionInstruction = async ({ text, channel = 'voice', sender =
   };
 };
 
+
+// -----------------------------------------------------------------------------
+// General SMS / WhatsApp executive command router
+// -----------------------------------------------------------------------------
+
+const formatMessagingEmailList = (emails = []) => {
+  if (!emails.length) return 'I found no recent emails in your Minaco inbox.';
+  return emails.slice(0, 5).map((email, index) => {
+    const sender =
+      email.from?.emailAddress?.name ||
+      email.from?.emailAddress?.address ||
+      'Unknown sender';
+    const subject = email.subject || '(No subject)';
+    return `${index + 1}. ${sender} — ${subject}`;
+  }).join('\n');
+};
+
+const formatMessagingCalendarList = (events = []) => {
+  const active = events.filter((event) => !event.isCancelled).slice(0, 8);
+  if (!active.length) return 'I found no upcoming meetings on your Minaco calendar.';
+  return active.map((event, index) => {
+    const when = event.startLocal || event.start?.dateTime || '';
+    return `${index + 1}. ${when} — ${event.subject || '(No subject)'}`;
+  }).join('\n');
+};
+
+const compactTaskTitleFromMessage = (text) => {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim();
+  return clean.length > 140 ? `${clean.slice(0, 137)}...` : clean;
+};
+
+const processExecutiveMessagingInstruction = async ({
+  text,
+  channel = 'sms',
+  sender = RAMY_PHONE_NUMBER,
+}) => {
+  const cleanText = String(text || '').trim();
+  const lower = cleanText.toLowerCase();
+  if (!cleanText) return { success: false, reply: 'I did not receive a command.' };
+
+  // Natural conversation.
+  if (/^(hi|hello|hey|hey london|hi london|hello london)[.!?\s]*$/i.test(cleanText)) {
+    return { success: true, reply: 'Hi Ramy. I’m here — what do you need?' };
+  }
+  if (/^(thanks|thank you|thx|perfect|great)[.!?\s]*$/i.test(cleanText)) {
+    return { success: true, reply: 'You’re welcome.' };
+  }
+  if (/^(are you there|you there|london|london\?)[.!?\s]*$/i.test(cleanText)) {
+    return { success: true, reply: 'Yes, I’m here.' };
+  }
+
+  // Read-only email commands.
+  if (
+    /(check|show|read|latest|recent|what).*\b(email|emails|inbox|mail)\b/i.test(cleanText) ||
+    /\b(email|emails|inbox)\b.*\b(latest|recent|new|today)\b/i.test(cleanText)
+  ) {
+    try {
+      const emails = await getRecentMinacoEmails(5);
+      return {
+        success: true,
+        reply: `Latest Minaco emails:\n${formatMessagingEmailList(emails)}`,
+      };
+    } catch (error) {
+      return { success: false, reply: `I could not read your inbox: ${error.message}` };
+    }
+  }
+
+  // Read-only calendar commands.
+  if (
+    /\b(calendar|schedule|meetings|appointments)\b/i.test(cleanText) &&
+    /\b(check|show|what|today|tomorrow|week|upcoming|next)\b/i.test(cleanText)
+  ) {
+    try {
+      const events = await getCalendarEvents();
+      return {
+        success: true,
+        reply: `Upcoming Minaco calendar:\n${formatMessagingCalendarList(events)}`,
+      };
+    } catch (error) {
+      return { success: false, reply: `I could not read your calendar: ${error.message}` };
+    }
+  }
+
+  // Action Register commands remain the primary lightweight update path.
+  const actionResult = await processQuickActionInstruction({
+    text: cleanText,
+    channel,
+    sender,
+  });
+  if (actionResult?.success) return actionResult;
+
+  // For an ordinary executive instruction that is not safely executable through
+  // messaging yet, capture it as an Action Register task instead of rejecting it.
+  // External sends and calendar writes still require a separate confirmation path.
+  const looksLikeInstruction =
+    /^(please\s+)?(email|reply|respond|send|call|follow|review|analyze|analyse|check|book|schedule|cancel|reschedule|prepare|draft|contact|ask|remind|find|compare|update)\b/i.test(cleanText);
+
+  if (looksLikeInstruction) {
+    try {
+      const action = await createActionItem({
+        title: compactTaskTitleFromMessage(cleanText),
+        owner: 'London',
+        status: 'ACTIVE',
+        priority: 'NORMAL',
+        nextAction: cleanText,
+        source: String(channel || 'message').toUpperCase(),
+        notes: `Command received from Ramy via ${channel}: ${cleanText}`,
+      });
+      return {
+        success: true,
+        reply: `Got it. I registered this task: ${action.title}. I’ll keep it in the Action Register. External sends or calendar changes still require confirmation before I execute them.`,
+      };
+    } catch (error) {
+      return { success: false, reply: `I received the command but could not register it: ${error.message}` };
+    }
+  }
+
+  return {
+    success: false,
+    reply: 'I received your message, but I could not safely determine the action. Please state the task in one short sentence.',
+  };
+};
+
 // -----------------------------------------------------------------------------
 // Daily executive brief
 // -----------------------------------------------------------------------------
@@ -4415,6 +4538,15 @@ Verified Minaco identities:
 
 When Ramy asks what his email address is without specifying another company, answer ramy.mina@minaco.ca.
 When Ramy asks who you are, say: "I am London Assistant, your executive assistant for Minaco."
+
+VOICE ALIGNMENT
+
+Speak in polished British English with a natural England accent. Match Vale's calm, measured pacing as closely as the available realtime voice permits.
+Speak about 10-15% slower than a typical assistant. Never rush names, dates, numbers, email addresses, or meeting times.
+Keep answers concise and avoid long monologues. Prefer one or two short thoughts at a time.
+Ramy often pauses briefly while forming a sentence. Do NOT jump in during a short pause, hesitation, or self-correction. Wait until his thought is clearly complete before responding.
+If Ramy begins speaking while you are talking, stop promptly and listen. Do not continue over him.
+When guiding him through a technical setup, give one short step at a time and wait for his reply before giving the next step.
 Ramy's first name is spelled RAMY with a Y. When writing his name or signing an email, always use "Ramy", never "Rami".
 
 ACCURACY IS YOUR HIGHEST PRIORITY
@@ -4791,10 +4923,10 @@ const handleIncomingExecutiveMessage = async (request, reply) => {
           reply: 'I received the attachment. For document or spreadsheet analysis, email it to london@minaco.ca so I can process the full file safely.',
         };
       } else {
-        result = await processQuickActionInstruction({
+        result = await processExecutiveMessagingInstruction({
           text: messageBody,
           channel,
-          sender: from,
+          sender: from || waId,
         });
       }
 
@@ -4829,7 +4961,7 @@ const handleIncomingExecutiveMessage = async (request, reply) => {
         await sendTwilioChannelMessage({
           to: errorReplyTo,
           from: errorReplyFrom,
-          body: `I received your ${channel === 'whatsapp' ? 'WhatsApp' : 'text'} but could not update the Action Register: ${error.message}`,
+          body: `I received your ${channel === 'whatsapp' ? 'WhatsApp' : 'text'} command but could not complete it: ${error.message}`,
         });
       } catch (notifyError) {
         console.error('Inbound executive messaging failure notification failed:', notifyError);
@@ -5080,6 +5212,7 @@ fastify.register(async (fastifyInstance) => {
                 },
                 turn_detection: {
                   type: 'semantic_vad',
+                  // Medium eagerness balances waiting through Ramy's brief pauses with responsiveness.
                   eagerness: 'medium',
                   create_response: true,
                   interrupt_response: true,
