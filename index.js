@@ -2976,13 +2976,16 @@ const normalizedMessagingChanges = (changes = {}) => {
   return out;
 };
 
-const parseMessagingActionCommand = async ({ text, actions, recentList }) => {
+const parseMessagingActionCommand = async ({ text, actions, recentList, recentMessages = [] }) => {
   const context = {
     currentMontrealDate: montrealDateParts(),
     currentMontrealDateTime: formatMontrealDateTime(new Date()),
     openActions: actions.map(actionCompactForParser),
     recentNumberedList: Array.isArray(recentList)
       ? recentList.map((action, index) => ({ index: index + 1, title: action.title }))
+      : [],
+    recentMessages: Array.isArray(recentMessages)
+      ? recentMessages.slice(-6).map((item) => String(item || '').trim()).filter(Boolean)
       : [],
     message: String(text || '').trim(),
   };
@@ -2993,6 +2996,8 @@ const parseMessagingActionCommand = async ({ text, actions, recentList }) => {
       instructions: `You are London's Action Register command parser for Ramy Mina. Interpret a short SMS, WhatsApp, or voice status update and return ONLY valid JSON, no Markdown.
 The current Montreal date/time and current open actions are supplied.
 Ramy should be able to write naturally: “Joannie done”, “waiting on Anass until Friday”, “follow up with Franco next Tuesday”, “add task: call Makar tomorrow”, “cancel the EV item”, “what's overdue?”, or several updates in one message.
+IMPORTANT: SMS and WhatsApp are conversational. Use recentMessages to resolve short follow-up fragments such as “tomorrow”, “yes”, “that one”, “set it as a reminder”, or a task description sent in the next message. Treat them as continuations of the immediately preceding conversation when that connection is clear.
+Example: if a prior message describes an item, then Ramy says “set as a reminder”, then “tomorrow”, combine those messages into one reminder/action instead of asking him to restart in one sentence.
 Do not guess which action Ramy means when two actions are genuinely plausible. In that case return a clarify operation.
 Only mark COMPLETED when Ramy clearly says done/completed/finished/resolved/closed. Only mark CANCELLED when he clearly cancels/drops it.
 “Waiting on NAME” normally means WAITING - EXTERNAL, waitingOn NAME, ramyRequired false. “Waiting on me/Ramy/my decision” means WAITING - RAMY and ramyRequired true.
@@ -3070,7 +3075,13 @@ const processQuickActionInstruction = async ({ text, channel = 'voice', sender =
 
   pruneMessagingState();
   const key = messagingKey(channel, sender);
-  const state = messagingState.get(key) || { recentList: [], lastEventId: '', updatedAt: Date.now() };
+  const state = messagingState.get(key) || { recentList: [], recentMessages: [], lastEventId: '', updatedAt: Date.now() };
+  state.recentMessages = Array.isArray(state.recentMessages) ? state.recentMessages : [];
+  const priorMessages = state.recentMessages.slice(-5);
+  state.recentMessages.push(cleanText);
+  state.recentMessages = state.recentMessages.slice(-6);
+  state.updatedAt = Date.now();
+  messagingState.set(key, state);
   const lower = cleanText.toLowerCase().trim();
 
   // Ordinary conversation should not be treated as an Action Register update.
@@ -3123,6 +3134,7 @@ const processQuickActionInstruction = async ({ text, channel = 'voice', sender =
     text: cleanText,
     actions: allOpen,
     recentList: state.recentList,
+    recentMessages: priorMessages,
   });
 
   if (!operations.length) return { success: false, reply: 'I could not identify an Action Register update in that message.' };
@@ -3245,6 +3257,26 @@ const processExecutiveMessagingInstruction = async ({
   const lower = cleanText.toLowerCase();
   if (!cleanText) return { success: false, reply: 'I did not receive a command.' };
 
+  // Preserve short conversational context across SMS/WhatsApp turns so Ramy can
+  // give a task naturally over several messages rather than restating it.
+  pruneMessagingState();
+  const executiveKey = messagingKey(channel, sender);
+  const executiveState = messagingState.get(executiveKey) || {
+    recentList: [],
+    recentMessages: [],
+    lastEventId: '',
+    updatedAt: Date.now(),
+  };
+  executiveState.recentMessages = Array.isArray(executiveState.recentMessages)
+    ? executiveState.recentMessages
+    : [];
+  if (executiveState.recentMessages.at(-1) !== cleanText) {
+    executiveState.recentMessages.push(cleanText);
+    executiveState.recentMessages = executiveState.recentMessages.slice(-6);
+  }
+  executiveState.updatedAt = Date.now();
+  messagingState.set(executiveKey, executiveState);
+
   // Natural conversation.
   if (/^(hi|hello|hey|hey london|hi london|hello london)[.!?\s]*$/i.test(cleanText)) {
     return { success: true, reply: 'Hi Ramy. I’m here — what do you need?' };
@@ -3324,7 +3356,7 @@ const processExecutiveMessagingInstruction = async ({
 
   return {
     success: false,
-    reply: 'I received your message, but I could not safely determine the action. Please state the task in one short sentence.',
+    reply: 'I received that. I may be missing part of the instruction from the conversation. Tell me the missing detail and I’ll continue from what you already sent.',
   };
 };
 
