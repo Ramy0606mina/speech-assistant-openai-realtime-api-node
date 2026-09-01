@@ -2996,7 +2996,9 @@ const parseMessagingActionCommand = async ({ text, actions, recentList, recentMe
       instructions: `You are London's Action Register command parser for Ramy Mina. Interpret a short SMS, WhatsApp, or voice status update and return ONLY valid JSON, no Markdown.
 The current Montreal date/time and current open actions are supplied.
 Ramy should be able to write naturally: “Joannie done”, “waiting on Anass until Friday”, “follow up with Franco next Tuesday”, “add task: call Makar tomorrow”, “cancel the EV item”, “what's overdue?”, or several updates in one message.
-IMPORTANT: SMS and WhatsApp are conversational. Use recentMessages to resolve short follow-up fragments such as “tomorrow”, “yes”, “that one”, “set it as a reminder”, or a task description sent in the next message. Treat them as continuations of the immediately preceding conversation when that connection is clear.
+IMPORTANT: SMS and WhatsApp are conversational. Use recentMessages to resolve short follow-up fragments such as “tomorrow”, “yes”, “that one”, “set it as a reminder”, “put this in tomorrow's to-do list”, or a task description sent in the next message. Treat them as continuations of the immediately preceding conversation when that connection is clear.
+If Ramy says "this", "that", or "it", infer the referent from the most recent substantive message whenever there is only one sensible candidate. Do not ask him to repeat information already present in recentMessages.
+Example: if a prior message says a WhatsApp template category changed from Utility to Marketing and Ramy then says “put this in the things to do tomorrow”, create a task about reviewing/following up on that specific template-category issue for tomorrow.
 Example: if a prior message describes an item, then Ramy says “set as a reminder”, then “tomorrow”, combine those messages into one reminder/action instead of asking him to restart in one sentence.
 Do not guess which action Ramy means when two actions are genuinely plausible. In that case return a clarify operation.
 Only mark COMPLETED when Ramy clearly says done/completed/finished/resolved/closed. Only mark CANCELLED when he clearly cancels/drops it.
@@ -3248,6 +3250,77 @@ const compactTaskTitleFromMessage = (text) => {
   return clean.length > 140 ? `${clean.slice(0, 137)}...` : clean;
 };
 
+const mostRecentSubstantiveMessagingContext = (messages = []) => {
+  const ignored = /^(hi|hello|hey|thanks|thank you|okay|ok|yes|no|tomorrow|today|perfect|great|set as a reminder|remind me|put this in the things to do tomorrow|put that in the things to do tomorrow)[.!?\s]*$/i;
+
+  const candidates = (Array.isArray(messages) ? messages : [])
+    .map((item) => String(item || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .filter((item) => !ignored.test(item));
+
+  return candidates.at(-1) || '';
+};
+
+const inferTaskFromReferentialMessagingCommand = async ({
+  cleanText,
+  channel,
+  recentMessages,
+}) => {
+  const referential =
+    /\b(this|that|it)\b/i.test(cleanText) &&
+    /\b(remind|reminder|to[- ]?do|things? to do|task|follow up|put|add|schedule)\b/i.test(cleanText);
+
+  if (!referential) return null;
+
+  const prior = mostRecentSubstantiveMessagingContext(recentMessages);
+  if (!prior) return null;
+
+  const lower = cleanText.toLowerCase();
+  const tomorrow = /\btomorrow\b/.test(lower);
+  const today = /\btoday\b/.test(lower);
+
+  let nextFollowUp = '';
+  if (tomorrow) nextFollowUp = addDaysToLocalDate(montrealDateParts(), 1);
+  if (today) nextFollowUp = montrealDateParts();
+
+  const titlePrompt = `Create a concise executive task title from this prior WhatsApp/SMS message. Preserve the actual subject and outcome. Do not invent facts. Return only the task title, maximum 110 characters.\n\nPRIOR MESSAGE:\n${prior}`;
+
+  let title = '';
+  try {
+    const response = await callOpenAIResponses(
+      {
+        model: ACTION_MESSAGE_MODEL,
+        instructions:
+          'You turn an existing business message into a concise Action Register task title. Preserve the specific subject and required follow-up. Return only the title with no quotes or punctuation wrapper.',
+        input: titlePrompt,
+      },
+      12000
+    );
+    title = extractOpenAIResponseText(response).replace(/^["']|["']$/g, '').trim();
+  } catch (error) {
+    console.warn('Referential task title inference warning:', error.message);
+  }
+
+  if (!title) title = compactTaskTitleFromMessage(prior);
+
+  const action = await createActionItem({
+    title,
+    owner: 'London',
+    status: 'ACTIVE',
+    priority: 'NORMAL',
+    nextFollowUp,
+    nextAction: prior,
+    source: String(channel || 'message').toUpperCase(),
+    notes: `Created from conversational context. Ramy said: "${cleanText}". Prior message: "${prior}"`,
+  });
+
+  return {
+    success: true,
+    action,
+    reply: `Done. I added “${action.title}”${action.nextFollowUp ? ` for ${action.nextFollowUp}` : ''}.`,
+  };
+};
+
 const processExecutiveMessagingInstruction = async ({
   text,
   channel = 'sms',
@@ -3319,6 +3392,15 @@ const processExecutiveMessagingInstruction = async ({
       return { success: false, reply: `I could not read your calendar: ${error.message}` };
     }
   }
+
+  // Referential task commands such as "put this in tomorrow's to-do list"
+  // should resolve the subject from the recent conversation automatically.
+  const inferredTask = await inferTaskFromReferentialMessagingCommand({
+    cleanText,
+    channel,
+    recentMessages: executiveState.recentMessages.slice(0, -1),
+  });
+  if (inferredTask?.success) return inferredTask;
 
   // Action Register commands remain the primary lightweight update path.
   const actionResult = await processQuickActionInstruction({
