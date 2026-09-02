@@ -51,6 +51,7 @@ const MAX_TASK_TOTAL_BYTES = 45 * 1024 * 1024;
 const LONDON_DROPBOX_ROOT = String(DROPBOX_ROOT_PATH || '/LONDON - ACCESS').trim() || '/LONDON - ACCESS';
 const STATE_FILE = String(LONDON_STATE_FILE || '/tmp/london-state.json').trim();
 const MAX_DROPBOX_TEXT_BYTES = 8 * 1024 * 1024;
+const MAX_DROPBOX_ANALYSIS_BYTES = 45 * 1024 * 1024;
 
 // -----------------------------------------------------------------------------
 // Network resilience
@@ -1603,6 +1604,162 @@ const readLondonDropboxText = async (path) => {
   const textLike = contentType.startsWith('text/') || ['txt','md','csv','json','js','ts','html','xml','yaml','yml','log'].includes(ext);
   if (!textLike) throw new Error('This Dropbox file is not plain text. Use the Task Inbox for PDF, Word, Excel, PowerPoint, or image analysis.');
   return { path: safePath, size: buffer.length, text: buffer.toString('utf8') };
+};
+
+const downloadLondonDropboxFile = async (path) => {
+  const safePath = normalizeDropboxPath(path);
+  const metaResponse = await dropboxApi('files/get_metadata', { path: safePath });
+  const meta = await metaResponse.json();
+  const size = Number(meta.size || 0);
+  if (size > MAX_DROPBOX_ANALYSIS_BYTES) {
+    throw new Error(
+      `Dropbox file is too large for direct analysis (${Math.round(size / 1024 / 1024)} MB). The current limit is 45 MB.`
+    );
+  }
+  const downloadResponse = await dropboxApi('files/download', { path: safePath }, { download: true });
+  const contentType = String(
+    downloadResponse.headers.get('content-type') ||
+      meta.mime_type ||
+      'application/octet-stream'
+  ).toLowerCase();
+  const buffer = Buffer.from(await downloadResponse.arrayBuffer());
+  return {
+    path: safePath,
+    filename: meta.name || safePath.split('/').at(-1) || 'dropbox-file',
+    contentType,
+    size: buffer.length,
+    buffer,
+  };
+};
+
+const analyzeLondonDropboxFile = async ({ path, instruction }) => {
+  const file = await downloadLondonDropboxFile(path);
+  const dataUri = `data:${file.contentType};base64,${file.buffer.toString('base64')}`;
+  const requestInstruction =
+    String(instruction || '').trim() ||
+    'Analyze this file accurately. Summarize the important content and identify decisions, deadlines, amounts, risks, discrepancies, and recommended next actions that matter to Ramy.';
+
+  const content = [];
+  if (file.contentType.startsWith('image/')) {
+    content.push({ type: 'input_image', image_url: dataUri, detail: 'auto' });
+  } else {
+    content.push({
+      type: 'input_file',
+      filename: file.filename,
+      file_data: dataUri,
+      detail: 'auto',
+    });
+  }
+  content.push({ type: 'input_text', text: requestInstruction });
+
+  const data = await callOpenAIResponses(
+    {
+      model: DOCUMENT_ANALYSIS_MODEL,
+      instructions:
+        'You are London Assistant analyzing a real file retrieved directly from Ramy Mina’s controlled Dropbox workspace. Use the actual file only. Do not invent missing content. Preserve names, dates, amounts, drawing references, revision numbers, legal/commercial terms, and material qualifiers. If the file is a drawing set or technical document, focus on the user’s requested review and clearly distinguish observed facts from your interpretation.',
+      input: [{ role: 'user', content }],
+    },
+    120000
+  );
+
+  const result = extractOpenAIResponseText(data);
+  if (!result) throw new Error('The Dropbox file analysis returned no text.');
+  return {
+    path: file.path,
+    filename: file.filename,
+    contentType: file.contentType,
+    size: file.size,
+    result,
+  };
+};
+
+const delegatedDropboxAnalysisJobs = new Map();
+
+const pruneDelegatedDropboxAnalysisJobs = () => {
+  if (delegatedDropboxAnalysisJobs.size <= 50) return;
+  const entries = [...delegatedDropboxAnalysisJobs.entries()].sort(
+    (a, b) => Number(a[1]?.createdAt || 0) - Number(b[1]?.createdAt || 0)
+  );
+  for (const [jobId] of entries.slice(0, delegatedDropboxAnalysisJobs.size - 50)) {
+    delegatedDropboxAnalysisJobs.delete(jobId);
+  }
+};
+
+const runDelegatedDropboxAnalysisJob = async ({ jobId, path, instruction }) => {
+  const job = delegatedDropboxAnalysisJobs.get(jobId);
+  if (job) {
+    job.status = 'running';
+    job.startedAt = Date.now();
+  }
+
+  try {
+    const analysis = await analyzeLondonDropboxFile({ path, instruction });
+    const body = `London Dropbox Analysis\n\nFile: ${analysis.filename}\nPath: ${analysis.path}\n\n${analysis.result}`;
+    await sendEmailFromLondon({
+      to: RAMY_MINACO_EMAIL,
+      subject: `LONDON — Dropbox Analysis | ${analysis.filename}`,
+      body,
+      contentType: 'Text',
+    });
+
+    if (job) {
+      job.status = 'completed';
+      job.completedAt = Date.now();
+      job.filename = analysis.filename;
+    }
+    console.log('DELEGATED DROPBOX ANALYSIS COMPLETED:', {
+      jobId,
+      path: analysis.path,
+      filename: analysis.filename,
+    });
+  } catch (error) {
+    console.error('DELEGATED DROPBOX ANALYSIS FAILED:', {
+      jobId,
+      path,
+      error: error.message,
+    });
+    if (job) {
+      job.status = 'failed';
+      job.completedAt = Date.now();
+      job.error = error.message;
+    }
+    try {
+      await sendEmailFromLondon({
+        to: RAMY_MINACO_EMAIL,
+        subject: 'LONDON — Dropbox Analysis Could Not Complete',
+        body: `London could not complete the Dropbox file analysis.\n\nFile: ${path}\nTechnical issue: ${error.message}\n\nNo external email or commitment was sent.`,
+        contentType: 'Text',
+      });
+    } catch (notifyError) {
+      console.error('Dropbox analysis failure notification also failed:', notifyError);
+    }
+  } finally {
+    pruneDelegatedDropboxAnalysisJobs();
+  }
+};
+
+const queueDelegatedDropboxAnalysisJob = ({ path, instruction = '' }) => {
+  const safePath = normalizeDropboxPath(path);
+  if (!RAMY_MINACO_EMAIL) throw new Error('RAMY_MINACO_EMAIL is not configured.');
+  const jobId = `dropbox-analysis-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  delegatedDropboxAnalysisJobs.set(jobId, {
+    jobId,
+    status: 'queued',
+    createdAt: Date.now(),
+    path: safePath,
+  });
+  setImmediate(() => {
+    runDelegatedDropboxAnalysisJob({ jobId, path: safePath, instruction }).catch((error) => {
+      console.error('Unexpected delegated Dropbox analysis failure:', error);
+    });
+  });
+  return {
+    success: true,
+    queued: true,
+    jobId,
+    path: safePath,
+    emailDestination: RAMY_MINACO_EMAIL,
+  };
 };
 
 const formatMontrealDateTime = (date) =>
@@ -4920,7 +5077,10 @@ When an email has attachments, use list_email_attachments to identify the exact 
 
 DROPBOX DOCUMENT WORKSPACE
 
-London's controlled Dropbox workspace is LONDON - ACCESS. Use list_dropbox, search_dropbox, and read_dropbox_text only for content inside that root. Never access or claim access to anything outside that folder. Dropbox is read-only through these tools. For binary Office/PDF/image analysis that cannot be read as text, tell Ramy to route the file through the Task Inbox until a binary Dropbox analyzer is configured.
+London's controlled Dropbox workspace is LONDON - ACCESS. Use list_dropbox, search_dropbox, read_dropbox_text, and delegate_dropbox_file_analysis only for content inside that root. Never access or claim access to anything outside that folder. Dropbox is read-only through these tools.
+When Ramy asks what is inside a folder, inspect that folder yourself. If he asks for subfolders, sub-subfolders, deeper structure, everything under a folder, or says "find it on your own", use list_dropbox with recursive=true and inspect the returned descendants. Do not ask him which child folder to inspect when his request is to discover the deeper structure autonomously.
+When Ramy names a folder or file approximately, use search_dropbox to resolve the real path rather than asking him to restate the exact filename.
+For PDF, Word, Excel, PowerPoint, image, or other supported binary documents already in Dropbox, do NOT tell Ramy to email the file to the Task Inbox. Use delegate_dropbox_file_analysis. If he asks for analysis and says to email him the result, queue the delegated Dropbox analysis immediately; it may email the completed analysis only to Ramy's verified Minaco email. Tell him briefly that the analysis is queued and he may continue with another task or hang up.
 
 Use resolve_person when Ramy gives a person's name but not an email address. It searches verified identities and Minaco email history. If one clear candidate is returned, use that verified address. If multiple plausible candidates are returned, ask Ramy which one he means. Never invent an address.
 
@@ -5907,7 +6067,7 @@ fastify.register(async (fastifyInstance) => {
                   type: 'object',
                   properties: {
                     path: { type: 'string', description: 'Path inside LONDON - ACCESS. Default root.' },
-                    recursive: { type: 'boolean', description: 'Whether to include descendants. Default false.' },
+                    recursive: { type: 'boolean', description: 'Whether to include descendants. Use true when Ramy asks for subfolders, sub-subfolders, deeper structure, everything under a folder, or tells London to find it on her own. Default false.' },
                   },
                   additionalProperties: false,
                 },
@@ -5926,11 +6086,25 @@ fastify.register(async (fastifyInstance) => {
               {
                 type: 'function',
                 name: 'read_dropbox_text',
-                description: 'Read a plain-text file inside LONDON - ACCESS. Read-only. For PDF/Office/image files use Task Inbox until binary Dropbox analysis is configured.',
+                description: 'Read a plain-text file inside LONDON - ACCESS. Read-only.',
                 parameters: {
                   type: 'object',
                   properties: { path: { type: 'string', description: 'Exact path inside LONDON - ACCESS.' } },
                   required: ['path'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'delegate_dropbox_file_analysis',
+                description: 'Queue background analysis of a real PDF, Word, Excel, PowerPoint, image, or other supported file already inside LONDON - ACCESS and email the completed analysis to Ramy. Use when Ramy asks to analyze/review a Dropbox file, especially when he says email me the analysis. This is read-only and never emails an external party.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    path: { type: 'string', description: 'Exact Dropbox path inside LONDON - ACCESS. Resolve approximate names with search_dropbox first.' },
+                    instruction: { type: 'string', description: 'What Ramy wants analyzed, checked, compared, summarized, or extracted from the file.' },
+                  },
+                  required: ['path', 'instruction'],
                   additionalProperties: false,
                 },
               },
@@ -7045,7 +7219,7 @@ fastify.register(async (fastifyInstance) => {
             try {
               const args = JSON.parse(response.arguments || '{}');
               const entries = await listLondonDropbox(args.path || LONDON_DROPBOX_ROOT, Boolean(args.recursive));
-              respondToToolCall(response.call_id, { success: true, root: LONDON_DROPBOX_ROOT, entries }, 'Summarize the Dropbox listing concisely. Use only the returned entries and never imply access outside the controlled root.');
+              respondToToolCall(response.call_id, { success: true, root: LONDON_DROPBOX_ROOT, entries }, 'Summarize the Dropbox listing concisely. If recursive descendants were returned, organize them by folder hierarchy and answer the requested depth without asking Ramy to choose a child folder. Use only the returned entries and never imply access outside the controlled root.');
             } catch (error) {
               respondToToolCall(response.call_id, { success: false, error: error.message }, 'Tell Ramy the Dropbox listing failed and state the error concisely.');
             }
@@ -7076,6 +7250,32 @@ fastify.register(async (fastifyInstance) => {
               respondToToolCall(response.call_id, { success: true, ...result }, 'Use only the returned Dropbox file text. Answer Ramy directly and concisely.');
             } catch (error) {
               respondToToolCall(response.call_id, { success: false, error: error.message }, 'Tell Ramy the Dropbox file could not be read and state the error concisely.');
+            }
+            return;
+          }
+
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'delegate_dropbox_file_analysis'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const queued = queueDelegatedDropboxAnalysisJob({
+                path: args.path,
+                instruction: args.instruction || '',
+              });
+              respondToToolCall(
+                response.call_id,
+                queued,
+                `Tell Ramy the Dropbox file analysis has been queued and the completed review will be emailed to ${RAMY_MINACO_EMAIL}. Keep it to one or two short sentences. Do not say the analysis is already complete.`
+              );
+            } catch (error) {
+              respondToToolCall(
+                response.call_id,
+                { success: false, queued: false, error: error.message },
+                'Tell Ramy the Dropbox analysis could not be queued and state the returned error concisely. Do not tell him to re-upload or email the file unless the returned error specifically requires it.'
+              );
             }
             return;
           }
