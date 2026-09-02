@@ -6,6 +6,7 @@ import fastifyWs from '@fastify/websocket';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { resolveFileContentType } from './file-content-type.js';
 
 // Load environment variables from .env file
 dotenv.config();
@@ -1617,15 +1618,17 @@ const downloadLondonDropboxFile = async (path) => {
     );
   }
   const downloadResponse = await dropboxApi('files/download', { path: safePath }, { download: true });
-  const contentType = String(
-    downloadResponse.headers.get('content-type') ||
-      meta.mime_type ||
-      'application/octet-stream'
-  ).toLowerCase();
   const buffer = Buffer.from(await downloadResponse.arrayBuffer());
+  const filename = meta.name || safePath.split('/').at(-1) || 'dropbox-file';
+  const contentType = resolveFileContentType({
+    filename,
+    reportedContentType:
+      downloadResponse.headers.get('content-type') || meta.mime_type || '',
+    buffer,
+  });
   return {
     path: safePath,
-    filename: meta.name || safePath.split('/').at(-1) || 'dropbox-file',
+    filename,
     contentType,
     size: buffer.length,
     buffer,
