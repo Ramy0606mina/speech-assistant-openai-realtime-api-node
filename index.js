@@ -1537,7 +1537,7 @@ const dropboxApi = async (endpoint, body, { download = false } = {}) => {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${DROPBOX_ACCESS_TOKEN}`,
-      ...(download ? { 'Dropbox-API-Arg': JSON.stringify(body) } : { 'Content-Type': 'application/json' }),
+      ...(download ? { 'Dropbox-API-Arg': JSON.stringify(body).replace(/[\u007F-\uFFFF]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`) } : { 'Content-Type': 'application/json' }),
     },
     ...(download ? {} : { body: JSON.stringify(body) }),
   }, 20000);
