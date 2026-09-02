@@ -4,6 +4,8 @@ import dotenv from 'dotenv';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
+import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 // Load environment variables from .env file
 dotenv.config();
@@ -28,6 +30,10 @@ const {
   TASK_INBOX_MODEL,
   OPENAI_DOCUMENT_MODEL,
   EXECUTIVE_BRIEF_MODEL,
+  DROPBOX_ACCESS_TOKEN,
+  DROPBOX_ROOT_PATH,
+  HEALTH_SECRET,
+  LONDON_STATE_FILE,
 } = process.env;
 
 const MONTREAL_IANA_TIME_ZONE = 'America/Toronto';
@@ -42,6 +48,9 @@ const MAX_MESSAGING_REPLY_CHARS = 1450;
 const MAX_ATTACHMENT_BYTES = 45 * 1024 * 1024;
 const MAX_TASK_ATTACHMENTS = 10;
 const MAX_TASK_TOTAL_BYTES = 45 * 1024 * 1024;
+const LONDON_DROPBOX_ROOT = String(DROPBOX_ROOT_PATH || '/LONDON - ACCESS').trim() || '/LONDON - ACCESS';
+const STATE_FILE = String(LONDON_STATE_FILE || '/tmp/london-state.json').trim();
+const MAX_DROPBOX_TEXT_BYTES = 8 * 1024 * 1024;
 
 // -----------------------------------------------------------------------------
 // Network resilience
@@ -1466,6 +1475,136 @@ const sendEmailFromLondon = async ({ to, subject, body, contentType = 'Text' }) 
   };
 };
 
+
+const sendEmailFromMailbox = async ({ from, to, subject, body, contentType = 'Text' }) => {
+  const sender = String(from || '').trim().toLowerCase();
+  const allowed = new Set(
+    [RAMY_MINACO_EMAIL, LONDON_MINACO_EMAIL]
+      .filter(Boolean)
+      .map((value) => String(value).trim().toLowerCase())
+  );
+  if (!allowed.has(sender)) {
+    throw new Error('The requested sender mailbox is not authorized for London.');
+  }
+  if (!to || !subject || !body) throw new Error('Email requires recipient, subject, and body.');
+  const normalizedContentType = String(contentType || '').toLowerCase() === 'html' ? 'HTML' : 'Text';
+  const token = await getMicrosoftGraphActionsToken();
+  const response = await fetchWithTimeout(
+    `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(sender)}/sendMail`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: {
+          subject,
+          body: { contentType: normalizedContentType, content: body },
+          toRecipients: [{ emailAddress: { address: to } }],
+        },
+        saveToSentItems: true,
+      }),
+    },
+    15000
+  );
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Microsoft Graph email send failed from ${sender}: ${errorText || response.status}`);
+  }
+  return { success: true, from: sender, to, subject, contentType: normalizedContentType };
+};
+
+const normalizeDropboxPath = (value = '') => {
+  const raw = String(value || '').replace(/\\/g, '/').trim();
+  const absolute = raw.startsWith('/') ? raw : `${LONDON_DROPBOX_ROOT}/${raw}`;
+  const parts = [];
+  for (const part of absolute.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') throw new Error('Dropbox path traversal is not allowed.');
+    parts.push(part);
+  }
+  const normalized = `/${parts.join('/')}`;
+  const root = LONDON_DROPBOX_ROOT.replace(/\/$/, '');
+  if (normalized !== root && !normalized.startsWith(`${root}/`)) {
+    throw new Error(`Dropbox access is restricted to ${root}.`);
+  }
+  return normalized;
+};
+
+const dropboxApi = async (endpoint, body, { download = false } = {}) => {
+  if (!DROPBOX_ACCESS_TOKEN) throw new Error('DROPBOX_ACCESS_TOKEN is not configured.');
+  const url = `${download ? 'https://content.dropboxapi.com/2' : 'https://api.dropboxapi.com/2'}/${endpoint}`;
+  const response = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${DROPBOX_ACCESS_TOKEN}`,
+      ...(download ? { 'Dropbox-API-Arg': JSON.stringify(body) } : { 'Content-Type': 'application/json' }),
+    },
+    ...(download ? {} : { body: JSON.stringify(body) }),
+  }, 20000);
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Dropbox API ${endpoint} failed: ${errorText || response.status}`);
+  }
+  return response;
+};
+
+const listLondonDropbox = async (path = LONDON_DROPBOX_ROOT, recursive = false) => {
+  const safePath = normalizeDropboxPath(path);
+  const response = await dropboxApi('files/list_folder', { path: safePath, recursive: Boolean(recursive), limit: 200 });
+  const data = await response.json();
+  const entries = [...(data.entries || [])];
+  let cursor = data.cursor;
+  let hasMore = Boolean(data.has_more);
+  while (hasMore && entries.length < 1000) {
+    const next = await dropboxApi('files/list_folder/continue', { cursor });
+    const nextData = await next.json();
+    entries.push(...(nextData.entries || []));
+    cursor = nextData.cursor;
+    hasMore = Boolean(nextData.has_more);
+  }
+  return entries.slice(0, 1000).map((entry) => ({
+    type: entry['.tag'],
+    name: entry.name,
+    path: entry.path_display || entry.path_lower || '',
+    size: Number(entry.size || 0),
+    modified: entry.server_modified || '',
+  }));
+};
+
+const searchLondonDropbox = async (query) => {
+  const q = String(query || '').trim();
+  if (!q) throw new Error('A Dropbox search term is required.');
+  const response = await dropboxApi('files/search_v2', {
+    query: q,
+    options: { path: normalizeDropboxPath(LONDON_DROPBOX_ROOT), max_results: 100, filename_only: false },
+  });
+  const data = await response.json();
+  return (data.matches || []).map((match) => {
+    const metadata = match.metadata?.metadata || match.metadata || {};
+    return {
+      type: metadata['.tag'] || '',
+      name: metadata.name || '',
+      path: metadata.path_display || metadata.path_lower || '',
+      size: Number(metadata.size || 0),
+      modified: metadata.server_modified || '',
+    };
+  }).filter((item) => item.path && normalizeDropboxPath(item.path));
+};
+
+const readLondonDropboxText = async (path) => {
+  const safePath = normalizeDropboxPath(path);
+  const metaResponse = await dropboxApi('files/get_metadata', { path: safePath });
+  const meta = await metaResponse.json();
+  const size = Number(meta.size || 0);
+  if (size > MAX_DROPBOX_TEXT_BYTES) throw new Error('Dropbox file is too large for direct text reading.');
+  const downloadResponse = await dropboxApi('files/download', { path: safePath }, { download: true });
+  const contentType = String(downloadResponse.headers.get('content-type') || '').toLowerCase();
+  const buffer = Buffer.from(await downloadResponse.arrayBuffer());
+  const ext = safePath.split('.').pop()?.toLowerCase() || '';
+  const textLike = contentType.startsWith('text/') || ['txt','md','csv','json','js','ts','html','xml','yaml','yml','log'].includes(ext);
+  if (!textLike) throw new Error('This Dropbox file is not plain text. Use the Task Inbox for PDF, Word, Excel, PowerPoint, or image analysis.');
+  return { path: safePath, size: buffer.length, text: buffer.toString('utf8') };
+};
+
 const formatMontrealDateTime = (date) =>
   new Intl.DateTimeFormat('en-US', {
     timeZone: MONTREAL_IANA_TIME_ZONE,
@@ -2862,6 +3001,44 @@ const processedMessagingSids = new Map();
 const MESSAGING_STATE_TTL_MS = 6 * 60 * 60 * 1000;
 const MESSAGING_DEDUPE_TTL_MS = 24 * 60 * 60 * 1000;
 
+
+const loadPersistentMessagingState = () => {
+  try {
+    const parsed = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
+    for (const [key, value] of Object.entries(parsed.messagingState || {})) {
+      if (value && typeof value === 'object') messagingState.set(key, value);
+    }
+    for (const [key, value] of Object.entries(parsed.processedMessagingSids || {})) {
+      processedMessagingSids.set(key, Number(value));
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') console.warn('STATE load warning:', error.message);
+  }
+};
+
+let stateSaveTimer = null;
+const persistMessagingState = () => {
+  if (stateSaveTimer) return;
+  stateSaveTimer = setTimeout(() => {
+    stateSaveTimer = null;
+    try {
+      mkdirSync(dirname(STATE_FILE), { recursive: true });
+      const tmp = `${STATE_FILE}.tmp`;
+      writeFileSync(tmp, JSON.stringify({
+        savedAt: new Date().toISOString(),
+        messagingState: Object.fromEntries(messagingState.entries()),
+        processedMessagingSids: Object.fromEntries(processedMessagingSids.entries()),
+      }));
+      renameSync(tmp, STATE_FILE);
+    } catch (error) {
+      console.warn('STATE save warning:', error.message);
+    }
+  }, 250);
+  if (typeof stateSaveTimer.unref === 'function') stateSaveTimer.unref();
+};
+
+loadPersistentMessagingState();
+
 const pruneMessagingState = () => {
   const now = Date.now();
   for (const [key, value] of messagingState.entries()) {
@@ -3084,6 +3261,7 @@ const processQuickActionInstruction = async ({ text, channel = 'voice', sender =
   state.recentMessages = state.recentMessages.slice(-6);
   state.updatedAt = Date.now();
   messagingState.set(key, state);
+    persistMessagingState();
   const lower = cleanText.toLowerCase().trim();
 
   // Ordinary conversation should not be treated as an Action Register update.
@@ -3109,6 +3287,7 @@ const processQuickActionInstruction = async ({ text, channel = 'voice', sender =
     state.recentList = selected;
     state.updatedAt = Date.now();
     messagingState.set(key, state);
+    persistMessagingState();
     return { success: true, reply: formatActionListForMessaging(selected, directListFilter === 'overdue' ? 'Overdue actions' : 'Open actions'), actions: selected };
   }
 
@@ -3129,6 +3308,7 @@ const processQuickActionInstruction = async ({ text, channel = 'voice', sender =
     state.lastEventId = updated.eventId;
     state.updatedAt = Date.now();
     messagingState.set(key, state);
+    persistMessagingState();
     return { success: true, reply: `Updated: ${updated.title} — ${status}.`, action: updated };
   }
 
@@ -3211,6 +3391,7 @@ const processQuickActionInstruction = async ({ text, channel = 'voice', sender =
 
   state.updatedAt = Date.now();
   messagingState.set(key, state);
+    persistMessagingState();
 
   const reply = confirmations.filter(Boolean).join('\n').slice(0, MAX_MESSAGING_REPLY_CHARS);
   return {
@@ -3349,6 +3530,7 @@ const processExecutiveMessagingInstruction = async ({
   }
   executiveState.updatedAt = Date.now();
   messagingState.set(executiveKey, executiveState);
+  persistMessagingState();
 
   // Natural conversation.
   if (/^(hi|hello|hey|hey london|hi london|hello london)[.!?\s]*$/i.test(cleanText)) {
@@ -4683,7 +4865,7 @@ check_email returns a recent-email list and message ids. It does NOT contain the
 Use read_email whenever Ramy asks you to read, translate, summarize, analyze, or respond based on the complete contents of a specific email. read_email retrieves the full live message body in text form.
 If the target email has not yet been identified, use check_email first, identify the exact email, then use read_email with its message id. Never translate or analyze an email from a preview when the full body is available.
 
-Use prepare_email when Ramy asks you to draft, write, prepare, or send a NEW standalone email from London Assistant. Preparing an email NEVER sends it.
+For NEW standalone email, respect sender identity exactly. If Ramy says "from my email", "send it from me", or otherwise explicitly identifies his mailbox, prepare it from ramy.mina@minaco.ca. If he says "from London" or explicitly identifies London, prepare it from london@minaco.ca. Never substitute one sender for the other. If no sender identity is specified for a new external email, default to Ramy's mailbox because London is acting as his executive assistant. Preparing an email NEVER sends it.
 After prepare_email succeeds, read back the recipient, subject, and message and clearly say it has not been sent. Ask Ramy to confirm.
 
 For a REPLY to an email in Ramy's Minaco inbox:
@@ -4735,6 +4917,10 @@ Use check_accounting when Ramy asks about current invoices, statements, payment 
 Use read_accounting_email to retrieve the complete Accounting email body before translating, analyzing, or making conclusions from it.
 
 When an email has attachments, use list_email_attachments to identify the exact attachment. Use analyze_email_attachment when Ramy asks to open, summarize, translate, analyze, extract amounts/deadlines, or answer questions about an attachment. The attachment tool analyzes the actual file; never pretend you opened an attachment when you only saw its filename.
+
+DROPBOX DOCUMENT WORKSPACE
+
+London's controlled Dropbox workspace is LONDON - ACCESS. Use list_dropbox, search_dropbox, and read_dropbox_text only for content inside that root. Never access or claim access to anything outside that folder. Dropbox is read-only through these tools. For binary Office/PDF/image analysis that cannot be read as text, tell Ramy to route the file through the Task Inbox until a binary Dropbox analyzer is configured.
 
 Use resolve_person when Ramy gives a person's name but not an email address. It searches verified identities and Minaco email history. If one clear candidate is returned, use that verified address. If multiple plausible candidates are returned, ask Ramy which one he means. Never invent an address.
 
@@ -4871,8 +5057,47 @@ fastify.get('/', async (request, reply) => {
       'accounting mailbox',
       'daily executive brief',
       'automatic task inbox',
+      'dropbox controlled workspace',
+      'health monitoring',
     ],
   });
+});
+
+
+fastify.get('/health', async (request, reply) => {
+  return reply.send({
+    ok: true,
+    service: 'London Assistant',
+    time: new Date().toISOString(),
+    voiceModel: 'gpt-realtime',
+    dropboxConfigured: Boolean(DROPBOX_ACCESS_TOKEN),
+    stateFileConfigured: Boolean(STATE_FILE),
+  });
+});
+
+fastify.get('/health/deep', async (request, reply) => {
+  if (!HEALTH_SECRET || request.headers['x-london-health-secret'] !== HEALTH_SECRET) {
+    return reply.code(401).send({ ok: false, error: 'Unauthorized.' });
+  }
+  const checks = {};
+  const run = async (name, fn) => {
+    const started = Date.now();
+    try { await fn(); checks[name] = { ok: true, ms: Date.now() - started }; }
+    catch (error) { checks[name] = { ok: false, ms: Date.now() - started, error: String(error.message || error).slice(0, 300) }; }
+  };
+  await Promise.all([
+    run('microsoftRead', async () => { await getMicrosoftGraphToken(); }),
+    run('microsoftActions', async () => { await getMicrosoftGraphActionsToken(); }),
+    run('dropbox', async () => { if (!DROPBOX_ACCESS_TOKEN) throw new Error('Not configured'); await listLondonDropbox(LONDON_DROPBOX_ROOT, false); }),
+    run('twilio', async () => {
+      if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) throw new Error('Not configured');
+      const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+      const response = await fetchWithTimeout(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}.json`, { headers: { Authorization: `Basic ${auth}` } }, 12000);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    }),
+  ]);
+  const ok = Object.values(checks).every((item) => item.ok);
+  return reply.code(ok ? 200 : 503).send({ ok, time: new Date().toISOString(), checks });
 });
 
 // Optional scheduled endpoint. Power Automate can POST here each morning.
@@ -5039,7 +5264,7 @@ const handleIncomingExecutiveMessage = async (request, reply) => {
   if (messageSid && processedMessagingSids.has(messageSid)) {
     return reply.type('text/xml').send(emptyTwiml);
   }
-  if (messageSid) processedMessagingSids.set(messageSid, Date.now());
+  if (messageSid) { processedMessagingSids.set(messageSid, Date.now()); persistMessagingState(); }
 
   reply.type('text/xml').send(emptyTwiml);
 
@@ -5513,6 +5738,11 @@ fastify.register(async (fastifyInstance) => {
                       type: 'string',
                       description: 'Complete email body.',
                     },
+                    sender_identity: {
+                      type: 'string',
+                      enum: ['ramy', 'london'],
+                      description: 'Mailbox identity for this new email. Use ramy when Ramy says from my email/from me or does not specify; use london only when he explicitly says from London.',
+                    },
                   },
                   required: ['to', 'subject', 'body'],
                   additionalProperties: false,
@@ -5666,6 +5896,41 @@ fastify.register(async (fastifyInstance) => {
                     },
                   },
                   required: ['query'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'list_dropbox',
+                description: 'List files and folders inside London\'s controlled Dropbox workspace only. Read-only.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    path: { type: 'string', description: 'Path inside LONDON - ACCESS. Default root.' },
+                    recursive: { type: 'boolean', description: 'Whether to include descendants. Default false.' },
+                  },
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'search_dropbox',
+                description: 'Search files inside London\'s LONDON - ACCESS Dropbox workspace. Read-only.',
+                parameters: {
+                  type: 'object',
+                  properties: { query: { type: 'string', description: 'Filename or content search term.' } },
+                  required: ['query'],
+                  additionalProperties: false,
+                },
+              },
+              {
+                type: 'function',
+                name: 'read_dropbox_text',
+                description: 'Read a plain-text file inside LONDON - ACCESS. Read-only. For PDF/Office/image files use Task Inbox until binary Dropbox analysis is configured.',
+                parameters: {
+                  type: 'object',
+                  properties: { path: { type: 'string', description: 'Exact path inside LONDON - ACCESS.' } },
+                  required: ['path'],
                   additionalProperties: false,
                 },
               },
@@ -6315,7 +6580,7 @@ fastify.register(async (fastifyInstance) => {
                 }
 
                 const emailToSend = { ...pendingEmailDraft };
-                const result = await sendEmailFromLondon(emailToSend);
+                const result = await sendEmailFromMailbox(emailToSend);
                 pendingEmailDraft = null;
                 pendingEmailReply = null;
                 pendingEmailActionType = null;
@@ -6358,7 +6623,11 @@ fastify.register(async (fastifyInstance) => {
                 throw new Error('Recipient, subject, and body are required.');
               }
 
+              const senderIdentity = String(args.sender_identity || 'ramy').toLowerCase();
+              const senderMailbox = senderIdentity === 'london' ? LONDON_MINACO_EMAIL : RAMY_MINACO_EMAIL;
+              if (!senderMailbox) throw new Error('The selected sender mailbox is not configured.');
               pendingEmailDraft = {
+                from: senderMailbox,
                 to: args.to,
                 subject: args.subject,
                 body: args.body,
@@ -6374,7 +6643,7 @@ fastify.register(async (fastifyInstance) => {
                   draft: pendingEmailDraft,
                   sent: false,
                 },
-                'Read back the recipient, subject, and email message to Ramy. Clearly say the email has NOT been sent. Ask Ramy to confirm by saying Send it.'
+                'Read back the sender mailbox, recipient, subject, and email message to Ramy. Clearly say the email has NOT been sent. Ask Ramy to confirm by saying Send it.'
               );
             } catch (error) {
               console.error('Prepare email error:', error);
@@ -6765,6 +7034,48 @@ fastify.register(async (fastifyInstance) => {
                 { success: false, error: error.message },
                 'Tell Ramy the contact could not be resolved from verified Minaco data and ask for the email address if needed.'
               );
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'list_dropbox'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const entries = await listLondonDropbox(args.path || LONDON_DROPBOX_ROOT, Boolean(args.recursive));
+              respondToToolCall(response.call_id, { success: true, root: LONDON_DROPBOX_ROOT, entries }, 'Summarize the Dropbox listing concisely. Use only the returned entries and never imply access outside the controlled root.');
+            } catch (error) {
+              respondToToolCall(response.call_id, { success: false, error: error.message }, 'Tell Ramy the Dropbox listing failed and state the error concisely.');
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'search_dropbox'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const results = await searchLondonDropbox(args.query);
+              respondToToolCall(response.call_id, { success: true, root: LONDON_DROPBOX_ROOT, results }, 'Summarize the Dropbox search results concisely. Use only the returned results.');
+            } catch (error) {
+              respondToToolCall(response.call_id, { success: false, error: error.message }, 'Tell Ramy the Dropbox search failed and state the error concisely.');
+            }
+            return;
+          }
+
+          if (
+            response.type === 'response.function_call_arguments.done' &&
+            response.name === 'read_dropbox_text'
+          ) {
+            try {
+              const args = JSON.parse(response.arguments || '{}');
+              const result = await readLondonDropboxText(args.path);
+              respondToToolCall(response.call_id, { success: true, ...result }, 'Use only the returned Dropbox file text. Answer Ramy directly and concisely.');
+            } catch (error) {
+              respondToToolCall(response.call_id, { success: false, error: error.message }, 'Tell Ramy the Dropbox file could not be read and state the error concisely.');
             }
             return;
           }
