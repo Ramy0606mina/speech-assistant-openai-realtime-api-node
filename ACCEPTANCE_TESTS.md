@@ -14,7 +14,8 @@ Run on staging before production cutover.
 10. Restart test: with a persistent disk configured, redeploy/restart staging and verify recent SMS/WhatsApp context is retained.
 11. Dropbox: ask London to list/search `/LONDON - ACCESS`; try an outside path such as `/OtherFolder`; outside access must be rejected.
 12. Task Inbox: send a harmless internal test task from Ramy's Minaco mailbox to London and verify acknowledgement, analysis, Action Register update, and completion email.
-13. Daily Brief: invoke the existing scheduled endpoint manually with its secret and verify the brief uses current live data.
-14. Failure test: temporarily use an invalid Dropbox token in staging; `/health/deep` should show Dropbox failed without taking down voice/email/calendar.
+13. Task Inbox + Dropbox: send a task with no attachments that references `/LONDON - ACCESS/MINA CAPITAL/4_5165_DES SOURCES/Tenant_Apartment_Condition_Report.docx` and says the tenant information is in a PDF in the same folder. Verify London inspects the DOCX and folder PDFs, extracts the tenant details, and does not claim the files were unavailable.
+14. Daily Brief: invoke the existing scheduled endpoint manually with its secret and verify the brief uses current live data.
+15. Failure test: temporarily use an invalid Dropbox token in staging; `/health/deep` should show Dropbox failed without taking down voice/email/calendar.
 
 Do not cut over production until the tests relevant to configured integrations pass.

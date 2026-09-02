@@ -7,6 +7,10 @@ import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
 import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { resolveFileContentType } from './file-content-type.js';
+import {
+  extractDropboxReferencePlan,
+  selectDropboxTaskFiles,
+} from './task-dropbox-routing.js';
 
 // Load environment variables from .env file
 dotenv.config();
@@ -4378,6 +4382,135 @@ const buildTaskInboxFileInputs = async ({
   };
 };
 
+const buildTaskInboxDropboxInputs = async ({
+  taskInstruction,
+  initialTotalBytes = 0,
+  maxFiles = MAX_TASK_ATTACHMENTS,
+}) => {
+  const plan = extractDropboxReferencePlan(taskInstruction, LONDON_DROPBOX_ROOT);
+  const result = {
+    content: [],
+    reviewedFiles: [],
+    skippedFiles: [],
+    totalBytes: 0,
+    referenced: plan.referenced,
+  };
+
+  if (!plan.referenced) return result;
+  if (!DROPBOX_ACCESS_TOKEN) {
+    result.skippedFiles.push(
+      'Dropbox was referenced, but London’s deployed Dropbox connection is not configured.'
+    );
+    return result;
+  }
+
+  const entries = [];
+  const folders = new Set(plan.folders.map((path) => normalizeDropboxPath(path)));
+
+  for (const path of plan.explicitFiles) {
+    const safePath = normalizeDropboxPath(path);
+    try {
+      const metaResponse = await dropboxApi('files/get_metadata', { path: safePath });
+      const meta = await metaResponse.json();
+      if (meta['.tag'] === 'folder') {
+        folders.add(safePath);
+      } else {
+        entries.push({
+          type: 'file',
+          name: meta.name || safePath.split('/').at(-1) || '',
+          path: meta.path_display || meta.path_lower || safePath,
+          size: Number(meta.size || 0),
+          modified: meta.server_modified || '',
+        });
+      }
+    } catch (error) {
+      result.skippedFiles.push(`${safePath} — ${error.message}`);
+    }
+  }
+
+  for (const folder of folders) {
+    try {
+      entries.push(...(await listLondonDropbox(folder, false)));
+    } catch (error) {
+      result.skippedFiles.push(`${folder} — ${error.message}`);
+    }
+  }
+
+  const selected = selectDropboxTaskFiles({
+    entries,
+    explicitFiles: plan.explicitFiles,
+    instruction: taskInstruction,
+    maxFiles,
+  });
+
+  if (!selected.length && !result.skippedFiles.length) {
+    result.skippedFiles.push(
+      'Dropbox was referenced, but no relevant supported document was found in the referenced folder.'
+    );
+    return result;
+  }
+
+  let combinedBytes = Number(initialTotalBytes) || 0;
+  for (const entry of selected) {
+    const reportedSize = Number(entry.size || 0);
+    if (reportedSize > MAX_DROPBOX_ANALYSIS_BYTES) {
+      result.skippedFiles.push(`${entry.path} — larger than the 45 MB single-file limit`);
+      continue;
+    }
+    if (combinedBytes + reportedSize > MAX_TASK_TOTAL_BYTES) {
+      result.skippedFiles.push(
+        `${entry.path} — skipped because all task source files exceeded the 45 MB combined analysis limit`
+      );
+      continue;
+    }
+
+    try {
+      const file = await downloadLondonDropboxFile(entry.path);
+      if (combinedBytes + file.size > MAX_TASK_TOTAL_BYTES) {
+        result.skippedFiles.push(
+          `${file.path} — skipped because all task source files exceeded the 45 MB combined analysis limit`
+        );
+        continue;
+      }
+
+      const dataUri = `data:${file.contentType};base64,${file.buffer.toString('base64')}`;
+      if (file.contentType.startsWith('image/')) {
+        result.content.push({
+          type: 'input_image',
+          image_url: dataUri,
+          detail: 'auto',
+        });
+      } else {
+        result.content.push({
+          type: 'input_file',
+          filename: file.filename,
+          file_data: dataUri,
+          detail: 'auto',
+        });
+      }
+
+      combinedBytes += file.size;
+      result.totalBytes += file.size;
+      result.reviewedFiles.push(`Dropbox: ${file.filename} — ${file.path}`);
+    } catch (error) {
+      result.skippedFiles.push(`${entry.path} — ${error.message}`);
+    }
+  }
+
+  return result;
+};
+
+const mergeTaskInboxFileInputs = (...sources) => ({
+  content: sources.flatMap((source) => source?.content || []),
+  reviewedFiles: sources.flatMap((source) => source?.reviewedFiles || []),
+  skippedFiles: sources.flatMap((source) => source?.skippedFiles || []),
+  totalBytes: sources.reduce(
+    (total, source) => total + (Number(source?.totalBytes) || 0),
+    0
+  ),
+  dropboxReferenced: sources.some((source) => Boolean(source?.referenced)),
+});
+
 const normalizeTaskReport = (value = {}) => {
   const array = (candidate) => (Array.isArray(candidate) ? candidate : []);
   const object = (candidate) =>
@@ -4583,21 +4716,25 @@ const renderTaskInboxReportHtml = ({
             ? section('DETAILED COMPARISON / ANALYSIS', '#344054', tableHtml)
             : ''
         }
-        ${section(
-          'RISKS / ISSUES TO PROTECT',
-          '#B42318',
-          risks || '<div style="color:#667085;">No specific risk was identified from the supplied material.</div>'
-        )}
-        ${section(
-          'MISSING / UNVERIFIED INFORMATION',
-          '#B54708',
-          list(report.missingInformation, 'No material information gap was identified.')
-        )}
-        ${section(
-          'RECOMMENDED NEXT ACTIONS',
-          '#027A48',
-          list(report.recommendedNextActions, 'No further action is recommended from the supplied material.')
-        )}
+        ${risks ? section('RISKS / ISSUES TO PROTECT', '#B42318', risks) : ''}
+        ${
+          report.missingInformation?.length
+            ? section(
+                'MISSING / UNVERIFIED INFORMATION',
+                '#B54708',
+                list(report.missingInformation)
+              )
+            : ''
+        }
+        ${
+          report.recommendedNextActions?.length
+            ? section(
+                'RECOMMENDED NEXT ACTIONS',
+                '#027A48',
+                list(report.recommendedNextActions)
+              )
+            : ''
+        }
         ${
           report.ramyActionRequired
             ? section(
@@ -4636,6 +4773,7 @@ const renderTaskInboxReportHtml = ({
 const sendTaskInboxAcknowledgement = async ({
   taskSubject,
   attachmentNames,
+  dropboxReferenced = false,
   jobId,
 }) => {
   const files = (attachmentNames || []).filter(Boolean);
@@ -4643,7 +4781,9 @@ const sendTaskInboxAcknowledgement = async ({
     ? `<div style="margin-top:8px;color:#475467;font-size:13px;"><b>Files received:</b> ${files
         .map(escapeDelegatedHtml)
         .join(', ')}</div>`
-    : '<div style="margin-top:8px;color:#667085;font-size:13px;">No file attachment was detected.</div>';
+    : dropboxReferenced
+      ? '<div style="margin-top:8px;color:#475467;font-size:13px;"><b>Dropbox source detected:</b> I will inspect the referenced file and its folder automatically.</div>'
+      : '<div style="margin-top:8px;color:#667085;font-size:13px;">No email attachment or Dropbox source was detected.</div>';
 
   const html = `<!doctype html><html><body style="margin:0;background:#f2f4f7;font-family:Arial,Helvetica,sans-serif;">
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:22px 10px;">
@@ -4716,7 +4856,7 @@ const runTaskInboxJob = async ({
         status: 'ACTIVE',
         priority: 'NORMAL',
         lastContact: montrealDateParts(),
-        nextAction: 'Analyze the task email and attachments, then report back to Ramy.',
+        nextAction: 'Analyze the task email and all authorized source files, then report back to Ramy.',
         waitingOn: 'London',
         ramyRequired: false,
         source: `London Task Inbox | ${taskEmail.internetMessageId || taskEmail.id}`,
@@ -4731,13 +4871,29 @@ const runTaskInboxJob = async ({
     await sendTaskInboxAcknowledgement({
       taskSubject: actualSubject,
       attachmentNames: visibleAttachments.map((item) => item.name),
+      dropboxReferenced: extractDropboxReferencePlan(
+        taskInstruction,
+        LONDON_DROPBOX_ROOT
+      ).referenced,
       jobId,
     });
 
-    const fileInputs = await buildTaskInboxFileInputs({
+    const attachmentInputs = await buildTaskInboxFileInputs({
       messageId: taskEmail.id,
       attachments: visibleAttachments,
     });
+    const dropboxInputs = await buildTaskInboxDropboxInputs({
+      taskInstruction,
+      initialTotalBytes: attachmentInputs.totalBytes,
+      maxFiles: Math.max(
+        0,
+        MAX_TASK_ATTACHMENTS - attachmentInputs.reviewedFiles.length
+      ),
+    });
+    const fileInputs = mergeTaskInboxFileInputs(
+      attachmentInputs,
+      dropboxInputs
+    );
 
     const userContent = [...fileInputs.content];
     userContent.push({
@@ -4750,8 +4906,8 @@ Received: ${taskEmail.receivedDateTime || ''}
 TASK INSTRUCTIONS / EMAIL BODY:
 ${taskInstruction || '[No task instruction text was found in the email body.]'}
 
-FILES PROVIDED:
-${fileInputs.reviewedFiles.length ? fileInputs.reviewedFiles.join('\n') : '[No analyzable file attachments were included.]'}
+SOURCE FILES PROVIDED FROM EMAIL OR AUTHORIZED DROPBOX:
+${fileInputs.reviewedFiles.length ? fileInputs.reviewedFiles.join('\n') : '[No analyzable source files were available.]'}
 
 FILES NOT ANALYZED:
 ${fileInputs.skippedFiles.length ? fileInputs.skippedFiles.join('\n') : '[None]'}`,
@@ -4762,9 +4918,13 @@ ${fileInputs.skippedFiles.length ? fileInputs.skippedFiles.join('\n') : '[None]'
         model: TASK_INBOX_ANALYSIS_MODEL,
         instructions: `You are London Assistant performing an autonomous internal task assigned directly by Ramy Mina through the verified London Task Inbox.
 
-Use ONLY the task email and supplied attachments. Analyze the actual files, including every relevant Excel worksheet/tab when the task asks for spreadsheet review. Do not silently skip worksheets, rows, units, calculations, assumptions, dates, or material discrepancies requested by Ramy.
+Use ONLY the task email and the supplied source files retrieved from email attachments or Ramy’s authorized Dropbox workspace. Analyze the actual files, including every relevant Excel worksheet/tab when the task asks for spreadsheet review. Do not silently skip worksheets, rows, units, calculations, assumptions, dates, or material discrepancies requested by Ramy.
+
+When Ramy identifies a Dropbox file or says that supporting information is in the same Dropbox folder, the supplied Dropbox source files are authoritative task materials. Cross-reference them directly. Never claim they were unavailable merely because they were not attached to the email.
 
 Be objective. Do not manufacture a challenge or conclusion. If the source material supports the counterparty, say so. If the evidence is incomplete, identify exactly what is missing rather than guessing.
+
+Keep the report proportional to the task. For a straightforward retrieval or cross-reference task, answer directly and do not repeat the same point across findings, risks, missing information, limitations, and next actions. Leave sections empty when they add no value.
 
 Important authority rules:
 - This is an INTERNAL analysis for Ramy.

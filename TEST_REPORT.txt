@@ -1,3 +1,6 @@
 Syntax validation: PASS
-Baseline: London_WhatsApp_inference_fix_full_build.zip / index.js
-Generated: 2026-09-02T14:03:29Z
+Automated tests: PASS (8/8)
+Task Inbox Dropbox-path routing regression: PASS
+Actual folder discovery: PASS — DOCX and six supporting PDFs confirmed
+Live candidate Task Inbox execution: PENDING DEPLOYMENT
+Generated: 2026-09-02
