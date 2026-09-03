@@ -28,6 +28,8 @@ registerVoiceRoutes(app, {
   principalPhone: config.voice.principalPhone,
   model: config.voice.model,
   voice: config.voice.voice,
+  graph,
+  dropbox,
   logger: app.log,
 });
 
