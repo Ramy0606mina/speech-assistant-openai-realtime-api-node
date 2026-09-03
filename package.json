@@ -1,10 +1,13 @@
 {
   "name": "speech-assistant-openai-realtime-api-node",
-  "version": "1.0.1",
-  "description": "",
-  "main": "index.js",
+  "version": "2.0.0-lean",
+  "description": "London Assistant - lean single-backend architecture",
+  "main": "lean-server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node lean-server.js",
+    "start:legacy": "node index.js",
+    "check": "node --check lean-server.js && node --check index.js && node --check src/config.js && node --check src/http.js && node --check src/openai-client.js && node --check src/microsoft-graph.js && node --check src/dropbox-client.js && node --check src/state-store.js && node --check src/london-core.js && node --check src/voice-gateway.js",
+    "test": "npm run check && node --test test/*.test.js"
   },
   "keywords": [],
   "author": "",
