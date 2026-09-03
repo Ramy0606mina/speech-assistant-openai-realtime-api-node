@@ -1,5 +1,11 @@
 const read = (env, key, fallback = '') => String(env[key] ?? fallback).trim();
 
+const normalizeVoiceModel = (value) => {
+  const requested = String(value || '').trim();
+  if (!requested || requested === 'gpt-realtime') return 'gpt-realtime-1.5';
+  return requested;
+};
+
 export function loadConfig(env = process.env) {
   const config = {
     openai: {
@@ -22,7 +28,7 @@ export function loadConfig(env = process.env) {
     },
     voice: {
       principalPhone: read(env, 'RAMY_PHONE_NUMBER'),
-      model: read(env, 'VOICE_MODEL', 'gpt-realtime'),
+      model: normalizeVoiceModel(read(env, 'VOICE_MODEL', 'gpt-realtime-1.5')),
       voice: read(env, 'VOICE_NAME', 'marin'),
     },
     runtime: {
