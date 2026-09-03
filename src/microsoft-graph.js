@@ -4,6 +4,10 @@ function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
 }
 
+function clampLimit(value, fallback = 10, max = 25) {
+  return Math.min(max, Math.max(1, Number(value) || fallback));
+}
+
 export class MicrosoftGraphClient {
   constructor({
     readTenantId,
@@ -54,15 +58,25 @@ export class MicrosoftGraphClient {
   get readMailbox() { return normalizeEmail(this.londonMailbox); }
   get principalMailbox() { return normalizeEmail(this.ramyMailbox); }
 
-  async listLondonInbox(limit = 10) {
-    if (!this.londonMailbox) throw new Error('LONDON_MINACO_EMAIL is not configured.');
+  async #listInbox(mailbox, limit = 10) {
+    if (!mailbox) throw new Error('Mailbox is not configured.');
     const token = await this.#getToken(this.readCreds, this.readToken);
-    const url = new URL(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.londonMailbox)}/mailFolders/inbox/messages`);
-    url.searchParams.set('$top', String(Math.min(25, Math.max(1, Number(limit) || 10))));
+    const url = new URL(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(mailbox)}/mailFolders/inbox/messages`);
+    url.searchParams.set('$top', String(clampLimit(limit)));
     url.searchParams.set('$select', 'id,internetMessageId,subject,from,receivedDateTime,bodyPreview,isRead,hasAttachments');
     url.searchParams.set('$orderby', 'receivedDateTime desc');
     const data = await fetchJson(this.fetchImpl, url, { headers: { Authorization: `Bearer ${token}` } });
     return data?.value || [];
+  }
+
+  async listLondonInbox(limit = 10) {
+    if (!this.londonMailbox) throw new Error('LONDON_MINACO_EMAIL is not configured.');
+    return this.#listInbox(this.londonMailbox, limit);
+  }
+
+  async listPrincipalInbox(limit = 5) {
+    if (!this.ramyMailbox) throw new Error('RAMY_MINACO_EMAIL is not configured.');
+    return this.#listInbox(this.ramyMailbox, clampLimit(limit, 5, 10));
   }
 
   async getLondonMessage(messageId) {
@@ -73,6 +87,33 @@ export class MicrosoftGraphClient {
     return fetchJson(this.fetchImpl, url, {
       headers: { Authorization: `Bearer ${token}`, Prefer: 'outlook.body-content-type="text"' },
     });
+  }
+
+  async listPrincipalCalendar({ startIso, endIso, limit = 20 } = {}) {
+    if (!this.ramyMailbox) throw new Error('RAMY_MINACO_EMAIL is not configured.');
+    if (!startIso || !endIso) throw new Error('Calendar start and end are required.');
+
+    const start = new Date(startIso);
+    const end = new Date(endIso);
+    if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end <= start) {
+      throw new Error('Calendar start/end range is invalid.');
+    }
+
+    const token = await this.#getToken(this.readCreds, this.readToken);
+    const url = new URL(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.ramyMailbox)}/calendarView`);
+    url.searchParams.set('startDateTime', start.toISOString());
+    url.searchParams.set('endDateTime', end.toISOString());
+    url.searchParams.set('$top', String(clampLimit(limit, 20, 50)));
+    url.searchParams.set('$select', 'id,subject,start,end,location,organizer,isCancelled,isAllDay');
+    url.searchParams.set('$orderby', 'start/dateTime');
+
+    const data = await fetchJson(this.fetchImpl, url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Prefer: 'outlook.timezone="Eastern Standard Time"',
+      },
+    });
+    return data?.value || [];
   }
 
   async sendMail({ to, subject, body, cc = [] }) {
