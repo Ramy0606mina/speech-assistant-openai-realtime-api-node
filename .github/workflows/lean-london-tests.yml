@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - london-lean-core-2026-09-03
+      - london-production-candidate-2026-09-02
   pull_request:
 
 jobs:
@@ -16,8 +17,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: npm
       - name: Install dependencies
-        run: npm ci
+        run: npm install
       - name: Run automated tests
         run: npm test
