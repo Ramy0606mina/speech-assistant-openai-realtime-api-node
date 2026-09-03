@@ -42,12 +42,14 @@ test('configuration status does not expose secret values', () => {
   assert.equal(JSON.stringify(status).includes('dbx'), false);
 });
 
-test('London processes Ramy email as delegated task', async () => {
+test('London processes Ramy email as delegated task and sends completion through Graph', async () => {
   const state = new MemoryState();
+  const sent = [];
   const graph = {
     principalMailbox: 'ramy@minaco.ca', readMailbox: 'london@minaco.ca',
     async listLondonInbox() { return [{ id: '1', internetMessageId: 'm1' }]; },
     async getLondonMessage() { return { id: '1', internetMessageId: 'm1', from: { emailAddress: { address: 'ramy@minaco.ca' } }, subject: 'Review', body: { content: 'Review this.' } }; },
+    async sendMail(message) { sent.push(message); return { sent: true }; },
   };
   const openai = {
     async analyzeDelegatedEmail() { return { text: 'Objective: review.' }; },
@@ -57,6 +59,10 @@ test('London processes Ramy email as delegated task', async () => {
   const result = await core.pollOnce(10);
   assert.equal(result.results[0].type, 'delegated-task');
   assert.equal(result.results[0].analysis, 'Objective: review.');
+  assert.equal(result.results[0].completionSent, true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].to, 'ramy@minaco.ca');
+  assert.equal(sent[0].subject, 'LONDON — Task Complete | Review');
 });
 
 test('London classifies external email without executing it as Ramy task', async () => {
