@@ -1,4 +1,6 @@
 import Fastify from 'fastify';
+import fastifyFormBody from '@fastify/formbody';
+import fastifyWs from '@fastify/websocket';
 import dotenv from 'dotenv';
 import { loadConfig, configurationStatus } from './src/config.js';
 import { OpenAIClient } from './src/openai-client.js';
@@ -6,16 +8,28 @@ import { MicrosoftGraphClient } from './src/microsoft-graph.js';
 import { DropboxClient } from './src/dropbox-client.js';
 import { StateStore } from './src/state-store.js';
 import { LondonCore } from './src/london-core.js';
+import { registerVoiceRoutes } from './src/voice-gateway.js';
 
 dotenv.config();
 const config = loadConfig();
 const app = Fastify({ logger: true });
+
+await app.register(fastifyFormBody);
+await app.register(fastifyWs);
 
 const graph = new MicrosoftGraphClient({ ...config.microsoft });
 const openai = new OpenAIClient({ apiKey: config.openai.apiKey, model: config.openai.taskModel });
 const dropbox = new DropboxClient(config.dropbox);
 const state = new StateStore(config.runtime.stateFile);
 const london = new LondonCore({ graph, openai, dropbox, state, logger: app.log });
+
+registerVoiceRoutes(app, {
+  openAiApiKey: config.openai.apiKey,
+  principalPhone: config.voice.principalPhone,
+  model: config.voice.model,
+  voice: config.voice.voice,
+  logger: app.log,
+});
 
 let pollInFlight = false;
 async function safePoll() {
