@@ -28,20 +28,151 @@ export function buildIncomingCallTwiML({ host, streamToken }) {
 </Response>`;
 }
 
+function currentMontrealContext() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Toronto',
+    dateStyle: 'full',
+    timeStyle: 'short',
+  }).format(new Date());
+}
+
 function realtimeInstructions() {
   return [
     'You are London Assistant, executive assistant to Ramy Mina for Minaco.',
+    `The current Montreal date and time is ${currentMontrealContext()}.`,
     'Ramy is speaking to you by phone.',
     'Speak in polished British English with a calm, mature, discreet executive-assistant manner.',
     'Keep answers concise unless Ramy asks for detail.',
     'Ramy may pause briefly while forming a sentence; do not interrupt unnecessarily.',
     'If he interrupts you, stop promptly and listen.',
     'Never invent current email, calendar, Dropbox, financial, tenant, project, or business facts.',
-    'This restored voice gateway is conversational only while London tools are being reconnected to the lean core.',
-    'If Ramy asks you to perform a live action that is not available in this call, say briefly that the live action is not yet connected rather than pretending it was completed.',
+    'Use the live tools whenever Ramy asks about current email, his calendar, or Dropbox.',
+    'The currently connected tools are read-only. Never claim an email was sent or a calendar event was changed from this call.',
+    'If Ramy asks for a live action that is not connected, say briefly that the action is not yet connected rather than pretending it was completed.',
     'When asked who you are, say: I am London Assistant, your executive assistant for Minaco.',
     'Ramy is spelled R-A-M-Y.',
   ].join(' ');
+}
+
+function voiceTools() {
+  return [
+    {
+      type: 'function',
+      name: 'check_email',
+      description: 'Read Ramy Mina’s latest live Minaco inbox messages. Use for current inbox or latest email questions.',
+      parameters: {
+        type: 'object',
+        properties: {
+          limit: { type: 'integer', minimum: 1, maximum: 10, description: 'Number of latest messages. Default 5.' },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      type: 'function',
+      name: 'check_calendar',
+      description: 'Read Ramy’s live Minaco calendar for a precise date/time window.',
+      parameters: {
+        type: 'object',
+        properties: {
+          start_iso: { type: 'string', description: 'Window start as ISO 8601 datetime with timezone offset or Z.' },
+          end_iso: { type: 'string', description: 'Window end as ISO 8601 datetime with timezone offset or Z.' },
+        },
+        required: ['start_iso', 'end_iso'],
+        additionalProperties: false,
+      },
+    },
+    {
+      type: 'function',
+      name: 'search_dropbox',
+      description: 'Search London’s controlled LONDON - ACCESS Dropbox workspace for a file or folder by name/topic.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Filename, folder name, project, or search term.' },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+    {
+      type: 'function',
+      name: 'list_dropbox',
+      description: 'List one folder inside London’s controlled LONDON - ACCESS Dropbox workspace.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path inside LONDON - ACCESS. Use empty string for the root.' },
+        },
+        additionalProperties: false,
+      },
+    },
+  ];
+}
+
+function simplifyEmail(message) {
+  return {
+    id: message?.id || '',
+    subject: message?.subject || '(no subject)',
+    from: message?.from?.emailAddress?.address || '',
+    senderName: message?.from?.emailAddress?.name || '',
+    receivedDateTime: message?.receivedDateTime || '',
+    isRead: Boolean(message?.isRead),
+    hasAttachments: Boolean(message?.hasAttachments),
+    preview: String(message?.bodyPreview || '').slice(0, 700),
+  };
+}
+
+function simplifyCalendarEvent(event) {
+  return {
+    id: event?.id || '',
+    subject: event?.subject || '(no subject)',
+    start: event?.start || null,
+    end: event?.end || null,
+    location: event?.location?.displayName || '',
+    organizer: event?.organizer?.emailAddress?.address || '',
+    isAllDay: Boolean(event?.isAllDay),
+    isCancelled: Boolean(event?.isCancelled),
+  };
+}
+
+function simplifyDropboxEntry(entry) {
+  const meta = entry?.metadata?.metadata || entry?.metadata || entry || {};
+  return {
+    type: meta['.tag'] || meta.type || '',
+    name: meta.name || '',
+    path: meta.path_display || meta.path_lower || meta.path || '',
+    size: Number(meta.size || 0),
+    modified: meta.server_modified || meta.client_modified || '',
+  };
+}
+
+async function runVoiceTool(name, args, { graph, dropbox }) {
+  if (name === 'check_email') {
+    if (!graph) throw new Error('Microsoft Graph is not connected to the voice gateway.');
+    const messages = await graph.listPrincipalInbox(args.limit || 5);
+    return { success: true, messages: messages.map(simplifyEmail) };
+  }
+
+  if (name === 'check_calendar') {
+    if (!graph) throw new Error('Microsoft Graph is not connected to the voice gateway.');
+    const events = await graph.listPrincipalCalendar({ startIso: args.start_iso, endIso: args.end_iso });
+    return { success: true, events: events.map(simplifyCalendarEvent) };
+  }
+
+  if (name === 'search_dropbox') {
+    if (!dropbox) throw new Error('Dropbox is not connected to the voice gateway.');
+    const matches = await dropbox.search(args.query || '');
+    return { success: true, matches: matches.slice(0, 20).map(simplifyDropboxEntry) };
+  }
+
+  if (name === 'list_dropbox') {
+    if (!dropbox) throw new Error('Dropbox is not connected to the voice gateway.');
+    const entries = await dropbox.listFolder(args.path || '');
+    return { success: true, entries: entries.slice(0, 50).map(simplifyDropboxEntry) };
+  }
+
+  throw new Error(`Unsupported voice tool: ${name}`);
 }
 
 export function registerVoiceRoutes(app, {
@@ -49,6 +180,8 @@ export function registerVoiceRoutes(app, {
   principalPhone,
   model = 'gpt-realtime',
   voice = 'marin',
+  graph,
+  dropbox,
   logger = console,
 } = {}) {
   const authorizedStreamTokens = new Map();
@@ -95,6 +228,7 @@ export function registerVoiceRoutes(app, {
       let streamSid = '';
       let closed = false;
       let openAiReady = false;
+      let greetingSent = false;
       const pendingAudio = [];
 
       const openAiWs = new WebSocket(
@@ -125,6 +259,23 @@ export function registerVoiceRoutes(app, {
         }
       };
 
+      const sendToolOutput = (callId, output) => {
+        sendOpenAi({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: callId,
+            output: JSON.stringify(output),
+          },
+        });
+        sendOpenAi({
+          type: 'response.create',
+          response: {
+            instructions: 'Answer Ramy concisely using only the verified live tool output. If the tool returned an error, state it plainly.',
+          },
+        });
+      };
+
       openAiWs.on('open', () => {
         openAiReady = true;
         sendOpenAi({
@@ -150,26 +301,45 @@ export function registerVoiceRoutes(app, {
               },
             },
             instructions: realtimeInstructions(),
+            tools: voiceTools(),
+            tool_choice: 'auto',
           },
         });
         flushAudio();
-        sendOpenAi({
-          type: 'response.create',
-          response: {
-            instructions: 'Greet Ramy briefly as London and ask how you can help. One short sentence.',
-          },
-        });
       });
 
-      openAiWs.on('message', (data) => {
+      openAiWs.on('message', async (data) => {
         try {
           const event = JSON.parse(String(data));
+
+          if (event.type === 'session.updated' && !greetingSent) {
+            greetingSent = true;
+            sendOpenAi({
+              type: 'response.create',
+              response: {
+                instructions: 'Greet Ramy briefly as London and ask how you can help. One short sentence.',
+              },
+            });
+          }
+
           if (event.type === 'response.output_audio.delta' && event.delta && streamSid) {
             sendTwilio({ event: 'media', streamSid, media: { payload: event.delta } });
           }
 
           if (event.type === 'input_audio_buffer.speech_started' && streamSid) {
             sendTwilio({ event: 'clear', streamSid });
+          }
+
+          if (event.type === 'response.function_call_arguments.done') {
+            try {
+              const args = JSON.parse(event.arguments || '{}');
+              const output = await runVoiceTool(event.name, args, { graph, dropbox });
+              sendToolOutput(event.call_id, output);
+            } catch (error) {
+              logger.error?.({ err: error, tool: event.name }, 'London voice tool failed');
+              sendToolOutput(event.call_id, { success: false, error: error.message });
+            }
+            return;
           }
 
           if (event.type === 'error') {
