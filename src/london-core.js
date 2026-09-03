@@ -6,6 +6,10 @@ function messageKey(message) {
   return String(message?.internetMessageId || message?.id || '').trim();
 }
 
+function completionSubject(subject) {
+  return `LONDON — Task Complete | ${String(subject || '(no subject)').trim() || '(no subject)'}`;
+}
+
 export class LondonCore {
   constructor({ graph, openai, dropbox, state, logger = console }) {
     this.graph = graph;
@@ -33,7 +37,16 @@ export class LondonCore {
     let result;
     if (principal && sender === principal) {
       const analysis = await this.openai.analyzeDelegatedEmail(full);
-      result = { type: 'delegated-task', sender, analysis: analysis.text };
+      const text = String(analysis.text || '').trim();
+      if (!text) throw new Error('London produced an empty delegated-task result.');
+
+      await this.graph.sendMail({
+        to: principal,
+        subject: completionSubject(full.subject),
+        body: text,
+      });
+
+      result = { type: 'delegated-task', sender, analysis: text, completionSent: true };
     } else {
       const classification = await this.openai.classifyInboundEmail(full);
       result = { type: 'inbound-email', sender, classification: classification.text.trim().toUpperCase() };
