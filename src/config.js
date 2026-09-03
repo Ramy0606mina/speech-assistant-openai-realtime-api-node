@@ -20,6 +20,11 @@ export function loadConfig(env = process.env) {
       accessToken: read(env, 'DROPBOX_ACCESS_TOKEN'),
       rootPath: read(env, 'DROPBOX_ROOT_PATH', '/LONDON - ACCESS') || '/LONDON - ACCESS',
     },
+    voice: {
+      principalPhone: read(env, 'RAMY_PHONE_NUMBER'),
+      model: read(env, 'VOICE_MODEL', 'gpt-realtime'),
+      voice: read(env, 'VOICE_NAME', 'marin'),
+    },
     runtime: {
       healthSecret: read(env, 'HEALTH_SECRET'),
       stateFile: read(env, 'LONDON_STATE_FILE', '/tmp/london-lean-state.json'),
@@ -46,6 +51,9 @@ export function configurationStatus(config) {
       config.microsoft.actionClientSecret
     ),
     dropboxConfigured: Boolean(config.dropbox.accessToken && config.dropbox.rootPath),
+    voiceConfigured: Boolean(config.openai.apiKey && config.voice.principalPhone),
+    voiceModel: config.voice.model,
+    voiceName: config.voice.voice,
     stateFileConfigured: Boolean(config.runtime.stateFile),
   };
 }
