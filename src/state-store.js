@@ -23,17 +23,13 @@ export class StateStore {
   }
 
   hasMessage(key) {
-    return Boolean(key && this.state.processedMessages[key]);
+    return Boolean(key && Object.hasOwn(this.state.processedMessages, key));
   }
 
   markMessage(key, metadata = {}) {
     if (!key) return;
-    this.state.processedMessages[key] = { processedAt: new Date().toISOString(), ...metadata };
-    const keys = Object.keys(this.state.processedMessages);
-    if (keys.length > 2000) {
-      keys.sort((a, b) => String(this.state.processedMessages[a]?.processedAt).localeCompare(String(this.state.processedMessages[b]?.processedAt)));
-      for (const oldKey of keys.slice(0, keys.length - 1500)) delete this.state.processedMessages[oldKey];
-    }
+    Object.defineProperty(this.state.processedMessages, key, { value: { processedAt: new Date().toISOString(), ...metadata }, enumerable: true, configurable: true, writable: true });
+    // Retain delivery records; pruning can resend old messages still in the inbox.
     this.save();
   }
 

@@ -17,6 +17,7 @@ export class LondonCore {
     this.dropbox = dropbox;
     this.state = state;
     this.logger = logger;
+    this.inFlight = new Set();
   }
 
   async processMessage(summary) {
@@ -24,6 +25,14 @@ export class LondonCore {
     if (!key) return { skipped: true, reason: 'missing-message-id' };
     if (this.state.hasMessage(key)) return { skipped: true, reason: 'duplicate', key };
 
+    if (this.inFlight.has(key)) return { skipped: true, reason: 'in-flight', key };
+    this.inFlight.add(key);
+    try {
+      return await this.processClaimedMessage(summary, key);
+    } finally { this.inFlight.delete(key); }
+  }
+
+  async processClaimedMessage(summary, key) {
     const full = await this.graph.getLondonMessage(summary.id);
     const sender = emailAddress(full);
     const principal = this.graph.principalMailbox;
@@ -35,11 +44,15 @@ export class LondonCore {
     }
 
     let result;
-    if (principal && sender === principal) {
-      const analysis = await this.openai.analyzeDelegatedEmail(full);
+    const actualSender = String(full.sender?.emailAddress?.address || sender).trim().toLowerCase();
+    if (principal && sender === principal && actualSender === principal) {
+      const attachments = full.hasAttachments ? await this.graph.getLondonAttachments(summary.id) : [];
+      const analysis = await this.openai.analyzeDelegatedEmail(full, attachments);
       const text = String(analysis.text || '').trim();
       if (!text) throw new Error('London produced an empty delegated-task result.');
 
+      // Persist before dispatch: an interrupted/ambiguous send must not be retried blindly.
+      this.state.markMessage(key, { sender, result: 'delivery-pending-review' });
       await this.graph.sendMail({
         to: principal,
         subject: completionSubject(full.subject),
