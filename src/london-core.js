@@ -79,7 +79,7 @@ export class LondonCore {
       try {
         results.push(await this.processMessage(message));
       } catch (error) {
-        this.logger.error?.('London message processing failed', { messageId: message?.id, error: error?.message });
+        this.logger.error?.({ messageId: message?.id, error: error?.message, status: error?.status }, 'London message processing failed');
         results.push({ processed: false, messageId: message?.id, error: error?.message || String(error) });
       }
     }
