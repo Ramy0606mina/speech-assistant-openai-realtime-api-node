@@ -1,5 +1,7 @@
 import { fetchJson } from './http.js';
 import { createHash } from 'node:crypto';
+import mammoth from 'mammoth';
+import { renderReportPdf } from './report-pdf.js';
 
 function normalizeDropboxPath(value) {
   let path = String(value || '').trim().replace(/\\/g, '/');
@@ -113,6 +115,13 @@ export class DropboxClient {
       }
       const bytes = Buffer.concat(chunks);
       if (!bytes.length) throw new Error('Dropbox returned an empty document.');
+      if (filename.toLowerCase().endsWith('.docx')) {
+        const extracted = await mammoth.extractRawText({ buffer: bytes });
+        if (!extracted.value.trim()) throw new Error('Word document contains no extractable text; images and layout need separate review.');
+        if (extracted.value.length > 500000) throw new Error('Word document exceeds the text analysis limit.');
+        return { path: resolved, filename, size, part: { type: 'input_text',
+          text: `Dropbox Word source: ${resolved}\nExtracted text only; images and visual layout are not included.\n\n${extracted.value}` } };
+      }
       return { path: resolved, filename, size, part: {
         type: 'input_file', filename,
         file_data: `data:${filename.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream'};base64,${bytes.toString('base64')}`,
@@ -133,13 +142,14 @@ export class DropboxClient {
     const contents = `# ${String(subject || 'London report').replace(/[\r\n]+/g, ' ')}\n\n${text}\n`;
     const suffix = createHash('sha256').update(`${taskKey}\n${contents}`).digest('hex');
     const label = String(subject || 'Report').replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 60) || 'Report';
-    const path = this.resolvePath(`${folder}/London - ${label} - ${suffix}.md`);
+    const path = this.resolvePath(`${folder}/London - ${label} - ${suffix.slice(0, 16)}.pdf`);
+    const pdf = await renderReportPdf({ subject, text });
     const token = await this.#token();
     const data = await fetchJson(this.fetchImpl, 'https://content.dropboxapi.com/2/files/upload', {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/octet-stream',
         'Dropbox-API-Arg': JSON.stringify({ path, mode: 'overwrite', autorename: false, mute: true }).replace(/[\u007f-\uffff]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`) },
-      body: Buffer.from(contents, 'utf8'),
+      body: pdf,
     }, 30000);
     if (!data?.id || !data?.path_display) throw new Error('Dropbox did not confirm the saved report.');
     return { id: data.id, path: data.path_display };

@@ -130,7 +130,9 @@ test('generated reports stay in London Work, retain changed versions and retry i
     const arg = JSON.parse(options.headers['Dropbox-API-Arg']);
     assert.ok(arg.path.startsWith('/LONDON - ACCESS/London Work/London - '));
     assert.equal(arg.autorename, false);
-    assert.match(options.body.toString(), /Findings/);
+    assert.equal(options.body.subarray(0, 5).toString(), '%PDF-');
+    assert.match(options.body.toString(), /%%EOF/);
+    assert.ok(arg.path.endsWith('.pdf'));
     uploaded.push(arg.path);
     return Response.json({ id: 'report-id', path_display: arg.path });
   } });
