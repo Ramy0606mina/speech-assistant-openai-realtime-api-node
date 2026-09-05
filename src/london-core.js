@@ -47,7 +47,7 @@ export class LondonCore {
     const actualSender = String(full.sender?.emailAddress?.address || sender).trim().toLowerCase();
     if (principal && sender === principal && actualSender === principal) {
       const attachments = full.hasAttachments ? await this.graph.getLondonAttachments(summary.id) : [];
-      const analysis = await this.openai.analyzeDelegatedEmail(full, attachments);
+      const analysis = await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox });
       const text = String(analysis.text || '').trim();
       if (!text) throw new Error('London produced an empty delegated-task result.');
 

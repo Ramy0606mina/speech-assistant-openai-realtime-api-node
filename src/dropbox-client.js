@@ -16,10 +16,14 @@ export class DropboxClient {
 
   resolvePath(relativeOrAbsolute = '') {
     const candidate = normalizeDropboxPath(relativeOrAbsolute || this.rootPath);
+    if (candidate.split('/').some(part => part === '..' || part === '.') || /[\u0000-\u001f]/.test(candidate)) {
+      throw new Error('Dropbox path escapes configured London root.');
+    }
     const rootLower = this.rootPath.toLowerCase();
     const candidateLower = candidate.toLowerCase();
     if (candidateLower === rootLower || candidateLower.startsWith(`${rootLower}/`)) return candidate;
     if (candidate === '/') return this.rootPath;
+    if (String(relativeOrAbsolute).startsWith('/')) throw new Error('Dropbox path is outside configured London root.');
     const joined = normalizeDropboxPath(`${this.rootPath}/${String(relativeOrAbsolute || '').replace(/^\/+/, '')}`);
     if (!joined.toLowerCase().startsWith(`${rootLower}/`) && joined.toLowerCase() !== rootLower) {
       throw new Error('Dropbox path escapes configured London root.');
@@ -49,6 +53,35 @@ export class DropboxClient {
       options: { path: resolved, max_results: 50, filename_only: false },
     });
     return data?.matches || [];
+  }
+
+  async readFile(path, maxBytes = 20 * 1024 * 1024) {
+    const resolved = this.resolvePath(path);
+    const filename = resolved.split('/').at(-1);
+    if (!/\.(pdf|docx?|xlsx?|pptx?|txt|csv|md|rtf)$/i.test(filename)) throw new Error('Unsupported Dropbox document type.');
+    if (!this.accessToken) throw new Error('Dropbox runtime credentials are missing.');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    try {
+      const response = await this.fetchImpl('https://content.dropboxapi.com/2/files/download', {
+        method: 'POST', signal: controller.signal,
+        headers: { Authorization: `Bearer ${this.accessToken}`, 'Dropbox-API-Arg': JSON.stringify({ path: resolved }).replace(/[\u007f-\uffff]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`) },
+      });
+      if (!response.ok) throw new Error(`Dropbox download failed (HTTP ${response.status}).`);
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of response.body) {
+        size += chunk.length;
+        if (size > maxBytes) { controller.abort(); throw new Error('Dropbox documents exceed the 20 MB task limit.'); }
+        chunks.push(Buffer.from(chunk));
+      }
+      const bytes = Buffer.concat(chunks);
+      if (!bytes.length) throw new Error('Dropbox returned an empty document.');
+      return { path: resolved, filename, size, part: {
+        type: 'input_file', filename,
+        file_data: `data:${filename.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream'};base64,${bytes.toString('base64')}`,
+      } };
+    } finally { clearTimeout(timer); }
   }
 }
 
