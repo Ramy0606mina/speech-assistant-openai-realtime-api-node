@@ -83,10 +83,38 @@ export class MicrosoftGraphClient {
     if (!messageId) throw new Error('messageId is required.');
     const token = await this.#getToken(this.readCreds, this.readToken);
     const url = new URL(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.londonMailbox)}/messages/${encodeURIComponent(messageId)}`);
-    url.searchParams.set('$select', 'id,internetMessageId,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,body,bodyPreview,isRead,hasAttachments');
+    url.searchParams.set('$select', 'id,internetMessageId,conversationId,subject,from,sender,toRecipients,ccRecipients,receivedDateTime,body,bodyPreview,isRead,hasAttachments');
     return fetchJson(this.fetchImpl, url, {
       headers: { Authorization: `Bearer ${token}`, Prefer: 'outlook.body-content-type="text"' },
     });
+  }
+
+  async getLondonAttachments(messageId) {
+    const token = await this.#getToken(this.readCreds, this.readToken);
+    let url = new URL(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.londonMailbox)}/messages/${encodeURIComponent(messageId)}/attachments`);
+    const parts = [];
+    let total = 0;
+    let count = 0;
+    while (url) {
+      if (url.origin !== 'https://graph.microsoft.com') throw new Error('Invalid attachment pagination URL.');
+      const data = await fetchJson(this.fetchImpl, url, { headers: { Authorization: `Bearer ${token}` } });
+      for (const item of data.value || []) {
+        if (item.isInline) continue;
+        if (++count > 20) throw new Error('Too many attachments; maximum is 20.');
+        const name = String(item.name || 'attachment');
+        const supported = /\.(pdf|docx?|xlsx?|pptx?|txt|csv|md|rtf)$/i.test(name);
+        if (item['@odata.type'] !== '#microsoft.graph.fileAttachment' || !supported) {
+          parts.push({ type: 'input_text', text: `Attachment not analyzed (unsupported type): ${name}` });
+          continue;
+        }
+        if (!item.contentBytes) throw new Error(`Attachment content unavailable: ${name}`);
+        total += Buffer.from(item.contentBytes, 'base64').length;
+        if (total > 20 * 1024 * 1024) throw new Error('Attachments exceed the 20 MB analysis limit.');
+        parts.push({ type: 'input_file', filename: name, file_data: `data:${item.contentType || 'application/octet-stream'};base64,${item.contentBytes}` });
+      }
+      url = data['@odata.nextLink'] ? new URL(data['@odata.nextLink']) : null;
+    }
+    return parts;
   }
 
   async listPrincipalCalendar({ startIso, endIso, limit = 20 } = {}) {
@@ -117,7 +145,11 @@ export class MicrosoftGraphClient {
   }
 
   async sendMail({ to, subject, body, cc = [] }) {
-    if (!to) throw new Error('Recipient is required.');
+    const addresses = (Array.isArray(to) ? to : [to]);
+    const copies = (Array.isArray(cc) ? cc : [cc]).filter(Boolean);
+    if (!this.principalMailbox || !addresses.length || addresses.some(address => normalizeEmail(address) !== this.principalMailbox) || copies.some(address => normalizeEmail(address) !== this.principalMailbox)) {
+      throw new Error('Automatic email is restricted to the configured principal; other recipients are draft-only.');
+    }
     const token = await this.#getToken(this.actionCreds, this.actionToken);
     const recipients = (Array.isArray(to) ? to : [to]).filter(Boolean).map((address) => ({ emailAddress: { address } }));
     const ccRecipients = (Array.isArray(cc) ? cc : [cc]).filter(Boolean).map((address) => ({ emailAddress: { address } }));
