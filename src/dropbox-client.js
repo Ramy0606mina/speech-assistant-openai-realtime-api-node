@@ -1,4 +1,5 @@
 import { fetchJson } from './http.js';
+import { createHash } from 'node:crypto';
 
 function normalizeDropboxPath(value) {
   let path = String(value || '').trim().replace(/\\/g, '/');
@@ -8,13 +9,14 @@ function normalizeDropboxPath(value) {
 }
 
 export class DropboxClient {
-  constructor({ accessToken, refreshToken, appKey, appSecret, rootPath = '/LONDON - ACCESS', fetchImpl = fetch }) {
+  constructor({ accessToken, refreshToken, appKey, appSecret, saveReports = false, rootPath = '/LONDON - ACCESS', fetchImpl = fetch }) {
     this.accessToken = accessToken;
     this.refreshToken = refreshToken;
     this.appKey = appKey;
     this.appSecret = appSecret;
     this.tokenExpiresAt = 0;
     this.refreshInFlight = null;
+    this.saveReports = saveReports;
     this.rootPath = normalizeDropboxPath(rootPath);
     this.fetchImpl = fetchImpl;
   }
@@ -116,6 +118,31 @@ export class DropboxClient {
         file_data: `data:${filename.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream'};base64,${bytes.toString('base64')}`,
       } };
     } finally { clearTimeout(timer); }
+  }
+
+  async saveReport({ taskKey, subject, text }) {
+    if (!this.saveReports) throw new Error('Dropbox report saving is not enabled.');
+    if (!taskKey || !String(text || '').trim()) throw new Error('Report task and content are required.');
+    const folder = this.resolvePath('London Work');
+    try {
+      await this.#rpc('files/create_folder_v2', { path: folder, autorename: false });
+    } catch (error) {
+      if (error.status !== 409 || !String(error.data?.error_summary || '').startsWith('path/conflict/folder')) throw error;
+    }
+    // Content-addressed output names preserve prior reports and source documents.
+    const contents = `# ${String(subject || 'London report').replace(/[\r\n]+/g, ' ')}\n\n${text}\n`;
+    const suffix = createHash('sha256').update(`${taskKey}\n${contents}`).digest('hex');
+    const label = String(subject || 'Report').replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 60) || 'Report';
+    const path = this.resolvePath(`${folder}/London - ${label} - ${suffix}.md`);
+    const token = await this.#token();
+    const data = await fetchJson(this.fetchImpl, 'https://content.dropboxapi.com/2/files/upload', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/octet-stream',
+        'Dropbox-API-Arg': JSON.stringify({ path, mode: 'overwrite', autorename: false, mute: true }).replace(/[\u007f-\uffff]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`) },
+      body: Buffer.from(contents, 'utf8'),
+    }, 30000);
+    if (!data?.id || !data?.path_display) throw new Error('Dropbox did not confirm the saved report.');
+    return { id: data.id, path: data.path_display };
   }
 }
 

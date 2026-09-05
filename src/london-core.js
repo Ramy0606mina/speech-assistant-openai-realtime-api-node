@@ -50,16 +50,19 @@ export class LondonCore {
       const analysis = await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox });
       const text = String(analysis.text || '').trim();
       if (!text) throw new Error('London produced an empty delegated-task result.');
+      const report = this.dropbox?.saveReports
+        ? await this.dropbox.saveReport({ taskKey: key, subject: full.subject, text })
+        : null;
 
       // Persist before dispatch: an interrupted/ambiguous send must not be retried blindly.
       this.state.markMessage(key, { sender, result: 'delivery-pending-review' });
       await this.graph.sendMail({
         to: principal,
         subject: completionSubject(full.subject),
-        body: text,
+        body: report ? `${text}\n\nSaved in Dropbox: ${report.path}` : text,
       });
 
-      result = { type: 'delegated-task', sender, analysis: text, completionSent: true };
+      result = { type: 'delegated-task', sender, analysis: text, completionSent: true, reportPath: report?.path || null };
     } else {
       const classification = await this.openai.classifyInboundEmail(full);
       result = { type: 'inbound-email', sender, classification: classification.text.trim().toUpperCase() };
