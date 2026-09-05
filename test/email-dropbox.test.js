@@ -69,3 +69,38 @@ test('Dropbox stream enforces byte limit and rejects failed downloads', async ()
   dbx.fetchImpl = async () => new Response('', { status: 401 });
   await assert.rejects(dbx.readFile('test.pdf'), /HTTP 401/);
 });
+
+test('Dropbox renews credentials once for concurrent reads and retries rejected token once', async () => {
+  let renewals = 0;
+  let reads = 0;
+  const dbx = new DropboxClient({ refreshToken: 'refresh-test', appKey: 'app-test', appSecret: 'secret-test', fetchImpl: async (url, options) => {
+    if (String(url).endsWith('/oauth2/token')) {
+      renewals++;
+      const form = new URLSearchParams(options.body);
+      assert.equal(form.get('grant_type'), 'refresh_token');
+      assert.equal(form.get('refresh_token'), 'refresh-test');
+      return Response.json({ access_token: `renewed-${renewals}`, expires_in: 14400 });
+    }
+    reads++;
+    assert.match(options.headers.Authorization, /^Bearer renewed-/);
+    return Response.json({ entries: [] });
+  } });
+  await Promise.all([dbx.listFolder(), dbx.listFolder()]);
+  assert.equal(renewals, 1);
+  assert.equal(reads, 2);
+  let rejected = false;
+  const previous = dbx.fetchImpl;
+  dbx.fetchImpl = async (url, options) => {
+    if (!String(url).endsWith('/oauth2/token') && !rejected) { rejected = true; return Response.json({ error: 'expired' }, { status: 401 }); }
+    return previous(url, options);
+  };
+  await dbx.listFolder();
+  assert.equal(renewals, 2);
+});
+
+test('kitchen-sized PDF is accepted by the document limit', async () => {
+  const bytes = new Uint8Array(29147040);
+  const dbx = new DropboxClient({ accessToken: 'test', fetchImpl: async () => new Response(bytes) });
+  const file = await dbx.readFile('kitchen.pdf');
+  assert.equal(file.size, 29147040);
+});
