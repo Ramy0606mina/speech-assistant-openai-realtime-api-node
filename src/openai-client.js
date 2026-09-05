@@ -83,8 +83,8 @@ export class OpenAIClient {
           if (call.name === 'search_dropbox') output = (await dropbox.search(String(args.query || ''))).map(entrySummary);
           else if (call.name === 'list_dropbox') output = (await dropbox.listFolder(String(args.path || ''))).slice(0, 100).map(entrySummary);
           else if (call.name === 'read_dropbox_file') {
-            if (++reads > 6 || bytes >= 20 * 1024 * 1024) throw new Error('Document analysis limit reached for this task.');
-            const file = await dropbox.readFile(String(args.path || ''), 20 * 1024 * 1024 - bytes);
+            if (++reads > 6 || bytes >= 40 * 1024 * 1024) throw new Error('Document analysis limit reached for this task.');
+            const file = await dropbox.readFile(String(args.path || ''), 40 * 1024 * 1024 - bytes);
             bytes += file.size;
             document = file.part;
             output = { read: true, path: file.path, filename: file.filename, documentInputFollows: true };
