@@ -27,6 +27,7 @@ export function loadConfig(env = process.env) {
       refreshToken: read(env, 'DROPBOX_REFRESH_TOKEN'),
       appKey: read(env, 'DROPBOX_APP_KEY'),
       appSecret: read(env, 'DROPBOX_APP_SECRET'),
+      saveReports: read(env, 'DROPBOX_SAVE_REPORTS', 'false').toLowerCase() === 'true',
       rootPath: read(env, 'DROPBOX_ROOT_PATH', '/LONDON - ACCESS') || '/LONDON - ACCESS',
     },
     voice: {
@@ -61,6 +62,7 @@ export function configurationStatus(config) {
     ),
     dropboxConfigured: Boolean((config.dropbox.accessToken || (config.dropbox.refreshToken && config.dropbox.appKey)) && config.dropbox.rootPath),
     dropboxRefreshConfigured: Boolean(config.dropbox.refreshToken && config.dropbox.appKey),
+    dropboxReportSavingEnabled: Boolean(config.dropbox.saveReports),
     voiceConfigured: Boolean(config.openai.apiKey && config.voice.principalPhone),
     voiceModel: config.voice.model,
     voiceName: config.voice.voice,

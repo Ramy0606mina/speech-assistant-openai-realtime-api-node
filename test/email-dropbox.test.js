@@ -104,3 +104,41 @@ test('kitchen-sized PDF is accepted by the document limit', async () => {
   const file = await dbx.readFile('kitchen.pdf');
   assert.equal(file.size, 29147040);
 });
+
+test('report is saved before owner email and save failure does not claim completion', async () => {
+  const events = [];
+  const core = new LondonCore({ state: new StateStore(), graph: {
+    principalMailbox: 'owner@example.com', readMailbox: 'london@example.com',
+    getLondonMessage: async () => ({ from: { emailAddress: { address: 'owner@example.com' } }, subject: 'Compare plans' }),
+    sendMail: async mail => { events.push('email'); assert.match(mail.body, /Saved in Dropbox:/); },
+  }, openai: { analyzeDelegatedEmail: async () => ({ text: 'Comparison findings.' }) }, dropbox: {
+    saveReports: true,
+    saveReport: async report => { events.push('save'); assert.equal(report.text, 'Comparison findings.'); return { path: '/LONDON - ACCESS/London Work/report.md' }; },
+  } });
+  await core.processMessage({ id: 'save-test' });
+  assert.deepEqual(events, ['save', 'email']);
+  core.dropbox.saveReport = async () => { throw new Error('Storage unavailable'); };
+  await assert.rejects(core.processMessage({ id: 'save-failed' }), /Storage unavailable/);
+  assert.equal(core.state.hasMessage('save-failed'), false);
+  assert.deepEqual(events, ['save', 'email']);
+});
+
+test('generated reports stay in London Work, retain changed versions and retry identical output safely', async () => {
+  const uploaded = [];
+  const dbx = new DropboxClient({ accessToken: 'test', saveReports: true, fetchImpl: async (url, options) => {
+    if (String(url).endsWith('create_folder_v2')) return Response.json({ error_summary: 'path/conflict/folder/...' }, { status: 409 });
+    const arg = JSON.parse(options.headers['Dropbox-API-Arg']);
+    assert.ok(arg.path.startsWith('/LONDON - ACCESS/London Work/London - '));
+    assert.equal(arg.autorename, false);
+    assert.match(options.body.toString(), /Findings/);
+    uploaded.push(arg.path);
+    return Response.json({ id: 'report-id', path_display: arg.path });
+  } });
+  const report = { taskKey: 'one', subject: '../../source.pdf', text: 'Findings' };
+  await dbx.saveReport(report);
+  await dbx.saveReport(report);
+  await dbx.saveReport({ ...report, text: 'Findings revised' });
+  assert.equal(uploaded[0], uploaded[1]);
+  assert.notEqual(uploaded[0], uploaded[2]);
+  assert.ok(uploaded.every(path => !path.includes('..')));
+});
