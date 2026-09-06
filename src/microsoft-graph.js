@@ -13,6 +13,10 @@ function htmlEscape(value) {
   return String(value||'').replace(/[&<>"']/g,char=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
 }
 
+function emailBodyHtml(value) {
+  return String(value||'').replace(/\r\n?/g,'\n').trim().split(/\n\s*\n/).map(block=>`<p>${block.split('\n').map(htmlEscape).join('<br>')}</p>`).join('');
+}
+
 function verifiedTeamsJoinUrl(value) {
   try{const url=new URL(String(value||''));return url.protocol==='https:'&&(url.hostname==='teams.microsoft.com'||url.hostname.endsWith('.teams.microsoft.com'))?url.href:'';}catch{return '';}
 }
@@ -296,11 +300,11 @@ export class MicrosoftGraphClient {
     if(messageId) {
       const source=await this.getVoiceMessage(mailbox,messageId);
       if(source.isDraft)throw new Error('Choose a received message to reply to.');
-      result=await this.voiceRequest(mailbox,`/messages/${encodeURIComponent(messageId)}/createReply`,{method:'POST',body:JSON.stringify({comment:body})});
+      result=await this.voiceRequest(mailbox,`/messages/${encodeURIComponent(messageId)}/createReply`,{method:'POST',body:JSON.stringify({message:{body:{contentType:'HTML',content:emailBodyHtml(body)}}})});
     } else {
       if(typeof subject!=='string'||!subject.trim()||subject.length>250)throw new Error('A draft subject is required.');
       if(!Array.isArray(to)||!to.length||to.length>10||to.some(v=>typeof v!=='string'||v.length>254||!/^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/.test(v)))throw new Error('Provide explicit recipient email addresses; names must not be guessed.');
-      result=await this.voiceRequest(mailbox,'/messages',{method:'POST',body:JSON.stringify({subject,body:{contentType:'Text',content:body},toRecipients:to.map(address=>({emailAddress:{address}}))})});
+      result=await this.voiceRequest(mailbox,'/messages',{method:'POST',body:JSON.stringify({subject,body:{contentType:'HTML',content:emailBodyHtml(body)},toRecipients:to.map(address=>({emailAddress:{address}}))})});
     }
     if(!result?.id||result.isDraft!==true)throw new Error('Microsoft did not confirm the saved draft. Check Drafts before retrying.');
     return {id:result.id,subject:result.subject,isDraft:true,mailbox:this.voiceMailbox(mailbox),folder:'Drafts',sent:false};
