@@ -59,6 +59,47 @@ export class MicrosoftGraphClient {
   get readMailbox() { return normalizeEmail(this.londonMailbox); }
   get principalMailbox() { return normalizeEmail(this.ramyMailbox); }
 
+  voiceMailbox(choice = 'principal') {
+    const mailbox=choice==='principal' ? this.principalMailbox : choice==='london' ? this.readMailbox : '';
+    if(!mailbox)throw new Error('Choose a connected mailbox: principal or london.');
+    return mailbox;
+  }
+
+  async voiceRequest(mailbox,path,options={}) {
+    const owner=this.voiceMailbox(mailbox);
+    const token=await this.#getToken(this.actionCreds,this.actionToken);
+    return fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(owner)}${path}`,{
+      ...options,headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json',Prefer:'IdType="ImmutableId", outlook.body-content-type="text"'},
+    });
+  }
+
+  async listVoiceMessages(mailbox='principal',folder='inbox',limit=10) {
+    if(!['inbox','drafts'].includes(folder))throw new Error('Unsupported mail folder.');
+    const data=await this.voiceRequest(mailbox,`/mailFolders/${folder}/messages?$top=${clampLimit(limit)}&$orderby=lastModifiedDateTime desc&$select=id,subject,from,toRecipients,bodyPreview,isDraft,receivedDateTime,hasAttachments`);
+    return data?.value||[];
+  }
+
+  async getVoiceMessage(mailbox,id) {
+    if(typeof id!=='string'||!id||id.length>2000)throw new Error('A message selected from the mailbox is required.');
+    return this.voiceRequest(mailbox,`/messages/${encodeURIComponent(id)}?$select=id,subject,from,replyTo,toRecipients,ccRecipients,body,isDraft,hasAttachments`);
+  }
+
+  async createVoiceDraft({mailbox='principal',to=[],subject,body,messageId}) {
+    if(typeof body!=='string'||!body.trim()||body.length>20000)throw new Error('A draft body of at most 20,000 characters is required.');
+    let result;
+    if(messageId) {
+      const source=await this.getVoiceMessage(mailbox,messageId);
+      if(source.isDraft)throw new Error('Choose a received message to reply to.');
+      result=await this.voiceRequest(mailbox,`/messages/${encodeURIComponent(messageId)}/createReply`,{method:'POST',body:JSON.stringify({comment:body})});
+    } else {
+      if(typeof subject!=='string'||!subject.trim()||subject.length>250)throw new Error('A draft subject is required.');
+      if(!Array.isArray(to)||!to.length||to.length>10||to.some(v=>typeof v!=='string'||v.length>254||!/^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/.test(v)))throw new Error('Provide explicit recipient email addresses; names must not be guessed.');
+      result=await this.voiceRequest(mailbox,'/messages',{method:'POST',body:JSON.stringify({subject,body:{contentType:'Text',content:body},toRecipients:to.map(address=>({emailAddress:{address}}))})});
+    }
+    if(!result?.id||result.isDraft!==true)throw new Error('Microsoft did not confirm the saved draft. Check Drafts before retrying.');
+    return {id:result.id,subject:result.subject,isDraft:true,mailbox:this.voiceMailbox(mailbox),folder:'Drafts',sent:false};
+  }
+
   async #listInbox(mailbox, limit = 10) {
     if (!mailbox) throw new Error('Mailbox is not configured.');
     const token = await this.#getToken(this.readCreds, this.readToken);

@@ -41,6 +41,8 @@ async function safeMorningBrief() {
 registerVoiceRoutes(app, {
   openAiApiKey: config.openai.apiKey,
   principalPhone: config.voice.principalPhone,
+  twilioAuthToken: process.env.TWILIO_AUTH_TOKEN,
+  publicUrl: process.env.RENDER_EXTERNAL_URL,
   model: config.voice.model,
   voice: config.voice.voice,
   graph,
