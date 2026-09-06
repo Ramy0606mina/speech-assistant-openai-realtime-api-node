@@ -219,6 +219,11 @@ function simplifyDropboxEntry(entry) {
   };
 }
 
+function explicitlyOnlineMeeting(args,title) {
+  if(args.online_meeting===true)return true;
+  return /\b(?:teams|virtual|online|video)\b/i.test([title,args.location,args.body].map(value=>String(value||'')).join(' '));
+}
+
 export async function runVoiceTool(name, args, { graph, dropbox, readMessages = new Set(), draftRequests = new Set(), calendarEvents = new Map(), meetingProposals = new Map(), meetingRequests = new Set(), cancellationProposals = new Map(), cancellationRequests = new Set(), callKey = '' }) {
   if (name === 'check_email') {
     if (!graph) throw new Error('Microsoft Graph is not connected to the voice gateway.');
@@ -279,7 +284,7 @@ export async function runVoiceTool(name, args, { graph, dropbox, readMessages = 
     if(String(args.body||'').length>4000||String(args.location||'').length>300)throw new Error('Meeting notes or location are too long.');
     if(meetingProposals.size>=10)throw new Error('Ten meeting proposals have been prepared on this call; start a new call after reviewing them.');
     const proposalId=randomUUID();const end=new Date(start.getTime()+duration*60000);
-    const proposal={proposalId,title,startIso:String(args.start_iso),endIso:end.toISOString(),durationMinutes:duration,timezone,attendees,body:String(args.body||''),location:String(args.location||''),onlineMeeting:args.online_meeting===true};
+    const proposal={proposalId,title,startIso:String(args.start_iso),endIso:end.toISOString(),durationMinutes:duration,timezone,attendees,body:String(args.body||''),location:String(args.location||''),onlineMeeting:explicitlyOnlineMeeting(args,title)};
     const conflicts=await graph.listPrincipalCalendar({startIso:proposal.startIso,endIso:proposal.endIso});
     meetingProposals.set(proposalId,proposal);
     const preview=await graph.previewVoiceMeeting?.(proposal);
