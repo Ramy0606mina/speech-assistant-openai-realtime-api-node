@@ -22,3 +22,13 @@ test('model prepares a task without changing calendar while reasoning',async()=>
  const r=await ai.analyzeDelegatedEmail({body:{content:'Create follow-up on September 7'}},[],{graph:{createFollowUp:async()=>created++}});
  assert.equal(created,0);assert.equal(r.followUps.length,1);assert.equal(r.followUps[0].date,'2026-09-07');
 });
+
+test('calendar reads use the action app that owns calendar access',async()=>{
+ let identity;
+ const g=new MicrosoftGraphClient({readTenantId:'test',readClientId:'mail-reader',readClientSecret:'test',actionTenantId:'test',actionClientId:'calendar-actions',actionClientSecret:'test',ramyMailbox:'owner@example.com',fetchImpl:async(url,o)=>{
+  if(String(url).includes('oauth2')){identity=new URLSearchParams(o.body).get('client_id');return Response.json({access_token:identity,expires_in:3600});}
+  assert.equal(o.headers.Authorization,'Bearer calendar-actions');return Response.json({value:[]});
+ }});
+ assert.deepEqual(await g.listPrincipalCalendar({startIso:'2026-09-07T00:00:00Z',endIso:'2026-09-08T00:00:00Z'}),[]);
+ assert.equal(identity,'calendar-actions');
+});
