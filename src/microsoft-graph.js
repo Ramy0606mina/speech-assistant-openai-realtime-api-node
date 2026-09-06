@@ -346,7 +346,7 @@ export class MicrosoftGraphClient {
     return this.#listInbox(this.ramyMailbox, clampLimit(limit, 5, 25));
   }
 
-  async listFollowUps() {
+  async listFollowUps({includeCompleted=false}={}) {
     const token=await this.#getToken(this.actionCreds,this.actionToken);
     const base=`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}`;
     const headers={Authorization:`Bearer ${token}`,Prefer:'outlook.body-content-type="text"'};
@@ -366,12 +366,35 @@ export class MicrosoftGraphClient {
         if(!content.trim().startsWith('LONDON_ACTION_V1'))continue;
         const start=content.indexOf('{');const end=content.lastIndexOf('}');
         let action;try{action=JSON.parse(content.slice(start,end+1));}catch{throw new Error('An action record could not be read.');}
-        if(['CLOSED','COMPLETED','CANCELLED','DONE'].includes(String(action.status).toUpperCase()))continue;
-        actions.push({title:action.title,status:action.status,nextFollowUp:action.nextFollowUp,priority:action.priority,nextAction:action.nextAction});
+        const status=String(action.status).toUpperCase();
+        if(['CLOSED','CANCELLED','DONE'].includes(status))continue;
+        if(status==='COMPLETED'&&(!includeCompleted||action.completionReportedAt))continue;
+        actions.push({id:event.id,title:action.title,status:action.status,nextFollowUp:action.nextFollowUp,priority:action.priority,nextAction:action.nextAction,notes:action.notes,completionReportedAt:action.completionReportedAt||null});
       }
       next=page['@odata.nextLink']?new URL(page['@odata.nextLink']):null;
     }
     return actions;
+  }
+
+  async updateFollowUp({id,status,nextFollowUp,notes=''}) {
+    const eventId=String(id||'').trim();const normalized=String(status||'').trim().toUpperCase();
+    if(!eventId||!['ACTIVE','PENDING','WAITING','DEFERRED','COMPLETED','CANCELLED'].includes(normalized))throw new Error('A selected action and valid status are required.');
+    const token=await this.#getToken(this.actionCreds,this.actionToken);const base=`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}`;const headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json',Prefer:'outlook.body-content-type="text"'};
+    const calendars=await fetchJson(this.fetchImpl,`${base}/calendars?$select=id,name,owner&$top=100`,{headers});const matches=(calendars.value||[]).filter(c=>c.name==='London Action Register'&&normalizeEmail(c.owner?.address)===this.principalMailbox);if(matches.length!==1)throw new Error('London Action Register unavailable.');
+    const url=`${base}/calendars/${encodeURIComponent(matches[0].id)}/events/${encodeURIComponent(eventId)}`;const event=await fetchJson(this.fetchImpl,`${url}?$select=id,subject,body`,{headers});const content=String(event.body?.content||'');if(!content.startsWith('LONDON_ACTION_V1'))throw new Error('The selected item is not a London action.');
+    let action;try{action=JSON.parse(content.slice(content.indexOf('{'),content.lastIndexOf('}')+1));}catch{throw new Error('The selected action could not be read.');}
+    if(nextFollowUp){if(!/^\d{4}-\d{2}-\d{2}$/.test(nextFollowUp)||new Date(nextFollowUp).toISOString().slice(0,10)!==nextFollowUp)throw new Error('The new follow-up date is invalid.');action.nextFollowUp=nextFollowUp;}
+    action.status=normalized;action.updatedAt=new Date().toISOString();if(normalized==='COMPLETED'){action.completedAt=action.updatedAt;delete action.completionReportedAt;}if(notes)action.notes=`${String(action.notes||'')}\n${String(notes).slice(0,1000)}`.trim();
+    await fetchJson(this.fetchImpl,url,{method:'PATCH',headers,body:JSON.stringify({subject:`[${action.priority||'NORMAL'}] [${normalized}] ${action.title}`,body:{contentType:'text',content:`LONDON_ACTION_V1\n${JSON.stringify(action,null,2)}`}})});
+    return {id:eventId,title:action.title,status:normalized,nextFollowUp:action.nextFollowUp};
+  }
+
+  async markFollowUpsReported(ids,date) {
+    for(const id of ids){
+      const actions=await this.listFollowUps({includeCompleted:true});const found=actions.find(action=>action.id===id);if(!found||String(found.status).toUpperCase()!=='COMPLETED')continue;
+      await this.updateFollowUp({id,status:'COMPLETED',notes:`Completion shown in morning report ${date}.`});
+      const token=await this.#getToken(this.actionCreds,this.actionToken);const base=`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}`;const headers={Authorization:`Bearer ${token}`,'Content-Type':'application/json',Prefer:'outlook.body-content-type="text"'};const calendars=await fetchJson(this.fetchImpl,`${base}/calendars?$select=id,name,owner&$top=100`,{headers});const calendar=(calendars.value||[]).find(c=>c.name==='London Action Register'&&normalizeEmail(c.owner?.address)===this.principalMailbox);const url=`${base}/calendars/${encodeURIComponent(calendar.id)}/events/${encodeURIComponent(id)}`;const event=await fetchJson(this.fetchImpl,`${url}?$select=body`,{headers});const content=String(event.body?.content||'');const action=JSON.parse(content.slice(content.indexOf('{'),content.lastIndexOf('}')+1));action.completionReportedAt=date;await fetchJson(this.fetchImpl,url,{method:'PATCH',headers,body:JSON.stringify({body:{contentType:'text',content:`LONDON_ACTION_V1\n${JSON.stringify(action,null,2)}`}})});
+    }
   }
 
   async getLondonMessage(messageId) {
@@ -545,7 +568,7 @@ export class MicrosoftGraphClient {
     return { title:action.title,date,id:result.id,calendar:'London Action Register',reminder:reminder ? 'Outlook alert at 9 a.m. Eastern on the due date' : 'None' };
   }
 
-  async sendMail({ to, subject, body, cc = [] }) {
+  async sendMail({ to, subject, body, cc = [], contentType = 'Text' }) {
     const addresses = (Array.isArray(to) ? to : [to]);
     const copies = (Array.isArray(cc) ? cc : [cc]).filter(Boolean);
     if (!this.principalMailbox || !addresses.length || addresses.some(address => normalizeEmail(address) !== this.principalMailbox) || copies.some(address => normalizeEmail(address) !== this.principalMailbox)) {
@@ -560,7 +583,7 @@ export class MicrosoftGraphClient {
       body: JSON.stringify({
         message: {
           subject: String(subject || '').trim() || '(no subject)',
-          body: { contentType: 'Text', content: String(body || '') },
+          body: { contentType: contentType === 'HTML' ? 'HTML' : 'Text', content: String(body || '') },
           toRecipients: recipients,
           ccRecipients,
         },
@@ -570,4 +593,3 @@ export class MicrosoftGraphClient {
     return { sent: true };
   }
 }
-

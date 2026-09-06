@@ -61,6 +61,16 @@ test('voice instructions require professional rewriting without changing materia
   assert.match(instructions,/professional business English/i);
   assert.match(instructions,/Never invent, omit, soften, or strengthen a material fact/i);
 });
+test('voice reads the Action Register before updating one exact status',async()=>{
+  let update;
+  const graph={listFollowUps:async()=>[{id:'action-1',title:'Review quote',status:'PENDING',nextFollowUp:'2026-09-08'}],updateFollowUp:async value=>(update=value,{...value,title:'Review quote'})};
+  const context={graph,actionRecords:new Map(),actionUpdates:new Set()};
+  await assert.rejects(()=>runVoiceTool('update_action_register',{action_id:'action-1',status:'COMPLETED',date:'2026-09-08'},context),/Read and select/);
+  const listed=await runVoiceTool('read_action_register',{include_completed:false},context);assert.equal(listed.actions.length,1);
+  const changed=await runVoiceTool('update_action_register',{action_id:'action-1',status:'COMPLETED',date:'2026-09-08'},context);
+  assert.equal(changed.updated,true);assert.equal(update.status,'COMPLETED');
+  await assert.rejects(()=>runVoiceTool('update_action_register',{action_id:'action-1',status:'COMPLETED',date:'2026-09-08'},context),/already attempted/);
+});
 test('Twilio signature rejects spoofed callers and altered fields',()=>{
   const request={method:'POST',url:'/incoming-call',body:{From:'+15145550000'},headers:{}};
   assert.equal(validTwilioRequest(request,'key','https://example.com'),false);
@@ -68,5 +78,4 @@ test('Twilio signature rejects spoofed callers and altered fields',()=>{
   assert.equal(validTwilioRequest(request,'key','https://example.com'),true);
   request.body.From='+15145550001';assert.equal(validTwilioRequest(request,'key','https://example.com'),false);
 });
-
 

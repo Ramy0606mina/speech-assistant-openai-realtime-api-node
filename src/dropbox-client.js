@@ -168,7 +168,7 @@ export class DropboxClient {
     }
   }
 
-  async saveReport({ taskKey, subject, text }) {
+  async saveReport({ taskKey, subject, text, reportData }) {
     if (!this.saveReports) throw new Error('Dropbox report saving is not enabled.');
     if (!taskKey || !String(text || '').trim()) throw new Error('Report task and content are required.');
     const folder = this.resolvePath('London Work');
@@ -182,7 +182,7 @@ export class DropboxClient {
     const suffix = createHash('sha256').update(`${taskKey}\n${contents}`).digest('hex');
     const label = String(subject || 'Report').replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 60) || 'Report';
     const path = this.resolvePath(`${folder}/London - ${label} - ${suffix.slice(0, 16)}.pdf`);
-    const pdf = await renderReportPdf({ subject, text });
+    const pdf = await renderReportPdf({ subject, text, reportData });
     const token = await this.#token();
     const data = await fetchJson(this.fetchImpl, 'https://content.dropboxapi.com/2/files/upload', {
       method: 'POST',
