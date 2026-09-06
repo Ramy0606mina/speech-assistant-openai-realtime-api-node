@@ -187,6 +187,21 @@ export class MicrosoftGraphClient {
     const token=await this.#getToken(this.actionCreds,this.actionToken);
     const base=`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(owner)}`;
     const collection=folder==='all' ? `${base}/messages` : `${base}/mailFolders/${folder}/messages`;
+    const indexed=new URL(collection);
+    indexed.searchParams.set('$search',`"${needle.replace(/["\\]/g,' ')}"`);
+    indexed.searchParams.set('$top','1000');
+    indexed.searchParams.set('$select','id,subject,from,toRecipients,bodyPreview,isDraft,receivedDateTime,sentDateTime,hasAttachments');
+    const indexedPage=await fetchJson(this.fetchImpl,indexed,{headers:{Authorization:`Bearer ${token}`,Prefer:'IdType="ImmutableId", outlook.body-content-type="text"'}});
+    if(!Array.isArray(indexedPage?.value))throw new Error('Indexed email search response was invalid.');
+    const indexedMatches=[];
+    for(const message of indexedPage.value){
+      const when=new Date(message.receivedDateTime||message.sentDateTime||0);
+      if(start&&when<start)continue;
+      if(end&&when>=end)continue;
+      const haystack=[message.from?.emailAddress?.name,message.from?.emailAddress?.address,message.subject,message.bodyPreview].map(v=>String(v||'').toLowerCase()).join('\n');
+      if(haystack.includes(needle)&&indexedMatches.length<maxResults)indexedMatches.push(message);
+    }
+    if(indexedMatches.length)return {messages:indexedMatches,scanned:indexedPage.value.length,complete:!indexedPage['@odata.nextLink'],indexed:true};
     const first=new URL(collection);
     first.searchParams.set('$top','50');
     first.searchParams.set('$select','id,subject,from,toRecipients,bodyPreview,isDraft,receivedDateTime,sentDateTime,hasAttachments');

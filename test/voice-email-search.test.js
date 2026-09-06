@@ -13,14 +13,21 @@ test('search pages beyond ten messages and finds an older sender',async()=>{
     return Response.json({value:[{id:'eve',subject:'Project update',from:{emailAddress:{name:'Eve Trotman',address:'eve@example.com'}},receivedDateTime:'2026-08-20T12:00:00Z',bodyPreview:'Update attached.'}]});
   });
   const result=await graph.searchVoiceMessages({query:'Eve Trotman'});
-  assert.equal(pages,2);assert.equal(result.scanned,51);assert.equal(result.complete,true);assert.equal(result.messages[0].id,'eve');
+  assert.equal(pages,2);assert.equal(result.scanned,1);assert.equal(result.complete,true);assert.equal(result.messages[0].id,'eve');
+});
+
+test('indexed email search returns an exact older match in one Microsoft request',async()=>{
+  let calls=0;
+  const graph=graphWith(url=>{calls++;assert.equal(url.searchParams.get('$search'),'"eve trotman"');return Response.json({value:[{id:'eve',subject:'Project update',from:{emailAddress:{name:'Eve Trotman',address:'eve@example.com'}},receivedDateTime:'2026-08-20T12:00:00Z'}]});});
+  const result=await graph.searchVoiceMessages({query:'Eve Trotman'});
+  assert.equal(calls,1);assert.equal(result.indexed,true);assert.equal(result.messages[0].id,'eve');
 });
 
 test('search reports incomplete rather than claiming absence at scan limit',async()=>{
   let pages=0;
   const graph=graphWith(url=>{pages++;url.searchParams.set('$skiptoken',String(pages));return Response.json({value:Array.from({length:50},(_,i)=>({id:`${pages}-${i}`,subject:'Other'})),'@odata.nextLink':url.href});});
   const result=await graph.searchVoiceMessages({query:'missing',maxScan:50});
-  assert.equal(result.messages.length,0);assert.equal(result.scanned,50);assert.equal(result.complete,false);assert.equal(pages,1);
+  assert.equal(result.messages.length,0);assert.equal(result.scanned,50);assert.equal(result.complete,false);assert.equal(pages,2);
 });
 
 test('voice exposes deep email search and forwards folder and dates',async()=>{
@@ -74,6 +81,7 @@ test('default sender search reaches a close voice transcription beyond one thous
   assert.equal(result.approximateMatch,true);
   assert.equal(result.suggestedSender,'Yves Trauttmann');
   assert.equal(result.messages[0].id,'yves');
-  assert.equal(result.scanned,1001);
+  assert.equal(result.scanned,951);
 });
+
 
