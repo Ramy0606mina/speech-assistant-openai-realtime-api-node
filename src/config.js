@@ -21,6 +21,7 @@ export function loadConfig(env = process.env) {
       actionClientSecret: read(env, 'ACTIONS_MS_CLIENT_SECRET', read(env, 'MS_CLIENT_SECRET')),
       londonMailbox: read(env, 'LONDON_MINACO_EMAIL', 'london@minaco.ca'),
       ramyMailbox: read(env, 'RAMY_MINACO_EMAIL'),
+      ramyUserId: read(env, 'RAMY_MINACO_USER_ID'),
     },
     dropbox: {
       accessToken: read(env, 'DROPBOX_ACCESS_TOKEN'),
@@ -69,3 +70,4 @@ export function configurationStatus(config) {
     stateFileConfigured: Boolean(config.runtime.stateFile),
   };
 }
+
