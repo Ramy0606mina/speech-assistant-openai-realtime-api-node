@@ -77,7 +77,35 @@ export class MicrosoftGraphClient {
 
   async listPrincipalInbox(limit = 5) {
     if (!this.ramyMailbox) throw new Error('RAMY_MINACO_EMAIL is not configured.');
-    return this.#listInbox(this.ramyMailbox, clampLimit(limit, 5, 10));
+    return this.#listInbox(this.ramyMailbox, clampLimit(limit, 5, 25));
+  }
+
+  async listFollowUps() {
+    const token=await this.#getToken(this.actionCreds,this.actionToken);
+    const base=`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}`;
+    const headers={Authorization:`Bearer ${token}`,Prefer:'outlook.body-content-type="text"'};
+    const calendars=await fetchJson(this.fetchImpl,`${base}/calendars?$select=id,name,owner&$top=100`,{headers});
+    const matches=(calendars.value||[]).filter(c=>c.name==='London Action Register' && normalizeEmail(c.owner?.address)===this.principalMailbox);
+    if(matches.length!==1)throw new Error('London Action Register unavailable.');
+    const first=new URL(`${base}/calendars/${encodeURIComponent(matches[0].id)}/events?$top=100&$select=id,subject,body,isCancelled`);
+    let next=first;const visited=new Set();const actions=[];
+    while(next){
+      if(next.origin!==first.origin || next.pathname!==first.pathname || visited.has(next.href) || visited.size>=100)throw new Error('Action register retrieval incomplete.');
+      visited.add(next.href);
+      const page=await fetchJson(this.fetchImpl,next,{headers});
+      if(!Array.isArray(page.value))throw new Error('Action register response invalid.');
+      for(const event of page.value){
+        if(event.isCancelled)continue;
+        const content=String(event.body?.content||'');
+        if(!content.trim().startsWith('LONDON_ACTION_V1'))continue;
+        const start=content.indexOf('{');const end=content.lastIndexOf('}');
+        let action;try{action=JSON.parse(content.slice(start,end+1));}catch{throw new Error('An action record could not be read.');}
+        if(['CLOSED','COMPLETED','CANCELLED','DONE'].includes(String(action.status).toUpperCase()))continue;
+        actions.push({title:action.title,status:action.status,nextFollowUp:action.nextFollowUp,priority:action.priority,nextAction:action.nextAction});
+      }
+      next=page['@odata.nextLink']?new URL(page['@odata.nextLink']):null;
+    }
+    return actions;
   }
 
   async getLondonMessage(messageId) {

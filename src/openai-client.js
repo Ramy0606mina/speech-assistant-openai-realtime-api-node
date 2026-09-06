@@ -1,4 +1,5 @@
 import { fetchJson } from './http.js';
+import { gatherBrief } from './morning-brief.js';
 
 const dropboxTools = [
   ['search_dropbox', 'Search the existing shared Dropbox workspace by filename or topic. Try separate keywords if a combined query returns no matches.', { query: { type: 'string' } }],
@@ -88,7 +89,7 @@ export class OpenAIClient {
     let bytes = attachments.reduce((sum, part) => sum + (part.file_data ? Buffer.from(part.file_data.split(',')[1] || '', 'base64').length : 0), 0);
     let reads = 0;
     const followUps = [];
-    const tools = [...(dropbox ? dropboxTools : []), ...(graph ? [calendarTool] : []), ...(graph?.createFollowUp ? [followUpTool] : [])];
+    const tools = [...(dropbox ? dropboxTools : []), ...(graph ? [calendarTool] : []), ...(graph?.createFollowUp ? [followUpTool] : []), ...(graph?.listFollowUps ? [{type:'function',name:'read_executive_brief_sources',description:'Read live primary inbox, today calendar and open follow-up register for a morning executive report. Source limits and failures must be disclosed.',strict:true,parameters:{type:'object',properties:{},required:[],additionalProperties:false}}] : [])];
     for (let round = 0; round < 12; round++) {
       const response = await this.respond({ instructions, input, ...(tools.length ? { tools } : {}) });
       const calls = (response.raw?.output || []).filter(item => item.type === 'function_call');
@@ -99,7 +100,8 @@ export class OpenAIClient {
         let document;
         try {
           const args = JSON.parse(call.arguments);
-          if (call.name === 'prepare_follow_up' && graph?.createFollowUp) {
+          if (call.name === 'read_executive_brief_sources' && graph?.listFollowUps) output=await gatherBrief(graph);
+          else if (call.name === 'prepare_follow_up' && graph?.createFollowUp) {
             if (followUps.length >= 3) throw new Error('Maximum three follow-ups per request.');
             if (!String(args.title || '').trim() || String(args.title).length>180 || !/^\d{4}-\d{2}-\d{2}$/.test(args.date) || !Number.isFinite(Date.parse(args.date)) || new Date(args.date).toISOString().slice(0,10)!==args.date || String(args.notes).length>4000) throw new Error('Valid title, explicit date and short notes required.');
             if (typeof args.reminder !== 'boolean') throw new Error('Explicit reminder choice required.');

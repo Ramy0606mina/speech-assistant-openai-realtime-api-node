@@ -10,6 +10,7 @@ import { StateStore } from './src/state-store.js';
 import { DeliveryGuard } from './src/delivery-guard.js';
 import { LondonCore } from './src/london-core.js';
 import { registerVoiceRoutes } from './src/voice-gateway.js';
+import { MorningBrief } from './src/morning-brief.js';
 
 dotenv.config();
 const config = loadConfig();
@@ -25,6 +26,12 @@ const state = new StateStore(config.runtime.stateFile);
 const deliveryGuard = new DeliveryGuard(dropbox, graph.readMailbox);
 const london = new LondonCore({ graph, openai, dropbox, state, deliveryGuard, logger: app.log });
 let deliveryGuardReady = false;
+const morningBrief = new MorningBrief({graph,openai,dropbox,guard:deliveryGuard});
+const morningBriefEnabled = process.env.LONDON_MORNING_BRIEF_ENABLED !== 'false';
+async function safeMorningBrief() {
+  if (!morningBriefEnabled || !deliveryGuardReady) return;
+  try { await morningBrief.tick(); } catch(error) { app.log.error({err:error},'Morning executive report failed'); }
+}
 
 registerVoiceRoutes(app, {
   openAiApiKey: config.openai.apiKey,
@@ -62,6 +69,7 @@ app.get('/health', async () => ({
   pendingDeliveryReview: Object.values(state.state.processedMessages).filter(item => item.result === 'delivery-pending-review').length,
   durableDeliveryGuard: deliveryGuardReady,
   historicalRequestsHeld: Object.values(state.state.processedMessages).filter(item => item.result === 'historical-review').length,
+  morningBrief: {enabled:morningBriefEnabled,time:'07:30',timeZone:'America/Toronto',cadence:'daily',catchUpUntil:'12:00',lastOutcome:morningBrief.lastOutcome},
   ...configurationStatus(config),
   lastPollAt: state.state.lastPollAt,
   time: new Date().toISOString(),
@@ -90,3 +98,4 @@ await app.listen({ port, host: '0.0.0.0' });
 const pollTimer = setInterval(safePoll, config.runtime.pollIntervalMs);
 pollTimer.unref?.();
 setTimeout(safePoll, 1500).unref?.();
+setInterval(safeMorningBrief,60000).unref?.();
