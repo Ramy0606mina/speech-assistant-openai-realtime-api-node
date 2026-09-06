@@ -7,10 +7,25 @@ function client(handler){return new MicrosoftGraphClient({readTenantId:'t',readC
 
 test('Microsoft meeting includes attendee invitations and a stable transaction',async()=>{
   const calls=[];const graph=client((url,options)=>{calls.push({url,options});return Response.json({id:'event-1'});});
-  const result=await graph.createVoiceMeeting({title:'Project call',startIso:'2030-07-11T10:00:00-04:00',durationMinutes:30,timezone:'America/Toronto',attendees:['JACK@example.com'],body:'Discuss next steps.',location:'Microsoft Teams',transactionId:'12345678-1234-4123-8123-123456789abc'});
+  const result=await graph.createVoiceMeeting({title:'Project call',startIso:'2030-07-11T10:00:00-04:00',durationMinutes:30,timezone:'America/Toronto',attendees:['JACK@example.com'],body:'Discuss next steps.',location:'Office',transactionId:'12345678-1234-4123-8123-123456789abc'});
   assert.equal(result.invitationsSubmitted,true);assert.equal(calls.length,1);assert.match(calls[0].url,/owner%40example.com\/events$/);
   const body=JSON.parse(calls[0].options.body);assert.equal(body.attendees[0].emailAddress.address,'jack@example.com');assert.deepEqual(body.start,{dateTime:'2030-07-11T10:00:00',timeZone:'Eastern Standard Time'});assert.deepEqual(body.end,{dateTime:'2030-07-11T10:30:00',timeZone:'Eastern Standard Time'});assert.equal(body.transactionId,'12345678-1234-4123-8123-123456789abc');
+  assert.equal('isOnlineMeeting' in body,false);assert.equal('onlineMeetingProvider' in body,false);assert.equal(result.onlineMeeting,false);assert.equal(result.joinLinkCreated,false);
   assert.equal(result.timezone,'America/Toronto');assert.equal(result.microsoftTimeZone,'Eastern Standard Time');
+});
+
+test('Microsoft virtual meeting requests Teams and verifies the returned joining link without exposing it',async()=>{
+  const calls=[];const graph=client((url,options)=>{calls.push({url,options});return Response.json({id:'event-online',isOnlineMeeting:true,onlineMeetingProvider:'teamsForBusiness',onlineMeeting:{joinUrl:'https://teams.microsoft.com/meet/example'}});});
+  const result=await graph.createVoiceMeeting({title:'Virtual project call',startIso:'2030-07-11T10:00:00-04:00',durationMinutes:30,timezone:'America/Toronto',attendees:['person@example.com'],onlineMeeting:true,transactionId:'32345678-1234-4123-8123-123456789abc'});
+  const body=JSON.parse(calls[0].options.body);
+  assert.equal(body.isOnlineMeeting,true);assert.equal(body.onlineMeetingProvider,'teamsForBusiness');
+  assert.equal(result.onlineMeeting,true);assert.equal(result.onlineMeetingProvider,'teamsForBusiness');assert.equal(result.joinLinkCreated,true);assert.equal('joinUrl' in result,false);
+});
+
+test('Microsoft re-reads an online event when creation response omits joining information',async()=>{
+  let call=0;const graph=client((url,options)=>{call++;return call===1?Response.json({id:'event-online'}):Response.json({id:'event-online',isOnlineMeeting:true,onlineMeetingProvider:'teamsForBusiness',onlineMeeting:{joinUrl:'https://teams.microsoft.com/meet/example'}});});
+  const result=await graph.createVoiceMeeting({title:'Virtual project call',startIso:'2030-07-11T10:00:00-04:00',durationMinutes:30,timezone:'America/Toronto',attendees:['person@example.com'],onlineMeeting:true,transactionId:'42345678-1234-4123-8123-123456789abc'});
+  assert.equal(call,2);assert.equal(result.joinLinkCreated,true);
 });
 
 test('Toronto meetings keep ten a.m. through winter and summer daylight-saving offsets',async()=>{
@@ -32,8 +47,9 @@ test('meeting rejects an offset that disagrees with Toronto daylight saving and 
 test('meeting requires preparation then explicit confirmation before Microsoft write',async()=>{
   let writes=0;const graph={listPrincipalCalendar:async()=>[],createVoiceMeeting:async proposal=>{writes++;return {id:'event',attendees:proposal.attendees};}};
   const context={graph,dropbox:{createDeliveryRecord:async()=>true},meetingProposals:new Map(),meetingRequests:new Set(),callKey:'call'};
-  const prepared=await runVoiceTool('prepare_calendar_meeting',{title:'Call Jack',start_iso:'2030-09-11T10:00:00-04:00',timezone:'America/Toronto',duration_minutes:30,attendees:['jack@example.com']},context);
+  const prepared=await runVoiceTool('prepare_calendar_meeting',{title:'Call Jack',start_iso:'2030-09-11T10:00:00-04:00',timezone:'America/Toronto',duration_minutes:30,attendees:['jack@example.com'],online_meeting:true},context);
   assert.equal(prepared.created,false);assert.equal(prepared.requiresConfirmation,true);assert.equal(writes,0);
+  assert.equal(prepared.proposal.onlineMeeting,true);assert.equal(prepared.proposal.onlineMeetingProvider,'Microsoft Teams');
   await assert.rejects(()=>runVoiceTool('confirm_calendar_meeting',{proposal_id:prepared.proposal.proposalId,confirmed:false},context),/not explicitly confirmed/);
   assert.equal(writes,0);
   const created=await runVoiceTool('confirm_calendar_meeting',{proposal_id:prepared.proposal.proposalId,confirmed:true},context);
@@ -43,8 +59,8 @@ test('meeting requires preparation then explicit confirmation before Microsoft w
 test('meeting preparation reports conflicts and refuses guessed attendee names',async()=>{
   const graph={listPrincipalCalendar:async()=>[{id:'busy',subject:'Existing',showAs:'busy',start:{dateTime:'2030-09-11T14:00:00Z'},end:{dateTime:'2030-09-11T14:30:00Z'}}]};
   const context={graph,meetingProposals:new Map()};
-  await assert.rejects(()=>runVoiceTool('prepare_calendar_meeting',{title:'Call Jack',start_iso:'2030-09-11T10:00:00-04:00',timezone:'America/Toronto',duration_minutes:30,attendees:['Jack Rawdon']},context),/exact attendee/);
-  const result=await runVoiceTool('prepare_calendar_meeting',{title:'Call Jack',start_iso:'2030-09-11T10:00:00-04:00',timezone:'America/Toronto',duration_minutes:30,attendees:['jack@example.com']},context);
+  await assert.rejects(()=>runVoiceTool('prepare_calendar_meeting',{title:'Call Jack',start_iso:'2030-09-11T10:00:00-04:00',timezone:'America/Toronto',duration_minutes:30,attendees:['Jack Rawdon'],online_meeting:false},context),/exact attendee/);
+  const result=await runVoiceTool('prepare_calendar_meeting',{title:'Call Jack',start_iso:'2030-09-11T10:00:00-04:00',timezone:'America/Toronto',duration_minutes:30,attendees:['jack@example.com'],online_meeting:false},context);
   assert.equal(result.conflicts.length,1);assert.equal(result.conflicts[0].subject,'Existing');
 });
 
