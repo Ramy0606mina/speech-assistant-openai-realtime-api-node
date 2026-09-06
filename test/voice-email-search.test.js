@@ -42,3 +42,21 @@ test('search rejects a Microsoft paging link for another mailbox',async()=>{
   await assert.rejects(()=>graph.searchVoiceMessages({query:'Eve'}),/paging was invalid/);
 });
 
+test('search suggests a close sender name after voice transcription changes the spelling',async()=>{
+  const graph=graphWith(()=>Response.json({value:[
+    {id:'jack',subject:'Engagement Letter and Fee Structure',from:{emailAddress:{name:'Jack Rawdon',address:'jack@example.com'}},receivedDateTime:'2026-09-03T12:00:00Z'},
+    {id:'other',subject:'Routine update',from:{emailAddress:{name:'Jane Smith',address:'jane@example.com'}},receivedDateTime:'2026-09-04T12:00:00Z'},
+  ]}));
+  const result=await graph.searchVoiceMessages({query:'Jack Roden'});
+  assert.equal(result.approximateMatch,true);
+  assert.equal(result.suggestedSender,'Jack Rawdon');
+  assert.equal(result.messages[0].id,'jack');
+});
+
+test('voice reports an approximate sender so London asks for confirmation',async()=>{
+  const graph={searchVoiceMessages:async()=>({messages:[{id:'jack',subject:'Update',from:{emailAddress:{name:'Jack Rawdon'}}}],scanned:100,complete:true,approximateMatch:true,suggestedSender:'Jack Rawdon'})};
+  const result=await runVoiceTool('search_email',{query:'Jack Roden'},{graph});
+  assert.equal(result.approximateMatch,true);
+  assert.equal(result.suggestedSender,'Jack Rawdon');
+});
+

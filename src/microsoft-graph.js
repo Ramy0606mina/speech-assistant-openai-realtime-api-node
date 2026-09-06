@@ -9,6 +9,31 @@ function clampLimit(value, fallback = 10, max = 25) {
   return Math.min(max, Math.max(1, Number(value) || fallback));
 }
 
+function nameWords(value) {
+  return String(value||'').normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim().split(/\s+/).filter(Boolean);
+}
+
+function editDistance(a,b) {
+  const row=Array.from({length:b.length+1},(_,i)=>i);
+  for(let i=1;i<=a.length;i++){
+    let diagonal=row[0];row[0]=i;
+    for(let j=1;j<=b.length;j++){
+      const previous=row[j];
+      row[j]=Math.min(row[j]+1,row[j-1]+1,diagonal+(a[i-1]===b[j-1]?0:1));
+      diagonal=previous;
+    }
+  }
+  return row[b.length];
+}
+
+function approximatePersonScore(query,sender) {
+  const q=nameWords(query),s=nameWords(sender);
+  if(q.length<2||q.length>4||s.length<2)return 0;
+  const pairs=[[q[0],s[0]],[q[q.length-1],s[s.length-1]]];
+  const scores=pairs.map(([a,b])=>1-editDistance(a,b)/Math.max(a.length,b.length,1));
+  return scores[1]>=0.45 ? (scores[0]+scores[1])/2 : 0;
+}
+
 export class MicrosoftGraphClient {
   constructor({
     readTenantId,
@@ -99,6 +124,7 @@ export class MicrosoftGraphClient {
     first.searchParams.set('$orderby','receivedDateTime desc');
     let next=first,scanned=0;
     const matches=[];
+    const approximate=[];
     const visited=new Set();
     const ownerPath=owner.toLowerCase();
     const allowedPaths=folder==='all'
@@ -121,8 +147,19 @@ export class MicrosoftGraphClient {
         if(end&&when>=end)continue;
         const haystack=[message.from?.emailAddress?.name,message.from?.emailAddress?.address,message.subject,message.bodyPreview].map(v=>String(v||'').toLowerCase()).join('\n');
         if(haystack.includes(needle)&&matches.length<maxResults)matches.push(message);
+        else {
+          const sender=message.from?.emailAddress?.name||'';
+          const score=approximatePersonScore(query,sender);
+          if(score>=0.56)approximate.push({message,sender,score});
+        }
       }
       next=page['@odata.nextLink']?new URL(page['@odata.nextLink']):null;
+    }
+    if(!matches.length&&approximate.length){
+      approximate.sort((a,b)=>b.score-a.score||new Date(b.message.receivedDateTime||0)-new Date(a.message.receivedDateTime||0));
+      const suggestedSender=approximate[0].sender;
+      const selected=approximate.filter(item=>item.sender===suggestedSender).slice(0,maxResults).map(item=>item.message);
+      return {messages:selected,scanned,complete:!next,approximateMatch:true,suggestedSender};
     }
     return {messages:matches,scanned,complete:!next};
   }
