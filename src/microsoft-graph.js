@@ -133,19 +133,29 @@ export class MicrosoftGraphClient {
     url.searchParams.set('startDateTime', start.toISOString());
     url.searchParams.set('endDateTime', end.toISOString());
     url.searchParams.set('$top', String(clampLimit(limit, 20, 50)));
-    url.searchParams.set('$select', 'id,subject,start,end,location,organizer,isCancelled,isAllDay');
+    url.searchParams.set('$select', 'id,subject,start,end,location,organizer,isCancelled,isAllDay,showAs');
     url.searchParams.set('$orderby', 'start/dateTime');
 
-    const data = await fetchJson(this.fetchImpl, url, {
-      headers: {
-        Authorization: `Bearer ${calendarToken}`,
-        Prefer: 'outlook.timezone="Eastern Standard Time"',
-      },
-    });
-    return data?.value || [];
+    const events = [];
+    const visited = new Set();
+    let next = url;
+    while (next) {
+      if (next.origin !== url.origin || next.pathname !== url.pathname || next.username || next.password) throw new Error('Calendar pagination address is invalid; availability was not established.');
+      if (visited.has(next.href) || visited.size >= 200) throw new Error('Calendar retrieval did not complete; request a narrower date range.');
+      visited.add(next.href);
+      const data = await fetchJson(this.fetchImpl, next, { headers: {
+        Authorization: `Bearer ${calendarToken}`, Prefer: 'outlook.timezone="Eastern Standard Time"',
+      } });
+      if (!Array.isArray(data?.value)) throw new Error('Calendar response is invalid; availability was not established.');
+      events.push(...data.value);
+      if (events.length > 10000) throw new Error('Calendar range is too large; request a narrower date range.');
+      next = data['@odata.nextLink'] ? new URL(data['@odata.nextLink']) : null;
+    }
+    return events;
   }
 
-  async createFollowUp({ title, date, notes = '', taskKey }) {
+  async createFollowUp({ title, date, notes = '', taskKey, reminder = true }) {
+    if (typeof reminder !== 'boolean') throw new Error('Reminder preference must be true or false.');
     if (!this.principalMailbox || !taskKey || !String(title || '').trim() || String(title).length > 180) throw new Error('Follow-up title and source are required.');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0,10) !== date) throw new Error('Follow-up requires an explicit valid date.');
     if (String(notes).length > 4000) throw new Error('Follow-up notes are too long.');
@@ -159,14 +169,14 @@ export class MicrosoftGraphClient {
     const now = new Date().toISOString();
     const next = new Date(Date.parse(date)+86400000).toISOString().slice(0,10);
     const action = { actionId, title:String(title).trim(), owner:'London', dateOpened:now.slice(0,10), nextFollowUp:date,
-      status:'ACTIVE',priority:'NORMAL',nextAction:String(title).trim(),source:'London owner email',notes:String(notes),createdAt:now,updatedAt:now };
+      status:'ACTIVE',priority:'NORMAL',nextAction:String(title).trim(),source:'London owner email',notes:String(notes),reminder,createdAt:now,updatedAt:now };
     const result = await fetchJson(this.fetchImpl, `${base}/calendars/${encodeURIComponent(matches[0].id)}/events`, {
       method:'POST',headers,body:JSON.stringify({ subject:`[NORMAL] [ACTIVE] ${action.title}`, body:{contentType:'text',content:`LONDON_ACTION_V1\n${JSON.stringify(action,null,2)}`},
-        start:{dateTime:`${date}T00:00:00`,timeZone:'Eastern Standard Time'},end:{dateTime:`${next}T00:00:00`,timeZone:'Eastern Standard Time'},
-        isAllDay:true,showAs:'free',sensitivity:'private',isReminderOn:false,attendees:[],transactionId:actionId }),
+        start:{dateTime:`${date}T${reminder ? '09:00:00' : '00:00:00'}`,timeZone:'Eastern Standard Time'},end:{dateTime:reminder ? `${date}T09:15:00` : `${next}T00:00:00`,timeZone:'Eastern Standard Time'},
+        isAllDay:!reminder,showAs:'free',sensitivity:'private',isReminderOn:reminder,reminderMinutesBeforeStart:0,attendees:[],transactionId:actionId }),
     });
     if (!result?.id) throw new Error('Microsoft did not confirm task creation; delivery requires review.');
-    return { title:action.title,date,id:result.id,calendar:'London Action Register' };
+    return { title:action.title,date,id:result.id,calendar:'London Action Register',reminder:reminder ? 'Outlook alert at 9 a.m. Eastern on the due date' : 'None' };
   }
 
   async sendMail({ to, subject, body, cc = [] }) {
