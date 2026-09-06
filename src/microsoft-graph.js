@@ -5,6 +5,18 @@ function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
 }
 
+function tokenRoles(token) {
+  try{return JSON.parse(Buffer.from(String(token||'').split('.')[1]||'','base64url')).roles||[];}catch{return [];}
+}
+
+function htmlEscape(value) {
+  return String(value||'').replace(/[&<>"']/g,char=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+}
+
+function verifiedTeamsJoinUrl(value) {
+  try{const url=new URL(String(value||''));return url.protocol==='https:'&&(url.hostname==='teams.microsoft.com'||url.hostname.endsWith('.teams.microsoft.com'))?url.href:'';}catch{return '';}
+}
+
 function clampLimit(value, fallback = 10, max = 25) {
   return Math.min(max, Math.max(1, Number(value) || fallback));
 }
@@ -434,21 +446,37 @@ export class MicrosoftGraphClient {
     const end=new Date(start.getTime()+duration*60000);
     const token=await this.#getToken(this.actionCreds,this.actionToken);
     const eventUrl=`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}/events`;
+    let standaloneJoinUrl='';
+    if(onlineMeeting){
+      const calendar=await fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}/calendar?$select=allowedOnlineMeetingProviders`,{headers:{Authorization:`Bearer ${token}`}});
+      const calendarSupportsTeams=(calendar?.allowedOnlineMeetingProviders||[]).includes('teamsForBusiness');
+      if(!calendarSupportsTeams){
+        if(!tokenRoles(token).includes('OnlineMeetings.ReadWrite.All'))throw new Error('London’s Microsoft app needs OnlineMeetings.ReadWrite.All and a user-scoped Teams application access policy before it can create Teams links.');
+        const owner=await fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}?$select=id`,{headers:{Authorization:`Bearer ${token}`}});
+        if(!owner?.id)throw new Error('Microsoft did not return the Teams organizer identity.');
+        const online=await fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(owner.id)}/onlineMeetings/createOrGet`,{
+          method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({startDateTime:start.toISOString(),endDateTime:end.toISOString(),subject,externalId:String(transactionId)}),
+        });
+        standaloneJoinUrl=verifiedTeamsJoinUrl(online?.joinWebUrl);
+        if(!standaloneJoinUrl)throw new Error('Microsoft did not return a verified Teams joining link.');
+      }
+    }
+    const eventBody=standaloneJoinUrl?`${htmlEscape(body).replace(/\n/g,'<br>')}<p><a href="${standaloneJoinUrl}">Join Microsoft Teams Meeting</a></p>`:String(body);
     const result=await fetchJson(this.fetchImpl,eventUrl,{
       method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({
-        subject,body:{contentType:'Text',content:String(body)},start:{dateTime:preview.localStart,timeZone:preview.microsoftTimeZone},end:{dateTime:preview.localEnd,timeZone:preview.microsoftTimeZone},
-        location:{displayName:String(location)},attendees:addresses.map(address=>({emailAddress:{address},type:'required'})),allowNewTimeProposals:true,transactionId,
-        ...(onlineMeeting?{isOnlineMeeting:true,onlineMeetingProvider:'teamsForBusiness'}:{}),
+        subject,body:{contentType:standaloneJoinUrl?'HTML':'Text',content:eventBody},start:{dateTime:preview.localStart,timeZone:preview.microsoftTimeZone},end:{dateTime:preview.localEnd,timeZone:preview.microsoftTimeZone},
+        location:{displayName:String(location)||(standaloneJoinUrl?'Microsoft Teams':'')},attendees:addresses.map(address=>({emailAddress:{address},type:'required'})),allowNewTimeProposals:true,transactionId,
+        ...(onlineMeeting&&!standaloneJoinUrl?{isOnlineMeeting:true,onlineMeetingProvider:'teamsForBusiness'}:{}),
       }),
     });
     if(!result?.id)throw new Error('Microsoft did not confirm meeting creation; invitation delivery was not established.');
     let verified=result;
-    if(onlineMeeting&&(!result.isOnlineMeeting||!result.onlineMeeting?.joinUrl)){
+    if(onlineMeeting&&!standaloneJoinUrl&&(!result.isOnlineMeeting||!result.onlineMeeting?.joinUrl)){
       verified=await fetchJson(this.fetchImpl,`${eventUrl}/${encodeURIComponent(result.id)}?$select=id,isOnlineMeeting,onlineMeetingProvider,onlineMeeting`,{
         headers:{Authorization:`Bearer ${token}`},
       });
     }
-    if(onlineMeeting&&(!verified?.isOnlineMeeting||verified?.onlineMeetingProvider!=='teamsForBusiness'||!verified?.onlineMeeting?.joinUrl)){
+    if(onlineMeeting&&!standaloneJoinUrl&&(!verified?.isOnlineMeeting||verified?.onlineMeetingProvider!=='teamsForBusiness'||!verified?.onlineMeeting?.joinUrl)){
       await fetchJson(this.fetchImpl,`${eventUrl}/${encodeURIComponent(result.id)}`,{
         method:'PATCH',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({isOnlineMeeting:true,onlineMeetingProvider:'teamsForBusiness'}),
       });
@@ -456,7 +484,7 @@ export class MicrosoftGraphClient {
         headers:{Authorization:`Bearer ${token}`},
       });
     }
-    const joinLinkCreated=Boolean(verified?.isOnlineMeeting&&verified?.onlineMeetingProvider==='teamsForBusiness'&&verified?.onlineMeeting?.joinUrl);
+    const joinLinkCreated=Boolean(standaloneJoinUrl||(verified?.isOnlineMeeting&&verified?.onlineMeetingProvider==='teamsForBusiness'&&verified?.onlineMeeting?.joinUrl));
     if(onlineMeeting&&!joinLinkCreated)throw new Error('Microsoft did not create a Teams joining link; the meeting must be checked before reporting success.');
     return {id:result.id,title:subject,...preview,durationMinutes:duration,attendees:addresses,location:String(location),calendar:'Primary Outlook calendar',invitationsSubmitted:true,onlineMeeting:Boolean(onlineMeeting),onlineMeetingProvider:onlineMeeting?'teamsForBusiness':'unknown',joinLinkCreated};
   }
