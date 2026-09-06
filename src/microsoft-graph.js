@@ -532,6 +532,26 @@ export class MicrosoftGraphClient {
     return {id:result.id,title:subject,...preview,durationMinutes:duration,attendees:addresses,location:String(location),calendar:'Primary Outlook calendar',invitationsSubmitted:true,onlineMeeting:Boolean(onlineMeeting),onlineMeetingProvider:onlineMeeting?'teamsForBusiness':'unknown',joinLinkCreated};
   }
 
+  async createPersonalReminder({title,startIso,notes='',phone='',taskKey}={}) {
+    const subject = String(title || '').trim();
+    const start = verifiedMeetingStart(startIso,'America/Toronto');
+    if (!this.principalMailbox || !taskKey || !subject || subject.length > 180) throw new Error('Personal reminder title and source are required.');
+    if (start.date.getTime() <= Date.now()) throw new Error('The requested reminder time has passed; no event was created.');
+    if (String(notes).length > 4000 || !/^[+\d\s().-]{0,40}$/.test(phone)) throw new Error('Reminder notes or phone are invalid.');
+    const end = new Date(start.date.getTime() + 15*60000);
+    const token = await this.#getToken(this.actionCreds,this.actionToken);
+    const transactionId = createHash('sha256').update(`personal-reminder\n${this.principalMailbox}\n${taskKey}`).digest('hex');
+    const dial = String(phone).replace(/[^+\d]/g,'');
+    const content = `<p>${htmlEscape(notes).replace(/\n/g,'<br>')}</p>${dial ? `<p>Phone: <a href="tel:${dial}">${htmlEscape(phone)}</a></p>` : ''}<p>Personal reminder; no appointment or invitation has been made.</p>`;
+    const result = await fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}/events`,{
+      method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
+      body:JSON.stringify({subject,body:{contentType:'HTML',content},start:{dateTime:start.local,timeZone:start.zone.graph},end:{dateTime:zonedDateTime(end,start.zone.iana),timeZone:start.zone.graph},
+        isAllDay:false,showAs:'free',sensitivity:'private',isReminderOn:true,reminderMinutesBeforeStart:0,attendees:[],transactionId}),
+    });
+    if (!result?.id || result.isReminderOn !== true || result.reminderMinutesBeforeStart !== 0) throw new Error('Microsoft did not verify the saved reminder and alert; check the calendar before retrying.');
+    return {id:result.id,title:subject,startLocal:start.local,timezone:'Eastern time',phone,calendar:'Primary Outlook calendar',created:true,reminderOn:true};
+  }
+
   async cancelVoiceMeeting({eventId,comment=''}={}) {
     const id=String(eventId||'').trim();const note=String(comment||'').trim();
     if(!this.principalMailbox||!id||id.length>1000)throw new Error('A selected calendar event is required.');

@@ -1,3 +1,5 @@
+import { ownerReminderRequest } from './email-reminder.js';
+
 function emailAddress(message) {
   return String(message?.from?.emailAddress?.address || '').trim().toLowerCase();
 }
@@ -64,6 +66,22 @@ export class LondonCore {
         this.state.markMessage(key, { sender, result: 'durable-duplicate' });
         return { skipped: true, reason: 'durable-duplicate', key };
       }
+      let reminderFailed = false;
+      if (analysis.calendarReminder) {
+        if (!this.deliveryGuard || !ownerReminderRequest(full)) throw new Error('Personal reminders require a direct owner request and durable protection.');
+        try {
+          const reminder = await this.graph.createPersonalReminder({...analysis.calendarReminder,taskKey:key});
+          if (!reminder?.created || !reminder?.id || !reminder?.reminderOn) throw new Error('The saved reminder was not verified.');
+          // Use the verified result directly: no model can turn a preparation
+          // or a failed Microsoft write into a success message.
+          text = `Reminder created in your primary Outlook calendar.\n\n${reminder.title}\nWhen: ${reminder.startLocal.replace('T',' ')} ${reminder.timezone}\nAlert: at the requested time.${reminder.phone ? `\nPhone: ${reminder.phone}` : ''}\n\nThis is a personal reminder, not a confirmed appointment.`;
+        } catch (error) {
+          const detail = error.status === 403 ? 'Microsoft denied calendar-write access for London.' : 'Outlook did not confirm the reminder and alert. Check the calendar before retrying to avoid a duplicate.';
+          reminderFailed = true;
+          text = `Reminder not confirmed. ${detail}`;
+          this.logger.error?.({error:error.message,status:error.status},'Personal reminder creation failed');
+        }
+      }
       if (analysis.followUps?.length) {
         if (!this.deliveryGuard) throw new Error('Follow-up creation requires durable delivery protection.');
         const tasks = [];
@@ -91,7 +109,7 @@ export class LondonCore {
       this.state.markMessage(key, { sender, result: 'delivery-pending-review' });
       await this.graph.sendMail({
         to: principal,
-        subject: completionSubject(full.subject),
+        subject: reminderFailed ? `LONDON — Reminder Needs Attention | ${full.subject || '(no subject)'}` : completionSubject(full.subject),
         body: report ? `${text}\n\nSaved in Dropbox: ${report.path}` : text,
       });
       if (this.deliveryGuard) await this.deliveryGuard.complete(key, report?.path);
