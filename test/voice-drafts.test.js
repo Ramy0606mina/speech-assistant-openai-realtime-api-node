@@ -79,4 +79,3 @@ test('Twilio signature rejects spoofed callers and altered fields',()=>{
   request.body.From='+15145550001';assert.equal(validTwilioRequest(request,'key','https://example.com'),false);
 });
 
-

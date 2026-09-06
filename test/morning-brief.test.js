@@ -36,4 +36,3 @@ test('brief JSON renders a compact colored HTML table',()=>{
  const report=parseBriefReport(reportJson);const html=renderBriefHtml(report);
  assert.match(html,/Top priorities/);assert.match(html,/Review quote/);assert.match(html,/background:#fff2cc/);assert.doesNotMatch(html,/undefined/);
 });
-

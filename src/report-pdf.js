@@ -58,4 +58,3 @@ export function renderReportPdf({ subject, text, reportData }) {
     doc.end();
   });
 }
-

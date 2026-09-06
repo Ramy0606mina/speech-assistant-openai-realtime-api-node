@@ -101,4 +101,3 @@ export class MorningBrief {
     finally {this.running=false;}
   }
 }
-

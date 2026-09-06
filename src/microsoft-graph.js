@@ -593,4 +593,3 @@ export class MicrosoftGraphClient {
     return { sent: true };
   }
 }
-

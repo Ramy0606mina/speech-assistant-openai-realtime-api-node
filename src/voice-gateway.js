@@ -609,4 +609,3 @@ export function registerVoiceRoutes(app, {
     });
   });
 }
-

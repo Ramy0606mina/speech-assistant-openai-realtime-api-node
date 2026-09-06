@@ -196,4 +196,3 @@ export class DropboxClient {
 }
 
 export { normalizeDropboxPath };
-

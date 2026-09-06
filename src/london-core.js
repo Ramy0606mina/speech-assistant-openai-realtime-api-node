@@ -121,4 +121,3 @@ export class LondonCore {
     return { checked: messages.length, results };
   }
 }
-
