@@ -183,6 +183,7 @@ export function registerVoiceRoutes(app, {
   graph,
   dropbox,
   logger = console,
+  WebSocketImpl = WebSocket,
 } = {}) {
   const authorizedStreamTokens = new Map();
 
@@ -231,12 +232,11 @@ export function registerVoiceRoutes(app, {
       let greetingSent = false;
       const pendingAudio = [];
 
-      const openAiWs = new WebSocket(
+      const openAiWs = new WebSocketImpl(
         `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`,
         {
           headers: {
             Authorization: `Bearer ${openAiApiKey}`,
-            'OpenAI-Beta': 'realtime=v1',
           },
         }
       );
@@ -258,6 +258,11 @@ export function registerVoiceRoutes(app, {
           sendOpenAi({ type: 'input_audio_buffer.append', audio: pendingAudio.shift() });
         }
       };
+      const greetWhenReady = () => {
+        if (!openAiReady || !streamSid || greetingSent) return;
+        greetingSent = true;
+        sendOpenAi({type:'response.create',response:{instructions:'Greet Ramy briefly as London and ask how you can help. One short sentence.'}});
+      };
 
       const sendToolOutput = (callId, output) => {
         sendOpenAi({
@@ -277,7 +282,6 @@ export function registerVoiceRoutes(app, {
       };
 
       openAiWs.on('open', () => {
-        openAiReady = true;
         sendOpenAi({
           type: 'session.update',
           session: {
@@ -290,7 +294,7 @@ export function registerVoiceRoutes(app, {
                 transcription: { model: 'gpt-4o-mini-transcribe' },
                 turn_detection: {
                   type: 'semantic_vad',
-                  eagerness: 'high',
+                  eagerness: 'low',
                   create_response: true,
                   interrupt_response: true,
                 },
@@ -305,21 +309,16 @@ export function registerVoiceRoutes(app, {
             tool_choice: 'auto',
           },
         });
-        flushAudio();
       });
 
       openAiWs.on('message', async (data) => {
         try {
           const event = JSON.parse(String(data));
 
-          if (event.type === 'session.updated' && !greetingSent) {
-            greetingSent = true;
-            sendOpenAi({
-              type: 'response.create',
-              response: {
-                instructions: 'Greet Ramy briefly as London and ask how you can help. One short sentence.',
-              },
-            });
+          if (event.type === 'session.updated') {
+            openAiReady = true;
+            flushAudio();
+            greetWhenReady();
           }
 
           if (event.type === 'response.output_audio.delta' && event.delta && streamSid) {
@@ -366,6 +365,7 @@ export function registerVoiceRoutes(app, {
           const event = JSON.parse(String(data));
           if (event.event === 'start') {
             streamSid = String(event.start?.streamSid || event.streamSid || '');
+            greetWhenReady();
             return;
           }
           if (event.event === 'media' && event.media?.payload) {
