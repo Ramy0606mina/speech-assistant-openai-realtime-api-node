@@ -4,7 +4,7 @@ import {MicrosoftGraphClient} from '../src/microsoft-graph.js';
 import {runVoiceTool,voiceTools} from '../src/voice-gateway.js';
 
 const actionToken=`x.${Buffer.from(JSON.stringify({roles:['Calendars.ReadWrite','OnlineMeetings.ReadWrite.All']})).toString('base64url')}.x`;
-function client(handler){return new MicrosoftGraphClient({readTenantId:'t',readClientId:'c',readClientSecret:'s',actionTenantId:'t',actionClientId:'c',actionClientSecret:'s',ramyMailbox:'owner@example.com',londonMailbox:'london@example.com',fetchImpl:async(url,options)=>String(url).includes('oauth2')?Response.json({access_token:actionToken,expires_in:3600}):handler(String(url),options)});}
+function client(handler){return new MicrosoftGraphClient({readTenantId:'t',readClientId:'c',readClientSecret:'s',actionTenantId:'t',actionClientId:'c',actionClientSecret:'s',ramyMailbox:'owner@example.com',ramyUserId:'11111111-1111-4111-8111-111111111111',londonMailbox:'london@example.com',fetchImpl:async(url,options)=>String(url).includes('oauth2')?Response.json({access_token:actionToken,expires_in:3600}):handler(String(url),options)});}
 
 test('Microsoft meeting includes attendee invitations and a stable transaction',async()=>{
   const calls=[];const graph=client((url,options)=>{calls.push({url,options});return Response.json({id:'event-1'});});
@@ -41,9 +41,10 @@ test('Microsoft refuses to report success when a Teams link cannot be verified',
 });
 
 test('Microsoft creates an idempotent standalone Teams meeting when the calendar provider is unavailable',async()=>{
-  const calls=[];const graph=client((url,options)=>{calls.push({url,options});if(url.includes('/calendar?'))return Response.json({allowedOnlineMeetingProviders:[]});if(/\/users\/owner%40example.com\?/.test(url))return Response.json({id:'owner-id'});if(url.includes('/onlineMeetings/createOrGet'))return Response.json({joinWebUrl:'https://teams.microsoft.com/l/meetup-join/example'});return Response.json({id:'event-fallback'});});
+  const calls=[];const graph=client((url,options)=>{calls.push({url,options});if(url.includes('/calendar?'))return Response.json({allowedOnlineMeetingProviders:[]});if(url.includes('/onlineMeetings/createOrGet'))return Response.json({joinWebUrl:'https://teams.microsoft.com/l/meetup-join/example'});return Response.json({id:'event-fallback'});});
   const result=await graph.createVoiceMeeting({title:'Virtual project call',startIso:'2030-07-11T10:00:00-04:00',durationMinutes:30,timezone:'America/Toronto',attendees:['person@example.com'],body:'Discuss.',onlineMeeting:true,transactionId:'72345678-1234-4123-8123-123456789abc'});
   const onlineCall=calls.find(call=>call.url.includes('/onlineMeetings/createOrGet'));const onlineBody=JSON.parse(onlineCall.options.body);assert.equal(onlineBody.externalId,'72345678-1234-4123-8123-123456789abc');
+  assert.match(onlineCall.url,/users\/11111111-1111-4111-8111-111111111111\/onlineMeetings/);
   const eventBody=JSON.parse(calls.at(-1).options.body);assert.equal(eventBody.body.contentType,'HTML');assert.match(eventBody.body.content,/Join Microsoft Teams Meeting/);assert.equal(result.joinLinkCreated,true);
 });
 
