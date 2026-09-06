@@ -10,7 +10,7 @@ test('follow-up uses only the existing principal register, private free time, no
   if(String(url).includes('/calendars?'))return Response.json({value:[{id:'register',name:'London Action Register',owner:{address:'owner@example.com'}}]});
   assert.match(String(url),/calendars\/register\/events$/);created.push(JSON.parse(o.body));return Response.json({id:'saved'});
  }});
- const task={title:'Review test',date:'2026-09-07',taskKey:'source',notes:'Test only'};
+ const task={title:'Review test',date:'2026-09-07',taskKey:'source',notes:'Test only',reminder:false};
  await g.createFollowUp(task);await g.createFollowUp(task);
  assert.equal(created[0].transactionId,created[1].transactionId);assert.deepEqual(created[0].attendees,[]);
  assert.equal(created[0].isReminderOn,false);assert.equal(created[0].showAs,'free');assert.equal(created[0].sensitivity,'private');
@@ -18,7 +18,7 @@ test('follow-up uses only the existing principal register, private free time, no
 });
 test('model prepares a task without changing calendar while reasoning',async()=>{
  let step=0,created=0;
- const ai=new OpenAIClient({apiKey:'test',fetchImpl:async()=>++step===1?Response.json({output:[{type:'function_call',call_id:'task',name:'prepare_follow_up',arguments:JSON.stringify({title:'Review test',date:'2026-09-07',notes:''})}]}):Response.json({output_text:'Follow-up details prepared.'})});
+ const ai=new OpenAIClient({apiKey:'test',fetchImpl:async()=>++step===1?Response.json({output:[{type:'function_call',call_id:'task',name:'prepare_follow_up',arguments:JSON.stringify({title:'Review test',date:'2026-09-07',notes:'',reminder:false})}]}):Response.json({output_text:'Follow-up details prepared.'})});
  const r=await ai.analyzeDelegatedEmail({body:{content:'Create follow-up on September 7'}},[],{graph:{createFollowUp:async()=>created++}});
  assert.equal(created,0);assert.equal(r.followUps.length,1);assert.equal(r.followUps[0].date,'2026-09-07');
 });
@@ -31,4 +31,16 @@ test('calendar reads use the action app that owns calendar access',async()=>{
  }});
  assert.deepEqual(await g.listPrincipalCalendar({startIso:'2026-09-07T00:00:00Z',endIso:'2026-09-08T00:00:00Z'}),[]);
  assert.equal(identity,'calendar-actions');
+});
+
+
+test('new follow-ups schedule a native 9 a.m. Eastern reminder without invitations',async()=>{
+ let event;
+ const graph=new MicrosoftGraphClient({readTenantId:'t',readClientId:'c',readClientSecret:'s',ramyMailbox:'owner@example.com',fetchImpl:async(url,o)=>{
+ if(String(url).includes('oauth2'))return Response.json({access_token:'test',expires_in:3600});
+ if(String(url).includes('/calendars?'))return Response.json({value:[{id:'register',name:'London Action Register',owner:{address:'owner@example.com'}}]});
+ event=JSON.parse(o.body);return Response.json({id:'created'});
+ }});
+ const result=await graph.createFollowUp({title:'Review',date:'2026-11-02',taskKey:'one'});
+ assert.equal(event.isReminderOn,true);assert.equal(event.reminderMinutesBeforeStart,0);assert.equal(event.start.dateTime,'2026-11-02T09:00:00');assert.equal(event.start.timeZone,'Eastern Standard Time');assert.equal(event.isAllDay,false);assert.equal(event.showAs,'free');assert.deepEqual(event.attendees,[]);assert.match(result.reminder,/9 a.m./);
 });

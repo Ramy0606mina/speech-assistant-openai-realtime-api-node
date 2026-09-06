@@ -70,7 +70,7 @@ export class LondonCore {
         const finalized = await this.openai.finalizeFollowUpReport(text, tasks);
         text = String(finalized.text || '').trim();
         if (!text) throw new Error('Confirmed follow-up report is empty; delivery requires review.');
-        text += '\n\nCreated in London Action Register:\n' + tasks.map(t=>`- ${t.title} — ${t.date} (task record; no reminder notification)`).join('\n');
+        text += '\n\nCreated in London Action Register:\n' + tasks.map(t=>`- ${t.title} — ${t.date}. Reminder: ${t.reminder}`).join('\n');
       }
       const report = this.dropbox?.saveReports
         ? await this.dropbox.saveReport({ taskKey: key, subject: full.subject, text })
