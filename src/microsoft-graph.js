@@ -308,6 +308,31 @@ export class MicrosoftGraphClient {
     return events;
   }
 
+  async createVoiceMeeting({title,startIso,durationMinutes,timezone,attendees,body='',location='',transactionId}={}) {
+    const subject=String(title||'').trim();
+    const start=new Date(startIso);
+    const duration=Number(durationMinutes);
+    const zone=String(timezone||'').trim();
+    const addresses=Array.isArray(attendees)?[...new Set(attendees.map(normalizeEmail))]:[];
+    if(!this.principalMailbox||!subject||subject.length>180)throw new Error('Meeting title is required and must be at most 180 characters.');
+    if(!/^(?:.+(?:Z|[+-]\d{2}:\d{2}))$/.test(String(startIso||''))||!Number.isFinite(start.getTime()))throw new Error('Meeting start requires an explicit ISO date, time, and offset.');
+    if(!Number.isInteger(duration)||duration<15||duration>480)throw new Error('Meeting duration must be between 15 minutes and 8 hours.');
+    if(!zone||zone.length>80)throw new Error('Meeting timezone is required.');
+    if(!addresses.length||addresses.length>20||addresses.some(value=>!/^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/.test(value)))throw new Error('Meeting invitations require one to twenty explicit attendee email addresses.');
+    if(String(body).length>4000||String(location).length>300)throw new Error('Meeting notes or location are too long.');
+    if(!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(transactionId||'')))throw new Error('Meeting transaction is invalid.');
+    const end=new Date(start.getTime()+duration*60000);
+    const token=await this.#getToken(this.actionCreds,this.actionToken);
+    const result=await fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}/events`,{
+      method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({
+        subject,body:{contentType:'Text',content:String(body)},start:{dateTime:start.toISOString().replace(/Z$/,''),timeZone:'UTC'},end:{dateTime:end.toISOString().replace(/Z$/,''),timeZone:'UTC'},
+        location:{displayName:String(location)},attendees:addresses.map(address=>({emailAddress:{address},type:'required'})),allowNewTimeProposals:true,transactionId,
+      }),
+    });
+    if(!result?.id)throw new Error('Microsoft did not confirm meeting creation; invitation delivery was not established.');
+    return {id:result.id,title:subject,startIso:start.toISOString(),endIso:end.toISOString(),durationMinutes:duration,timezone:zone,attendees:addresses,location:String(location),calendar:'Primary Outlook calendar',invitationsSubmitted:true};
+  }
+
   async createFollowUp({ title, date, notes = '', taskKey, reminder = true }) {
     if (typeof reminder !== 'boolean') throw new Error('Reminder preference must be true or false.');
     if (!this.principalMailbox || !taskKey || !String(title || '').trim() || String(title).length > 180) throw new Error('Follow-up title and source are required.');

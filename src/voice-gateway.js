@@ -69,8 +69,10 @@ function realtimeInstructions() {
     'If he interrupts you, stop promptly and listen.',
     'Never invent current email, calendar, Dropbox, financial, tenant, project, or business facts.',
     'Use the live tools whenever Ramy asks about current email, his calendar, or Dropbox.',
-    'You can read connected inbox messages, read calendars and Dropbox listings, and save NEW emails or reply drafts in Outlook Drafts.',
-    'Ramy will review, edit and send drafts himself. You cannot send email or create calendar events by phone. Never claim a draft was sent.',
+    'You can read connected inbox messages, read calendars and Dropbox listings, save NEW emails or reply drafts in Outlook Drafts, and prepare Microsoft Outlook meetings for explicit confirmation.',
+    'Ramy will review, edit and send email drafts himself. Never claim a draft was sent.',
+    'For a meeting, collect the title, exact future date and time, timezone, duration, and explicit attendee email addresses. Never guess an address. Call prepare_calendar_meeting, read back its exact proposal and any conflicts, then ask whether to create it and send invitations.',
+    'Call confirm_calendar_meeting only after Ramy unambiguously confirms that exact prepared proposal in a later spoken turn. A request to prepare, schedule, or invite is not confirmation. Never claim a meeting or invitation exists unless confirm_calendar_meeting returned success true during the current request.',
     'When asked to draft a response, first read the selected original email, then use save_email_draft with its message_id. Microsoft preserves the reply thread and recipients.',
     'Never say an email was drafted or saved unless save_email_draft returned success true during the current request. If the recipient address is unresolved or the tool was not called, state clearly that no draft was saved.',
     'Default to Ramy’s principal Minaco mailbox. The only other connected mailbox is London. Ask which message if the selection is ambiguous; never guess recipients or claim access to other inboxes.',
@@ -126,6 +128,14 @@ export function voiceTools() {
         required: ['start_iso', 'end_iso'],
         additionalProperties: false,
       },
+    },
+    {
+      type:'function',name:'prepare_calendar_meeting',description:'Prepare and conflict-check an exact Microsoft Outlook meeting proposal without creating it or sending invitations. Read the returned details to Ramy and ask for confirmation.',
+      parameters:{type:'object',properties:{title:{type:'string'},start_iso:{type:'string',description:'ISO 8601 meeting start with explicit timezone offset or Z.'},timezone:{type:'string',description:'Spoken timezone label, normally America/Toronto.'},duration_minutes:{type:'integer',minimum:15,maximum:480},attendees:{type:'array',items:{type:'string'},minItems:1,maxItems:20,description:'Exact attendee email addresses only.'},body:{type:'string'},location:{type:'string'}},required:['title','start_iso','timezone','duration_minutes','attendees'],additionalProperties:false},
+    },
+    {
+      type:'function',name:'confirm_calendar_meeting',description:'Create the previously prepared Microsoft Outlook meeting and submit its attendee invitations only after Ramy explicitly confirms the exact proposal in a later spoken turn.',
+      parameters:{type:'object',properties:{proposal_id:{type:'string'},confirmed:{type:'boolean',description:'Must be true only after Ramy explicitly confirms the prepared details.'}},required:['proposal_id','confirmed'],additionalProperties:false},
     },
     {
       type: 'function',
@@ -192,7 +202,7 @@ function simplifyDropboxEntry(entry) {
   };
 }
 
-export async function runVoiceTool(name, args, { graph, dropbox, readMessages = new Set(), draftRequests = new Set(), callKey = '' }) {
+export async function runVoiceTool(name, args, { graph, dropbox, readMessages = new Set(), draftRequests = new Set(), meetingProposals = new Map(), meetingRequests = new Set(), callKey = '' }) {
   if (name === 'check_email') {
     if (!graph) throw new Error('Microsoft Graph is not connected to the voice gateway.');
     const messages = await graph.listVoiceMessages(args.mailbox || 'principal',args.folder || 'inbox',args.limit || 5);
@@ -231,6 +241,39 @@ export async function runVoiceTool(name, args, { graph, dropbox, readMessages = 
     if (!graph) throw new Error('Microsoft Graph is not connected to the voice gateway.');
     const events = await graph.listPrincipalCalendar({ startIso: args.start_iso, endIso: args.end_iso });
     return { success: true, events: events.map(simplifyCalendarEvent) };
+  }
+
+  if(name==='prepare_calendar_meeting'){
+    if(!graph)throw new Error('Microsoft Graph is not connected to the voice gateway.');
+    const title=String(args.title||'').trim();
+    const start=new Date(args.start_iso);const duration=Number(args.duration_minutes);const timezone=String(args.timezone||'').trim();
+    const attendees=Array.isArray(args.attendees)?[...new Set(args.attendees.map(v=>String(v||'').trim().toLowerCase()))]:[];
+    if(!title||title.length>180)throw new Error('Meeting title is required and must be at most 180 characters.');
+    if(!/^(?:.+(?:Z|[+-]\d{2}:\d{2}))$/.test(String(args.start_iso||''))||!Number.isFinite(start.getTime())||start<=new Date())throw new Error('Meeting start requires an explicit future date, time, and timezone offset.');
+    if(!Number.isInteger(duration)||duration<15||duration>480)throw new Error('Meeting duration must be between 15 minutes and 8 hours.');
+    if(!timezone||timezone.length>80)throw new Error('Meeting timezone is required.');
+    if(!attendees.length||attendees.length>20||attendees.some(v=>!/^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/.test(v)))throw new Error('Provide one to twenty exact attendee email addresses; names must not be guessed.');
+    if(String(args.body||'').length>4000||String(args.location||'').length>300)throw new Error('Meeting notes or location are too long.');
+    if(meetingProposals.size>=10)throw new Error('Ten meeting proposals have been prepared on this call; start a new call after reviewing them.');
+    const proposalId=randomUUID();const end=new Date(start.getTime()+duration*60000);
+    const proposal={proposalId,title,startIso:start.toISOString(),endIso:end.toISOString(),durationMinutes:duration,timezone,attendees,body:String(args.body||''),location:String(args.location||'')};
+    const conflicts=await graph.listPrincipalCalendar({startIso:proposal.startIso,endIso:proposal.endIso});
+    meetingProposals.set(proposalId,proposal);
+    return {success:true,created:false,invitationsSubmitted:false,requiresConfirmation:true,proposal:{proposalId,title,startIso:proposal.startIso,endIso:proposal.endIso,durationMinutes:duration,timezone,attendees,location:proposal.location},conflicts:conflicts.filter(e=>!e.isCancelled&&e.showAs!=='free').map(simplifyCalendarEvent)};
+  }
+
+  if(name==='confirm_calendar_meeting'){
+    if(args.confirmed!==true)throw new Error('The prepared meeting was not explicitly confirmed; nothing was created.');
+    const proposal=meetingProposals.get(String(args.proposal_id||''));
+    if(!proposal)throw new Error('That meeting proposal is unavailable or was not prepared during this call.');
+    if(meetingRequests.has(proposal.proposalId))throw new Error('This meeting was already attempted; check the calendar before retrying.');
+    meetingRequests.add(proposal.proposalId);
+    if(!callKey||!dropbox?.createDeliveryRecord)throw new Error('Meeting recovery protection is unavailable.');
+    const key=createHash('sha256').update(`${callKey}:${proposal.proposalId}`).digest('hex');
+    if(!await dropbox.createDeliveryRecord(`voice-meeting-${key}`,{status:'attempted',at:new Date().toISOString()}))throw new Error('This meeting was already attempted; check the calendar before retrying.');
+    const meeting=await graph.createVoiceMeeting({...proposal,transactionId:proposal.proposalId});
+    meetingProposals.delete(proposal.proposalId);
+    return {success:true,created:true,invitationsSubmitted:true,meeting};
   }
 
   if (name === 'search_dropbox') {
@@ -300,6 +343,8 @@ export function registerVoiceRoutes(app, {
       authorizedStreamTokens.delete(token);
       const readMessages=new Set();
       const draftRequests=new Set();
+      const meetingProposals=new Map();
+      const meetingRequests=new Set();
       const toolResults=new Map();
 
       let streamSid = '';
@@ -408,7 +453,7 @@ export function registerVoiceRoutes(app, {
           if (event.type === 'response.function_call_arguments.done') {
             try {
               const args = JSON.parse(event.arguments || '{}');
-              if(!toolResults.has(event.call_id))toolResults.set(event.call_id,runVoiceTool(event.name,args,{graph,dropbox,readMessages,draftRequests,callKey:authorization.callKey}));
+              if(!toolResults.has(event.call_id))toolResults.set(event.call_id,runVoiceTool(event.name,args,{graph,dropbox,readMessages,draftRequests,meetingProposals,meetingRequests,callKey:authorization.callKey}));
               const output = await toolResults.get(event.call_id);
               sendToolOutput(event.call_id, output);
             } catch (error) {

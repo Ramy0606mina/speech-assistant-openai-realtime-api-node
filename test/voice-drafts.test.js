@@ -39,11 +39,11 @@ test('reply requires original read, and repeated draft attempts cannot duplicate
   await assert.rejects(()=>runVoiceTool('save_email_draft',args,ctx),/already attempted/);
   assert.equal(created,1);
 });
-test('failed durable claim blocks writes and no send tools exist',async()=>{
+test('failed durable claim blocks email writes and no email-send tool exists',async()=>{
   let created=false;
   await assert.rejects(()=>runVoiceTool('save_email_draft',{to:['x@example.com'],body:'B',subject:'S'},{graph:{createVoiceDraft:()=>created=true},dropbox:{createDeliveryRecord:async()=>false},callKey:'call'}),/already attempted/);
   assert.equal(created,false);
-  assert.equal(voiceTools().some(t=>/send|approve|create_event/.test(t.name)),false);
+  assert.equal(voiceTools().some(t=>/send_email|approve_email/.test(t.name)),false);
 });
 test('Twilio signature rejects spoofed callers and altered fields',()=>{
   const request={method:'POST',url:'/incoming-call',body:{From:'+15145550000'},headers:{}};
@@ -52,3 +52,4 @@ test('Twilio signature rejects spoofed callers and altered fields',()=>{
   assert.equal(validTwilioRequest(request,'key','https://example.com'),true);
   request.body.From='+15145550001';assert.equal(validTwilioRequest(request,'key','https://example.com'),false);
 });
+
