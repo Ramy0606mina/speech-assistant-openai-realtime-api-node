@@ -20,13 +20,15 @@ test('incoming call TwiML connects only to the generated tokenized media route',
 
 import {EventEmitter} from 'node:events';
 import {registerVoiceRoutes} from '../src/voice-gateway.js';
+import {createHmac} from 'node:crypto';
 test('voice uses current protocol and waits for both session and phone stream before greeting',async()=>{
  let incoming,media,upstream;
  class Socket extends EventEmitter {constructor(url,options){super();this.readyState=1;this.sent=[];this.options=options;upstream=this;}send(x){this.sent.push(JSON.parse(x));}close(){this.readyState=3;}}
  const app={all:(path,handler)=>incoming=handler,register:fn=>fn({get:(path,options,handler)=>media=handler})};
- registerVoiceRoutes(app,{openAiApiKey:'test',principalPhone:'+15145550000',WebSocketImpl:Socket});
+ registerVoiceRoutes(app,{openAiApiKey:'test',principalPhone:'+15145550000',WebSocketImpl:Socket,twilioAuthToken:'test-auth',publicUrl:'https://example.com'});
  let xml;const reply={type:()=>reply,send:x=>xml=x};
- await incoming({body:{From:'+15145550000'},headers:{host:'example.com'}},reply);
+ const signature=createHmac('sha1','test-auth').update('https://example.com/incoming-callFrom+15145550000').digest('base64');
+ await incoming({method:'POST',body:{From:'+15145550000'},headers:{host:'example.com','x-twilio-signature':signature}},reply);
  const token=xml.match(/media-stream\/([^" ]+)/)[1];
  const phone=new EventEmitter();phone.readyState=1;phone.send=()=>{};phone.close=()=>{};
  media(phone,{params:{streamToken:token}});
