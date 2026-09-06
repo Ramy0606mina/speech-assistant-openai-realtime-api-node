@@ -128,7 +128,7 @@ export class MicrosoftGraphClient {
       throw new Error('Calendar start/end range is invalid.');
     }
 
-    const token = await this.#getToken(this.readCreds, this.readToken);
+    const calendarToken = await this.#getToken(this.actionCreds, this.actionToken);
     const url = new URL(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.ramyMailbox)}/calendarView`);
     url.searchParams.set('startDateTime', start.toISOString());
     url.searchParams.set('endDateTime', end.toISOString());
@@ -138,7 +138,7 @@ export class MicrosoftGraphClient {
 
     const data = await fetchJson(this.fetchImpl, url, {
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${calendarToken}`,
         Prefer: 'outlook.timezone="Eastern Standard Time"',
       },
     });

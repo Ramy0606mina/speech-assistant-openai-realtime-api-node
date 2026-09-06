@@ -67,6 +67,9 @@ export class LondonCore {
         if (!this.deliveryGuard) throw new Error('Follow-up creation requires durable delivery protection.');
         const tasks = [];
         for (const task of analysis.followUps) tasks.push(await this.graph.createFollowUp({ ...task, taskKey:key }));
+        const finalized = await this.openai.finalizeFollowUpReport(text, tasks);
+        text = String(finalized.text || '').trim();
+        if (!text) throw new Error('Confirmed follow-up report is empty; delivery requires review.');
         text += '\n\nCreated in London Action Register:\n' + tasks.map(t=>`- ${t.title} — ${t.date} (task record; no reminder notification)`).join('\n');
       }
       const report = this.dropbox?.saveReports
