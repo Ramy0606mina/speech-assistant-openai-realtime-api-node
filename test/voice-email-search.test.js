@@ -60,3 +60,20 @@ test('voice reports an approximate sender so London asks for confirmation',async
   assert.equal(result.suggestedSender,'Jack Rawdon');
 });
 
+test('default sender search reaches a close voice transcription beyond one thousand messages',async()=>{
+  let page=0;
+  const graph=graphWith(url=>{
+    page++;
+    if(page<=20){
+      const next=new URL(url);next.pathname="/v1.0/users/owner@example.com/mailFolders('inbox')/messages";next.searchParams.set('$skiptoken',String(page));
+      return Response.json({value:Array.from({length:50},(_,i)=>({id:`${page}-${i}`,subject:'Other',from:{emailAddress:{name:'Someone Else'}}})),'@odata.nextLink':next.href});
+    }
+    return Response.json({value:[{id:'yves',subject:'Syncev follow-up',from:{emailAddress:{name:'Yves Trauttmann'}},receivedDateTime:'2026-09-04T13:01:48Z'}]});
+  });
+  const result=await graph.searchVoiceMessages({query:'Eve Trautman'});
+  assert.equal(result.approximateMatch,true);
+  assert.equal(result.suggestedSender,'Yves Trauttmann');
+  assert.equal(result.messages[0].id,'yves');
+  assert.equal(result.scanned,1001);
+});
+

@@ -104,7 +104,7 @@ export class MicrosoftGraphClient {
     return data?.value||[];
   }
 
-  async searchVoiceMessages({mailbox='principal',folder='inbox',query,startIso,endIso,maxScan=1000,maxResults=25}={}) {
+  async searchVoiceMessages({mailbox='principal',folder='inbox',query,startIso,endIso,maxScan=2000,maxResults=25}={}) {
     const owner=this.voiceMailbox(mailbox);
     const folders=['all','inbox','drafts','sentitems','deleteditems'];
     if(!folders.includes(folder))throw new Error('Unsupported mail folder.');
