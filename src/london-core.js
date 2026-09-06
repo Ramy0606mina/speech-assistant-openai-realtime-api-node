@@ -55,7 +55,7 @@ export class LondonCore {
         }
       }
       const attachments = full.hasAttachments ? await this.graph.getLondonAttachments(summary.id) : [];
-      const analysis = await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox });
+      const analysis = await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox, graph: this.graph });
       const text = String(analysis.text || '').trim();
       if (!text) throw new Error('London produced an empty delegated-task result.');
       // Only the winner of the durable claim may save a report or dispatch mail.
