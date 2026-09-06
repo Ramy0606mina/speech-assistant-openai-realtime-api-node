@@ -71,3 +71,25 @@ test('meeting attempt is durable and cannot be replayed',async()=>{
   assert.ok(voiceTools().some(tool=>tool.name==='prepare_calendar_meeting'));assert.ok(voiceTools().some(tool=>tool.name==='confirm_calendar_meeting'));
 });
 
+test('Microsoft cancellation sends the organizer note to attendees',async()=>{
+  const calls=[];const graph=client((url,options)=>{calls.push({url,options});return new Response(null,{status:202});});
+  const result=await graph.cancelVoiceMeeting({eventId:'event-1',comment:'Schedule changed.'});
+  assert.equal(result.cancelled,true);assert.match(calls[0].url,/events\/event-1\/cancel$/);assert.equal(calls[0].options.method,'POST');assert.deepEqual(JSON.parse(calls[0].options.body),{comment:'Schedule changed.'});
+});
+
+test('calendar cancellation requires selection and a later explicit confirmation',async()=>{
+  let cancellations=0;const event={id:'event-1',subject:'Project review',start:{dateTime:'2030-09-11T10:00:00'},end:{dateTime:'2030-09-11T10:30:00'},organizer:{emailAddress:{address:'owner@example.com'}},attendees:[{emailAddress:{name:'Jack',address:'jack@example.com'}}],isOrganizer:true,isCancelled:false};
+  const context={graph:{listPrincipalCalendar:async()=>[event],cancelVoiceMeeting:async()=>{cancellations++;return {cancelled:true,cancellationSent:true};}},dropbox:{createDeliveryRecord:async()=>true},calendarEvents:new Map(),cancellationProposals:new Map(),cancellationRequests:new Set(),callKey:'call'};
+  await assert.rejects(()=>runVoiceTool('prepare_calendar_cancellation',{event_id:'event-1'},context),/check_calendar/);
+  const checked=await runVoiceTool('check_calendar',{start_iso:'2030-09-11T00:00:00-04:00',end_iso:'2030-09-12T00:00:00-04:00'},context);assert.equal(checked.events[0].isOrganizer,true);
+  const prepared=await runVoiceTool('prepare_calendar_cancellation',{event_id:'event-1',comment:'Schedule changed.'},context);assert.equal(prepared.cancelled,false);assert.equal(cancellations,0);
+  await assert.rejects(()=>runVoiceTool('confirm_calendar_cancellation',{proposal_id:prepared.proposal.proposalId,confirmed:false},context),/not explicitly confirmed/);
+  const cancelled=await runVoiceTool('confirm_calendar_cancellation',{proposal_id:prepared.proposal.proposalId,confirmed:true},context);assert.equal(cancelled.cancelled,true);assert.equal(cancellations,1);
+});
+
+test('calendar cancellation refuses meetings Ramy does not organize',async()=>{
+  const context={calendarEvents:new Map([['event-2',{id:'event-2',subject:'External meeting',isOrganizer:false,isCancelled:false}]]),cancellationProposals:new Map()};
+  await assert.rejects(()=>runVoiceTool('prepare_calendar_cancellation',{event_id:'event-2'},context),/not the organizer/);
+  assert.ok(voiceTools().some(tool=>tool.name==='prepare_calendar_cancellation'));assert.ok(voiceTools().some(tool=>tool.name==='confirm_calendar_cancellation'));
+});
+

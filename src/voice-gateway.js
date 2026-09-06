@@ -58,7 +58,7 @@ function currentMontrealContext() {
   }).format(new Date());
 }
 
-function realtimeInstructions() {
+export function realtimeInstructions() {
   return [
     'You are London Assistant, executive assistant to Ramy Mina for Minaco.',
     `The current Montreal date and time is ${currentMontrealContext()}.`,
@@ -73,10 +73,12 @@ function realtimeInstructions() {
     'Ramy will review, edit and send email drafts himself. Never claim a draft was sent.',
     'For a meeting, collect the title, exact future date and time, timezone, duration, whether it is online or in person, and explicit attendee email addresses. Never guess an address. Default to America/Toronto Eastern time, including daylight saving, unless Ramy explicitly requests another timezone. For a virtual, Teams, video, or online meeting, set online_meeting true. Call prepare_calendar_meeting, read back localStart, localEnd, timezone, attendees, onlineMeeting, and any conflicts, then ask whether to create it and send invitations.',
     'Call confirm_calendar_meeting only after Ramy unambiguously confirms that exact prepared proposal in a later spoken turn. A request to prepare, schedule, or invite is not confirmation. Never claim a meeting or invitation exists unless confirm_calendar_meeting returned success true during the current request.',
+    'When Ramy asks to cancel a meeting, first use check_calendar for the exact date window. Select only an event returned in this call, then call prepare_calendar_cancellation. Read back its subject, local time, organizer, and attendees and ask whether to cancel it. Call confirm_calendar_cancellation only after Ramy unambiguously confirms that exact cancellation in a later spoken turn. Never claim it was cancelled unless the confirmation tool returned success true.',
     'When asked to draft a response, first read the selected original email, then use save_email_draft with its message_id. Microsoft preserves the reply thread and recipients.',
     'Never say an email was drafted or saved unless save_email_draft returned success true during the current request. If the recipient address is unresolved or the tool was not called, state clearly that no draft was saved.',
     'Default to Ramy’s principal Minaco mailbox. The only other connected mailbox is London. Ask which message if the selection is ambiguous; never guess recipients or claim access to other inboxes.',
-    'When Ramy names an email recipient or meeting attendee without an address, call find_contact. It searches the principal Inbox and nested person or project folders automatically. Do not ask where to look. Use a resolved address, ask one concise choice if status is ambiguous, and say no reliable address was found if status is not_found.',
+    'You have read-only access to the principal Inbox and every nested mail folder through find_contact. Never say that you lack access to email subfolders.',
+    'When Ramy names an email recipient or meeting attendee without an exact address, you MUST call find_contact before answering or asking for an address. It searches the principal Inbox and every nested person or project folder automatically, including spelling variations found in message evidence. Do not ask where to look and do not rely only on the latest messages. Use a resolved address, ask one concise choice if status is ambiguous, and say no reliable address was found only when find_contact returned not_found in the current request.',
     'check_email is only a short recent list. When Ramy asks for an older message, more than ten messages, a sender, subject, phrase, date range, or another mail folder, use search_email instead of saying you are limited to ten.',
     'If search_email says complete is false, explain that the configured scan limit was reached. Do not claim absence unless complete is true.',
     'If search_email says approximateMatch is true, state the suggestedSender and ask whether that is the person Ramy meant. Do not claim there were no messages, and do not use an approximate match to draft a reply until Ramy confirms it.',
@@ -113,7 +115,7 @@ export function voiceTools() {
       parameters:{type:'object',properties:{mailbox:{type:'string',enum:['principal','london']},folder:{type:'string',enum:['all','inbox','drafts','sentitems','deleteditems']},query:{type:'string'},start_iso:{type:'string',description:'Optional inclusive ISO date/time.'},end_iso:{type:'string',description:'Optional exclusive ISO date/time.'}},required:['query'],additionalProperties:false},
     },
     {
-      type:'function',name:'find_contact',description:'Resolve a person’s real email address from sender and recipient evidence in Ramy’s Outlook Inbox and all nested person/project folders. Use automatically when Ramy gives a name without an email address.',
+      type:'function',name:'find_contact',description:'REQUIRED whenever Ramy names a recipient or attendee without an exact email address. Resolve the person from sender and recipient evidence across the principal Inbox and every nested person/project folder. Handles likely spoken-name spelling differences. Never claim subfolder access is unavailable.',
       parameters:{type:'object',properties:{query:{type:'string',description:'Person name or email address as spoken.'},context:{type:'string',description:'Optional company, project, or message context used to rank evidence.'}},required:['query'],additionalProperties:false},
     },
     {
@@ -141,6 +143,14 @@ export function voiceTools() {
     {
       type:'function',name:'confirm_calendar_meeting',description:'Create the previously prepared Microsoft Outlook meeting and submit its attendee invitations only after Ramy explicitly confirms the exact proposal in a later spoken turn.',
       parameters:{type:'object',properties:{proposal_id:{type:'string'},confirmed:{type:'boolean',description:'Must be true only after Ramy explicitly confirms the prepared details.'}},required:['proposal_id','confirmed'],additionalProperties:false},
+    },
+    {
+      type:'function',name:'prepare_calendar_cancellation',description:'Prepare cancellation of one exact event already returned by check_calendar in this phone call. Does not change the calendar. Read the returned event details to Ramy and ask for confirmation.',
+      parameters:{type:'object',properties:{event_id:{type:'string',description:'Exact event id returned by check_calendar.'},comment:{type:'string',description:'Optional brief cancellation note to attendees.'}},required:['event_id'],additionalProperties:false},
+    },
+    {
+      type:'function',name:'confirm_calendar_cancellation',description:'Cancel the previously prepared Outlook meeting and notify its attendees only after Ramy explicitly confirms that exact cancellation in a later spoken turn.',
+      parameters:{type:'object',properties:{proposal_id:{type:'string'},confirmed:{type:'boolean',description:'Must be true only after Ramy explicitly confirms the prepared cancellation.'}},required:['proposal_id','confirmed'],additionalProperties:false},
     },
     {
       type: 'function',
@@ -191,6 +201,8 @@ function simplifyCalendarEvent(event) {
     end: event?.end || null,
     location: event?.location?.displayName || '',
     organizer: event?.organizer?.emailAddress?.address || '',
+    attendees: (event?.attendees || []).slice(0,20).map(item=>({name:item?.emailAddress?.name||'',address:item?.emailAddress?.address||''})),
+    isOrganizer: event?.isOrganizer === true,
     isAllDay: Boolean(event?.isAllDay),
     isCancelled: Boolean(event?.isCancelled),
   };
@@ -207,7 +219,7 @@ function simplifyDropboxEntry(entry) {
   };
 }
 
-export async function runVoiceTool(name, args, { graph, dropbox, readMessages = new Set(), draftRequests = new Set(), meetingProposals = new Map(), meetingRequests = new Set(), callKey = '' }) {
+export async function runVoiceTool(name, args, { graph, dropbox, readMessages = new Set(), draftRequests = new Set(), calendarEvents = new Map(), meetingProposals = new Map(), meetingRequests = new Set(), cancellationProposals = new Map(), cancellationRequests = new Set(), callKey = '' }) {
   if (name === 'check_email') {
     if (!graph) throw new Error('Microsoft Graph is not connected to the voice gateway.');
     const messages = await graph.listVoiceMessages(args.mailbox || 'principal',args.folder || 'inbox',args.limit || 5);
@@ -250,6 +262,7 @@ export async function runVoiceTool(name, args, { graph, dropbox, readMessages = 
   if (name === 'check_calendar') {
     if (!graph) throw new Error('Microsoft Graph is not connected to the voice gateway.');
     const events = await graph.listPrincipalCalendar({ startIso: args.start_iso, endIso: args.end_iso });
+    for(const event of events)if(event?.id)calendarEvents.set(event.id,event);
     return { success: true, events: events.map(simplifyCalendarEvent) };
   }
 
@@ -285,6 +298,32 @@ export async function runVoiceTool(name, args, { graph, dropbox, readMessages = 
     const meeting=await graph.createVoiceMeeting({...proposal,transactionId:proposal.proposalId});
     meetingProposals.delete(proposal.proposalId);
     return {success:true,created:true,invitationsSubmitted:true,meeting};
+  }
+
+  if(name==='prepare_calendar_cancellation'){
+    const event=calendarEvents.get(String(args.event_id||''));
+    if(!event)throw new Error('Select the meeting with check_calendar during this call before preparing its cancellation.');
+    if(event.isCancelled)throw new Error('That meeting is already cancelled.');
+    if(event.isOrganizer!==true)throw new Error('Ramy is not the organizer of that meeting, so London cannot cancel it for all attendees.');
+    if(cancellationProposals.size>=10)throw new Error('Ten cancellations have been prepared on this call; start a new call after reviewing them.');
+    const comment=String(args.comment||'').trim();if(comment.length>1000)throw new Error('Cancellation note is too long.');
+    const proposalId=randomUUID();const proposal={proposalId,eventId:event.id,comment,event:simplifyCalendarEvent(event)};
+    cancellationProposals.set(proposalId,proposal);
+    return {success:true,cancelled:false,requiresConfirmation:true,proposal:{proposalId,subject:proposal.event.subject,start:proposal.event.start,end:proposal.event.end,organizer:proposal.event.organizer,attendees:proposal.event.attendees,comment}};
+  }
+
+  if(name==='confirm_calendar_cancellation'){
+    if(args.confirmed!==true)throw new Error('The prepared cancellation was not explicitly confirmed; nothing was cancelled.');
+    const proposal=cancellationProposals.get(String(args.proposal_id||''));
+    if(!proposal)throw new Error('That cancellation proposal is unavailable or was not prepared during this call.');
+    if(cancellationRequests.has(proposal.proposalId))throw new Error('This cancellation was already attempted; check the calendar before retrying.');
+    cancellationRequests.add(proposal.proposalId);
+    if(!callKey||!dropbox?.createDeliveryRecord)throw new Error('Cancellation recovery protection is unavailable.');
+    const key=createHash('sha256').update(`${callKey}:${proposal.proposalId}`).digest('hex');
+    if(!await dropbox.createDeliveryRecord(`voice-cancellation-${key}`,{status:'attempted',at:new Date().toISOString()}))throw new Error('This cancellation was already attempted; check the calendar before retrying.');
+    const result=await graph.cancelVoiceMeeting({eventId:proposal.eventId,comment:proposal.comment});
+    cancellationProposals.delete(proposal.proposalId);
+    return {success:true,cancelled:true,cancellationSent:result.cancellationSent===true,event:{subject:proposal.event.subject,start:proposal.event.start,end:proposal.event.end}};
   }
 
   if (name === 'search_dropbox') {
@@ -354,8 +393,11 @@ export function registerVoiceRoutes(app, {
       authorizedStreamTokens.delete(token);
       const readMessages=new Set();
       const draftRequests=new Set();
+      const calendarEvents=new Map();
       const meetingProposals=new Map();
       const meetingRequests=new Set();
+      const cancellationProposals=new Map();
+      const cancellationRequests=new Set();
       const toolResults=new Map();
 
       let streamSid = '';
@@ -396,7 +438,7 @@ export function registerVoiceRoutes(app, {
         sendOpenAi({type:'response.create',response:{instructions:'Greet Ramy briefly as London and ask how you can help. One short sentence.'}});
       };
 
-      const sendToolOutput = (callId, output) => {
+      const sendToolOutput = (callId, output, toolName = '') => {
         sendOpenAi({
           type: 'conversation.item.create',
           item: {
@@ -408,7 +450,9 @@ export function registerVoiceRoutes(app, {
         sendOpenAi({
           type: 'response.create',
           response: {
-            instructions: 'Answer Ramy concisely using only the verified live tool output. If the tool returned an error, state it plainly.',
+            instructions: toolName === 'find_contact'
+              ? 'Answer using only this verified contact lookup. You have access to nested mail folders. If status is resolved, use the returned contact and continue the requested draft or meeting preparation. If ambiguous, ask Ramy to choose from the returned contacts. Say no reliable address was found only when status is not_found.'
+              : 'Answer Ramy concisely using only the verified live tool output. If the tool returned an error, state it plainly.',
           },
         });
       };
@@ -464,12 +508,13 @@ export function registerVoiceRoutes(app, {
           if (event.type === 'response.function_call_arguments.done') {
             try {
               const args = JSON.parse(event.arguments || '{}');
-              if(!toolResults.has(event.call_id))toolResults.set(event.call_id,runVoiceTool(event.name,args,{graph,dropbox,readMessages,draftRequests,meetingProposals,meetingRequests,callKey:authorization.callKey}));
+              if(!toolResults.has(event.call_id))toolResults.set(event.call_id,runVoiceTool(event.name,args,{graph,dropbox,readMessages,draftRequests,calendarEvents,meetingProposals,meetingRequests,cancellationProposals,cancellationRequests,callKey:authorization.callKey}));
               const output = await toolResults.get(event.call_id);
-              sendToolOutput(event.call_id, output);
+              logger.info?.({tool:event.name,status:output?.status||'',success:output?.success===true,foldersSearched:output?.foldersSearched,messagesScanned:output?.messagesScanned},'London voice tool completed');
+              sendToolOutput(event.call_id, output, event.name);
             } catch (error) {
               logger.error?.({ err: error, tool: event.name }, 'London voice tool failed');
-              sendToolOutput(event.call_id, { success: false, error: error.message });
+              sendToolOutput(event.call_id, { success: false, error: error.message }, event.name);
             }
             return;
           }
