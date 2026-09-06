@@ -31,3 +31,7 @@ test('SMS recipient is fixed and queue acceptance is not delivery confirmation',
  let form;const sms=new SmsClient({accountSid:'AC'+'a'.repeat(32),authToken:'test',from:'+15145550100',to:'+15145550101',fetchImpl:async(u,o)=>{form=new URLSearchParams(o.body);return Response.json({sid:'SMtest',status:'queued'});}});
  const result=await sms.send('Test');assert.equal(form.get('To'),'+15145550101');assert.equal(result.status,'queued');assert.equal(result.delivered,undefined);
 });
+test('invalid classification remains retryable rather than silently skipped',async()=>{
+ const f=fixture(),a=f.make();f.openai.respond=async()=>({text:'Maybe'});await assert.rejects(a.tick(),/invalid decision/);
+ f.openai.respond=async()=>({text:'URGENT'});await a.tick();assert.equal(f.sent.length,1);
+});
