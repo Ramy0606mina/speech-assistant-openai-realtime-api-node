@@ -7,6 +7,7 @@ import { OpenAIClient } from './src/openai-client.js';
 import { MicrosoftGraphClient } from './src/microsoft-graph.js';
 import { DropboxClient } from './src/dropbox-client.js';
 import { StateStore } from './src/state-store.js';
+import { DeliveryGuard } from './src/delivery-guard.js';
 import { LondonCore } from './src/london-core.js';
 import { registerVoiceRoutes } from './src/voice-gateway.js';
 
@@ -21,7 +22,9 @@ const graph = new MicrosoftGraphClient({ ...config.microsoft });
 const openai = new OpenAIClient({ apiKey: config.openai.apiKey, model: config.openai.taskModel });
 const dropbox = new DropboxClient(config.dropbox);
 const state = new StateStore(config.runtime.stateFile);
-const london = new LondonCore({ graph, openai, dropbox, state, logger: app.log });
+const deliveryGuard = new DeliveryGuard(dropbox, graph.readMailbox);
+const london = new LondonCore({ graph, openai, dropbox, state, deliveryGuard, logger: app.log });
+let deliveryGuardReady = false;
 
 registerVoiceRoutes(app, {
   openAiApiKey: config.openai.apiKey,
@@ -38,6 +41,7 @@ async function safePoll() {
   if (pollInFlight) return;
   pollInFlight = true;
   try {
+    if (!deliveryGuardReady) { await deliveryGuard.initialize(); deliveryGuardReady = true; }
     const result = await london.pollOnce(config.runtime.pollBatchSize);
     app.log.info({ checked: result.checked }, 'London mailbox poll complete');
   } catch (error) {
@@ -56,6 +60,8 @@ app.get('/health', async () => ({
   sms: 'paused',
   whatsapp: 'removed',
   pendingDeliveryReview: Object.values(state.state.processedMessages).filter(item => item.result === 'delivery-pending-review').length,
+  durableDeliveryGuard: deliveryGuardReady,
+  historicalRequestsHeld: Object.values(state.state.processedMessages).filter(item => item.result === 'historical-review').length,
   ...configurationStatus(config),
   lastPollAt: state.state.lastPollAt,
   time: new Date().toISOString(),
@@ -72,7 +78,10 @@ app.post('/internal/poll-once', async (request, reply) => {
   if (!config.runtime.healthSecret || request.headers['x-london-health-secret'] !== config.runtime.healthSecret) {
     return reply.code(401).send({ ok: false, error: 'Unauthorized.' });
   }
-  return london.pollOnce(config.runtime.pollBatchSize);
+  if (!deliveryGuardReady) return reply.code(503).send({ ok: false, error: 'Delivery ledger is not ready.' });
+  if (pollInFlight) return reply.code(409).send({ ok: false, error: 'Mailbox poll already running.' });
+  await safePoll();
+  return { ok: true };
 });
 
 const port = Number(process.env.PORT || 3000);

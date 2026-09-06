@@ -11,11 +11,12 @@ function completionSubject(subject) {
 }
 
 export class LondonCore {
-  constructor({ graph, openai, dropbox, state, logger = console }) {
+  constructor({ graph, openai, dropbox, state, deliveryGuard, logger = console }) {
     this.graph = graph;
     this.openai = openai;
     this.dropbox = dropbox;
     this.state = state;
+    this.deliveryGuard = deliveryGuard;
     this.logger = logger;
     this.inFlight = new Set();
   }
@@ -46,10 +47,22 @@ export class LondonCore {
     let result;
     const actualSender = String(full.sender?.emailAddress?.address || sender).trim().toLowerCase();
     if (principal && sender === principal && actualSender === principal) {
+      if (this.deliveryGuard) {
+        const reason = await this.deliveryGuard.check(key, full.receivedDateTime);
+        if (reason) {
+          this.state.markMessage(key, { sender, result: reason });
+          return { skipped: true, reason, key };
+        }
+      }
       const attachments = full.hasAttachments ? await this.graph.getLondonAttachments(summary.id) : [];
       const analysis = await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox });
       const text = String(analysis.text || '').trim();
       if (!text) throw new Error('London produced an empty delegated-task result.');
+      // Only the winner of the durable claim may save a report or dispatch mail.
+      if (this.deliveryGuard && !await this.deliveryGuard.claim(key)) {
+        this.state.markMessage(key, { sender, result: 'durable-duplicate' });
+        return { skipped: true, reason: 'durable-duplicate', key };
+      }
       const report = this.dropbox?.saveReports
         ? await this.dropbox.saveReport({ taskKey: key, subject: full.subject, text })
         : null;
@@ -61,6 +74,7 @@ export class LondonCore {
         subject: completionSubject(full.subject),
         body: report ? `${text}\n\nSaved in Dropbox: ${report.path}` : text,
       });
+      if (this.deliveryGuard) await this.deliveryGuard.complete(key, report?.path);
 
       result = { type: 'delegated-task', sender, analysis: text, completionSent: true, reportPath: report?.path || null };
     } else {
