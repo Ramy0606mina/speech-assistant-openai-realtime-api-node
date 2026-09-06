@@ -129,6 +129,45 @@ export class DropboxClient {
     } finally { clearTimeout(timer); }
   }
 
+  deliveryRecordPath(key) {
+    if (!/^[a-z0-9-]{1,150}$/.test(key)) throw new Error('Invalid delivery ledger key.');
+    return this.resolvePath(`London Work/.london-delivery/${key}.json`);
+  }
+
+  async readDeliveryRecord(key) {
+    const token = await this.#token();
+    try {
+      return await fetchJson(this.fetchImpl, 'https://content.dropboxapi.com/2/files/download', {
+        method: 'POST', headers: { Authorization: `Bearer ${token}`,
+          'Dropbox-API-Arg': JSON.stringify({ path: this.deliveryRecordPath(key) }).replace(/[\u007f-\uffff]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`) },
+      }, 30000);
+    } catch (error) {
+      if (error.status === 409 && String(error.data?.error_summary || '').startsWith('path/not_found')) return null;
+      throw error;
+    }
+  }
+
+  async createDeliveryRecord(key, record) {
+    const folder = this.resolvePath('London Work/.london-delivery');
+    try { await this.#rpc('files/create_folder_v2', { path: folder, autorename: false }); }
+    catch (error) {
+      if (error.status !== 409 || !String(error.data?.error_summary || '').startsWith('path/conflict/folder')) throw error;
+    }
+    const token = await this.#token();
+    try {
+      const result = await fetchJson(this.fetchImpl, 'https://content.dropboxapi.com/2/files/upload', {
+        method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/octet-stream',
+          'Dropbox-API-Arg': JSON.stringify({ path: this.deliveryRecordPath(key), mode: 'add', autorename: false, strict_conflict: true, mute: true }).replace(/[\u007f-\uffff]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`) },
+        body: JSON.stringify(record),
+      }, 30000);
+      if (!result?.id) throw new Error('Dropbox did not confirm delivery record creation.');
+      return true;
+    } catch (error) {
+      if (error.status === 409 && String(error.data?.error_summary || '').startsWith('path/conflict/file')) return false;
+      throw error;
+    }
+  }
+
   async saveReport({ taskKey, subject, text }) {
     if (!this.saveReports) throw new Error('Dropbox report saving is not enabled.');
     if (!taskKey || !String(text || '').trim()) throw new Error('Report task and content are required.');
