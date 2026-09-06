@@ -105,6 +105,7 @@ export class MicrosoftGraphClient {
     actionClientSecret,
     londonMailbox,
     ramyMailbox,
+    ramyUserId,
     fetchImpl = fetch,
   }) {
     this.readCreds = { tenantId: readTenantId, clientId: readClientId, clientSecret: readClientSecret };
@@ -115,6 +116,7 @@ export class MicrosoftGraphClient {
     };
     this.londonMailbox = londonMailbox;
     this.ramyMailbox = ramyMailbox;
+    this.ramyUserId = String(ramyUserId || '').trim();
     this.fetchImpl = fetchImpl;
     this.readToken = { value: '', expiresAt: 0 };
     this.actionToken = { value: '', expiresAt: 0 };
@@ -452,9 +454,8 @@ export class MicrosoftGraphClient {
       const calendarSupportsTeams=(calendar?.allowedOnlineMeetingProviders||[]).includes('teamsForBusiness');
       if(!calendarSupportsTeams){
         if(!tokenRoles(token).includes('OnlineMeetings.ReadWrite.All'))throw new Error('London’s Microsoft app needs OnlineMeetings.ReadWrite.All and a user-scoped Teams application access policy before it can create Teams links.');
-        const owner=await fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}?$select=id`,{headers:{Authorization:`Bearer ${token}`}});
-        if(!owner?.id)throw new Error('Microsoft did not return the Teams organizer identity.');
-        const online=await fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(owner.id)}/onlineMeetings/createOrGet`,{
+        if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(this.ramyUserId))throw new Error('London’s verified Microsoft organizer ID is not configured.');
+        const online=await fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.ramyUserId)}/onlineMeetings/createOrGet`,{
           method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({startDateTime:start.toISOString(),endDateTime:end.toISOString(),subject,externalId:String(transactionId)}),
         });
         standaloneJoinUrl=verifiedTeamsJoinUrl(online?.joinWebUrl);
