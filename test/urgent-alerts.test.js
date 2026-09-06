@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {UrgentAlerts} from '../src/urgent-alerts.js';
+import {UrgentAlerts,buildUrgentSms,urgencyInstructions} from '../src/urgent-alerts.js';
 import {DeliveryGuard} from '../src/delivery-guard.js';
 import {SmsClient} from '../src/sms-client.js';
 
@@ -8,7 +8,7 @@ function fixture(){
  const records=new Map(),sent=[];
  const store={readDeliveryRecord:async k=>records.get(k),createDeliveryRecord:async(k,v)=>{if(records.has(k))return false;records.set(k,v);return true;}};
  const graph={listPrincipalInbox:async()=>[{id:'new',receivedDateTime:new Date(Date.now()+1000).toISOString(),bodyPreview:'test'}]};
- const openai={respond:async()=>({text:'URGENT'})};
+ const openai={respond:async({instructions})=>({text:instructions===urgencyInstructions?'URGENT':'Please call back now.'})};
  const sms={configured:true,send:async text=>sent.push(text)};
  const make=()=>new UrgentAlerts({graph,openai,sms,guard:new DeliveryGuard(store,'owner:urgent')});
  return {graph,openai,sms,sent,make};
@@ -34,4 +34,26 @@ test('SMS recipient is fixed and queue acceptance is not delivery confirmation',
 test('invalid classification remains retryable rather than silently skipped',async()=>{
  const f=fixture(),a=f.make();f.openai.respond=async()=>({text:'Maybe'});await assert.rejects(a.tick(),/invalid decision/);
  f.openai.respond=async()=>({text:'URGENT'});await a.tick();assert.equal(f.sent.length,1);
+});
+
+test('alert includes actual sender and a summary grounded in the email preview',async()=>{
+ const message={from:{emailAddress:{name:'Mina Capital',address:'sender@example.com'}},subject:'Callback',bodyPreview:'Ramy, please call me now.'};
+ const text=await buildUrgentSms(message,{respond:async request=>{
+  assert.deepEqual(JSON.parse(request.input),{subject:'Callback',preview:'Ramy, please call me now.'});
+  return {text:'Please call back now.'};
+ }});
+ assert.equal(text,'London | From: Mina Capital\nPlease call back now.');
+});
+
+test('summary failure before dispatch remains retryable and does not claim delivery',async()=>{
+ const f=fixture(),a=f.make();
+ f.openai.respond=async({instructions})=>{if(instructions!==urgencyInstructions)throw Error('summary unavailable');return {text:'URGENT'};};
+ await assert.rejects(a.tick(),/summary unavailable/);assert.equal(f.sent.length,0);
+ f.openai.respond=async({instructions})=>({text:instructions===urgencyInstructions?'URGENT':'Call back now.'});
+ await a.tick();await f.make().tick();assert.equal(f.sent.length,1);assert.match(f.sent[0],/Call back now/);
+});
+
+test('sender fallback and message size remain bounded',async()=>{
+ const text=await buildUrgentSms({from:{emailAddress:{address:'owner@example.com'}}},{respond:async()=>({text:'x'.repeat(500)})});
+ assert.match(text,/From: owner@example.com/);assert.ok(text.length<250);
 });
