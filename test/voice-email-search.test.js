@@ -9,7 +9,7 @@ test('search pages beyond ten messages and finds an older sender',async()=>{
   let pages=0;
   const graph=graphWith(url=>{
     pages++;
-    if(pages===1){url.searchParams.set('$skiptoken','next');return Response.json({value:Array.from({length:50},(_,i)=>({id:`recent-${i}`,subject:'Other',from:{emailAddress:{name:'Other'}}})),'@odata.nextLink':url.href});}
+    if(pages===1){const next=new URL(url);next.pathname="/v1.0/users/owner@example.com/mailFolders('inbox')/messages";next.searchParams.set('$skiptoken','next');return Response.json({value:Array.from({length:50},(_,i)=>({id:`recent-${i}`,subject:'Other',from:{emailAddress:{name:'Other'}}})),'@odata.nextLink':next.href});}
     return Response.json({value:[{id:'eve',subject:'Project update',from:{emailAddress:{name:'Eve Trotman',address:'eve@example.com'}},receivedDateTime:'2026-08-20T12:00:00Z',bodyPreview:'Update attached.'}]});
   });
   const result=await graph.searchVoiceMessages({query:'Eve Trotman'});
@@ -36,3 +36,9 @@ test('search rejects invalid folders, ranges, and foreign paging links',async()=
   await assert.rejects(()=>graph.searchVoiceMessages({query:'Eve',startIso:'bad'}),/date range/);
   await assert.rejects(()=>graph.searchVoiceMessages({query:'Eve'}),/paging was invalid/);
 });
+
+test('search rejects a Microsoft paging link for another mailbox',async()=>{
+  const graph=graphWith(()=>Response.json({value:[],'@odata.nextLink':"https://graph.microsoft.com/v1.0/users/other@example.com/mailFolders('inbox')/messages?$skiptoken=x"}));
+  await assert.rejects(()=>graph.searchVoiceMessages({query:'Eve'}),/paging was invalid/);
+});
+

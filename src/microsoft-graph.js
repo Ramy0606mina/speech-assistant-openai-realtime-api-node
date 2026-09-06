@@ -100,8 +100,17 @@ export class MicrosoftGraphClient {
     let next=first,scanned=0;
     const matches=[];
     const visited=new Set();
+    const ownerPath=owner.toLowerCase();
+    const allowedPaths=folder==='all'
+      ? new Set([`/v1.0/users/${ownerPath}/messages`])
+      : new Set([
+          `/v1.0/users/${ownerPath}/mailfolders/${folder}/messages`,
+          `/v1.0/users/${ownerPath}/mailfolders('${folder}')/messages`,
+        ]);
     while(next&&scanned<maxScan) {
-      if(next.origin!=='https://graph.microsoft.com'||!next.pathname.startsWith(`/v1.0/users/${encodeURIComponent(owner)}/`)||!next.pathname.endsWith('/messages')||visited.has(next.href)||visited.size>=50)throw new Error('Email search paging was invalid; results were not established.');
+      let pagingPath='';
+      try { pagingPath=decodeURIComponent(next.pathname).toLowerCase(); } catch {}
+      if(next.origin!=='https://graph.microsoft.com'||next.username||next.password||!allowedPaths.has(pagingPath)||visited.has(next.href)||visited.size>=50)throw new Error('Email search paging was invalid; results were not established.');
       visited.add(next.href);
       const page=await fetchJson(this.fetchImpl,next,{headers:{Authorization:`Bearer ${token}`,Prefer:'IdType="ImmutableId", outlook.body-content-type="text"'}});
       if(!Array.isArray(page?.value))throw new Error('Email search response was invalid.');
@@ -312,3 +321,4 @@ export class MicrosoftGraphClient {
     return { sent: true };
   }
 }
+
