@@ -1,0 +1,41 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {MicrosoftGraphClient} from '../src/microsoft-graph.js';
+import {runVoiceTool,voiceTools} from '../src/voice-gateway.js';
+
+function graphWith(handler){return new MicrosoftGraphClient({readTenantId:'t',readClientId:'c',readClientSecret:'s',actionTenantId:'t',actionClientId:'c',actionClientSecret:'s',ramyMailbox:'owner@example.com',londonMailbox:'london@example.com',fetchImpl:async(url,options)=>String(url).includes('oauth2')?Response.json({access_token:'token',expires_in:3600}):handler(new URL(url),options)});}
+
+test('contact lookup searches a nested person folder and resolves from message evidence',async()=>{
+  const visited=[];const graph=graphWith(url=>{visited.push(decodeURIComponent(url.pathname));
+    if(url.pathname.endsWith('/mailFolders/inbox'))return Response.json({id:'inbox-id',displayName:'Inbox',childFolderCount:1});
+    if(url.pathname.includes('/mailFolders/inbox-id/childFolders'))return Response.json({value:[{id:'project-id',displayName:'PROJECTS',childFolderCount:1}]});
+    if(url.pathname.includes('/mailFolders/project-id/childFolders'))return Response.json({value:[{id:'jack-id',displayName:'JACK',childFolderCount:0}]});
+    if(url.pathname.includes('/mailFolders/jack-id/messages'))return Response.json({value:[{subject:'Engagement Letter',from:{emailAddress:{name:'Jack Rawdon',address:'jack.rawdon@example.com'}},toRecipients:[{emailAddress:{name:'Owner',address:'owner@example.com'}}],receivedDateTime:'2026-09-04T03:53:53Z'}]});
+    if(url.pathname.endsWith('/messages'))return Response.json({value:[]});throw new Error(`Unexpected ${url}`);
+  });
+  const result=await graph.resolveVoiceContact({query:'Jack Rodden',context:'Engagement Letter'});
+  assert.equal(result.status,'resolved');assert.equal(result.contacts[0].address,'jack.rawdon@example.com');assert.ok(result.contacts[0].folders.some(f=>f.includes('PROJECTS/JACK')));assert.ok(visited.some(p=>p.includes('project-id/childFolders')));
+});
+
+test('contact lookup reports ambiguity when the same spoken name maps to two addresses',async()=>{
+  const graph=graphWith(url=>{
+    if(url.pathname.endsWith('/mailFolders/inbox'))return Response.json({id:'inbox',displayName:'Inbox',childFolderCount:0});
+    if(url.pathname.endsWith('/messages'))return Response.json({value:[
+      {from:{emailAddress:{name:'Alex Smith',address:'alex.one@example.com'}},receivedDateTime:'2026-09-04T00:00:00Z'},
+      {from:{emailAddress:{name:'Alex Smith',address:'alex.two@example.com'}},receivedDateTime:'2026-09-03T00:00:00Z'},
+    ]});throw new Error(`Unexpected ${url}`);
+  });
+  const result=await graph.resolveVoiceContact({query:'Alex Smith'});assert.equal(result.status,'ambiguous');assert.equal(result.contacts.length,2);
+});
+
+test('contact lookup never invents an address when evidence is absent',async()=>{
+  const graph=graphWith(url=>url.pathname.endsWith('/mailFolders/inbox')?Response.json({id:'inbox',displayName:'Inbox',childFolderCount:0}):Response.json({value:[]}));
+  const result=await graph.resolveVoiceContact({query:'Unknown Person'});assert.equal(result.status,'not_found');assert.deepEqual(result.contacts,[]);
+});
+
+test('voice exposes automatic Outlook contact lookup',async()=>{
+  assert.ok(voiceTools().some(tool=>tool.name==='find_contact'));
+  const graph={resolveVoiceContact:async args=>{assert.equal(args.query,'Jack Rodden');return {status:'resolved',contacts:[{name:'Jack Rawdon',address:'jack@example.com'}],foldersSearched:3,messagesScanned:20};}};
+  const result=await runVoiceTool('find_contact',{query:'Jack Rodden'},{graph});assert.equal(result.status,'resolved');assert.equal(result.contacts[0].address,'jack@example.com');
+});
+

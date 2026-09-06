@@ -71,11 +71,12 @@ function realtimeInstructions() {
     'Use the live tools whenever Ramy asks about current email, his calendar, or Dropbox.',
     'You can read connected inbox messages, read calendars and Dropbox listings, save NEW emails or reply drafts in Outlook Drafts, and prepare Microsoft Outlook meetings for explicit confirmation.',
     'Ramy will review, edit and send email drafts himself. Never claim a draft was sent.',
-    'For a meeting, collect the title, exact future date and time, timezone, duration, and explicit attendee email addresses. Never guess an address. Call prepare_calendar_meeting, read back its exact proposal and any conflicts, then ask whether to create it and send invitations.',
+    'For a meeting, collect the title, exact future date and time, timezone, duration, and explicit attendee email addresses. Never guess an address. Default to America/Toronto Eastern time, including daylight saving, unless Ramy explicitly requests another timezone. Call prepare_calendar_meeting, read back localStart, localEnd, timezone, attendees, and any conflicts, then ask whether to create it and send invitations.',
     'Call confirm_calendar_meeting only after Ramy unambiguously confirms that exact prepared proposal in a later spoken turn. A request to prepare, schedule, or invite is not confirmation. Never claim a meeting or invitation exists unless confirm_calendar_meeting returned success true during the current request.',
     'When asked to draft a response, first read the selected original email, then use save_email_draft with its message_id. Microsoft preserves the reply thread and recipients.',
     'Never say an email was drafted or saved unless save_email_draft returned success true during the current request. If the recipient address is unresolved or the tool was not called, state clearly that no draft was saved.',
     'Default to Ramy’s principal Minaco mailbox. The only other connected mailbox is London. Ask which message if the selection is ambiguous; never guess recipients or claim access to other inboxes.',
+    'When Ramy names an email recipient or meeting attendee without an address, call find_contact. It searches the principal Inbox and nested person or project folders automatically. Do not ask where to look. Use a resolved address, ask one concise choice if status is ambiguous, and say no reliable address was found if status is not_found.',
     'check_email is only a short recent list. When Ramy asks for an older message, more than ten messages, a sender, subject, phrase, date range, or another mail folder, use search_email instead of saying you are limited to ten.',
     'If search_email says complete is false, explain that the configured scan limit was reached. Do not claim absence unless complete is true.',
     'If search_email says approximateMatch is true, state the suggestedSender and ask whether that is the person Ramy meant. Do not claim there were no messages, and do not use an approximate match to draft a reply until Ramy confirms it.',
@@ -112,6 +113,10 @@ export function voiceTools() {
       parameters:{type:'object',properties:{mailbox:{type:'string',enum:['principal','london']},folder:{type:'string',enum:['all','inbox','drafts','sentitems','deleteditems']},query:{type:'string'},start_iso:{type:'string',description:'Optional inclusive ISO date/time.'},end_iso:{type:'string',description:'Optional exclusive ISO date/time.'}},required:['query'],additionalProperties:false},
     },
     {
+      type:'function',name:'find_contact',description:'Resolve a person’s real email address from sender and recipient evidence in Ramy’s Outlook Inbox and all nested person/project folders. Use automatically when Ramy gives a name without an email address.',
+      parameters:{type:'object',properties:{query:{type:'string',description:'Person name or email address as spoken.'},context:{type:'string',description:'Optional company, project, or message context used to rank evidence.'}},required:['query'],additionalProperties:false},
+    },
+    {
       type:'function',name:'save_email_draft',description:'Save a new email or reply in Outlook Drafts ONLY when Ramy requests it. Never sends. For a reply, provide the original message_id after read_email. For a new email, provide exact to addresses and subject.',
       parameters:{type:'object',properties:{mailbox:{type:'string',enum:['principal','london']},message_id:{type:'string'},to:{type:'array',items:{type:'string'},maxItems:10},subject:{type:'string'},body:{type:'string',description:'The requested draft text or reply text.'}},required:['body'],additionalProperties:false},
     },
@@ -131,7 +136,7 @@ export function voiceTools() {
     },
     {
       type:'function',name:'prepare_calendar_meeting',description:'Prepare and conflict-check an exact Microsoft Outlook meeting proposal without creating it or sending invitations. Read the returned details to Ramy and ask for confirmation.',
-      parameters:{type:'object',properties:{title:{type:'string'},start_iso:{type:'string',description:'ISO 8601 meeting start with explicit timezone offset or Z.'},timezone:{type:'string',description:'Spoken timezone label, normally America/Toronto.'},duration_minutes:{type:'integer',minimum:15,maximum:480},attendees:{type:'array',items:{type:'string'},minItems:1,maxItems:20,description:'Exact attendee email addresses only.'},body:{type:'string'},location:{type:'string'}},required:['title','start_iso','timezone','duration_minutes','attendees'],additionalProperties:false},
+      parameters:{type:'object',properties:{title:{type:'string'},start_iso:{type:'string',description:'ISO 8601 meeting start with an offset matching the requested timezone. Default to Toronto local Eastern time and its date-specific daylight-saving offset.'},timezone:{type:'string',description:'Default America/Toronto unless Ramy explicitly requests another timezone.'},duration_minutes:{type:'integer',minimum:15,maximum:480},attendees:{type:'array',items:{type:'string'},minItems:1,maxItems:20,description:'Exact attendee email addresses only.'},body:{type:'string'},location:{type:'string'}},required:['title','start_iso','timezone','duration_minutes','attendees'],additionalProperties:false},
     },
     {
       type:'function',name:'confirm_calendar_meeting',description:'Create the previously prepared Microsoft Outlook meeting and submit its attendee invitations only after Ramy explicitly confirms the exact proposal in a later spoken turn.',
@@ -223,6 +228,11 @@ export async function runVoiceTool(name, args, { graph, dropbox, readMessages = 
     return response;
   }
 
+  if(name==='find_contact'){
+    if(!graph)throw new Error('Microsoft Graph is not connected to the voice gateway.');
+    return {success:true,...await graph.resolveVoiceContact({mailbox:'principal',query:args.query,context:args.context||''})};
+  }
+
   if (name === 'save_email_draft') {
     const mailbox=args.mailbox||'principal';
     if(args.message_id && !readMessages.has(`${mailbox}:${args.message_id}`))throw new Error('Read the selected original email before drafting its reply.');
@@ -246,7 +256,7 @@ export async function runVoiceTool(name, args, { graph, dropbox, readMessages = 
   if(name==='prepare_calendar_meeting'){
     if(!graph)throw new Error('Microsoft Graph is not connected to the voice gateway.');
     const title=String(args.title||'').trim();
-    const start=new Date(args.start_iso);const duration=Number(args.duration_minutes);const timezone=String(args.timezone||'').trim();
+    const start=new Date(args.start_iso);const duration=Number(args.duration_minutes);const timezone=String(args.timezone||'America/Toronto').trim();
     const attendees=Array.isArray(args.attendees)?[...new Set(args.attendees.map(v=>String(v||'').trim().toLowerCase()))]:[];
     if(!title||title.length>180)throw new Error('Meeting title is required and must be at most 180 characters.');
     if(!/^(?:.+(?:Z|[+-]\d{2}:\d{2}))$/.test(String(args.start_iso||''))||!Number.isFinite(start.getTime())||start<=new Date())throw new Error('Meeting start requires an explicit future date, time, and timezone offset.');
@@ -256,10 +266,11 @@ export async function runVoiceTool(name, args, { graph, dropbox, readMessages = 
     if(String(args.body||'').length>4000||String(args.location||'').length>300)throw new Error('Meeting notes or location are too long.');
     if(meetingProposals.size>=10)throw new Error('Ten meeting proposals have been prepared on this call; start a new call after reviewing them.');
     const proposalId=randomUUID();const end=new Date(start.getTime()+duration*60000);
-    const proposal={proposalId,title,startIso:start.toISOString(),endIso:end.toISOString(),durationMinutes:duration,timezone,attendees,body:String(args.body||''),location:String(args.location||'')};
+    const proposal={proposalId,title,startIso:String(args.start_iso),endIso:end.toISOString(),durationMinutes:duration,timezone,attendees,body:String(args.body||''),location:String(args.location||'')};
     const conflicts=await graph.listPrincipalCalendar({startIso:proposal.startIso,endIso:proposal.endIso});
     meetingProposals.set(proposalId,proposal);
-    return {success:true,created:false,invitationsSubmitted:false,requiresConfirmation:true,proposal:{proposalId,title,startIso:proposal.startIso,endIso:proposal.endIso,durationMinutes:duration,timezone,attendees,location:proposal.location},conflicts:conflicts.filter(e=>!e.isCancelled&&e.showAs!=='free').map(simplifyCalendarEvent)};
+    const preview=await graph.previewVoiceMeeting?.(proposal);
+    return {success:true,created:false,invitationsSubmitted:false,requiresConfirmation:true,proposal:{proposalId,title,startIso:proposal.startIso,endIso:proposal.endIso,localStart:preview?.localStart||proposal.startIso,localEnd:preview?.localEnd||proposal.endIso,durationMinutes:duration,timezone:preview?.timezone||timezone,microsoftTimeZone:preview?.microsoftTimeZone||'',attendees,location:proposal.location},conflicts:conflicts.filter(e=>!e.isCancelled&&e.showAs!=='free').map(simplifyCalendarEvent)};
   }
 
   if(name==='confirm_calendar_meeting'){

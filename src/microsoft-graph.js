@@ -34,6 +34,55 @@ function approximatePersonScore(query,sender) {
   return scores[1]>=0.45 ? (scores[0]+scores[1])/2 : 0;
 }
 
+const MEETING_ZONE_ALIASES=new Map([
+  ['america/toronto',{iana:'America/Toronto',graph:'Eastern Standard Time',label:'America/Toronto'}],
+  ['america/new_york',{iana:'America/Toronto',graph:'Eastern Standard Time',label:'America/Toronto'}],
+  ['eastern standard time',{iana:'America/Toronto',graph:'Eastern Standard Time',label:'America/Toronto'}],
+  ['eastern time',{iana:'America/Toronto',graph:'Eastern Standard Time',label:'America/Toronto'}],
+  ['et',{iana:'America/Toronto',graph:'Eastern Standard Time',label:'America/Toronto'}],
+  ['utc',{iana:'UTC',graph:'UTC',label:'UTC'}],
+  ['america/chicago',{iana:'America/Chicago',graph:'Central Standard Time',label:'America/Chicago'}],
+  ['central standard time',{iana:'America/Chicago',graph:'Central Standard Time',label:'America/Chicago'}],
+  ['america/denver',{iana:'America/Denver',graph:'Mountain Standard Time',label:'America/Denver'}],
+  ['mountain standard time',{iana:'America/Denver',graph:'Mountain Standard Time',label:'America/Denver'}],
+  ['america/los_angeles',{iana:'America/Los_Angeles',graph:'Pacific Standard Time',label:'America/Los_Angeles'}],
+  ['pacific standard time',{iana:'America/Los_Angeles',graph:'Pacific Standard Time',label:'America/Los_Angeles'}],
+]);
+
+function meetingZone(value) {
+  const raw=String(value||'').trim();
+  const alias=MEETING_ZONE_ALIASES.get(raw.toLowerCase());
+  const zone=alias||{iana:raw,graph:raw,label:raw};
+  try { new Intl.DateTimeFormat('en-CA',{timeZone:zone.iana}).format(new Date()); }
+  catch { throw new Error('Meeting timezone is unsupported. Use America/Toronto unless another timezone is explicitly requested.'); }
+  return zone;
+}
+
+function zonedDateTime(date,iana) {
+  const parts=Object.fromEntries(new Intl.DateTimeFormat('en-CA',{timeZone:iana,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(date).filter(p=>p.type!=='literal').map(p=>[p.type,p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function verifiedMeetingStart(startIso,timezone) {
+  const raw=String(startIso||'');
+  const match=raw.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/);
+  const date=new Date(raw);const zone=meetingZone(timezone||'America/Toronto');
+  if(!match||!Number.isFinite(date.getTime()))throw new Error('Meeting start requires an explicit ISO date, time, and offset.');
+  const supplied=`${match[1]}T${match[2]}:${match[3]}:${match[4]||'00'}`;
+  if(zonedDateTime(date,zone.iana)!==supplied)throw new Error('Meeting time offset does not match the requested timezone or its daylight-saving rules.');
+  return {date,zone,local:supplied};
+}
+
+function contactNameScore(query,name,address='') {
+  const emailQuery=normalizeEmail(query);
+  if(emailQuery.includes('@'))return emailQuery===normalizeEmail(address)?1:0;
+  const q=nameWords(query),n=nameWords(name);
+  if(q.length<1||n.length<1)return 0;
+  if(q.join(' ')===n.join(' '))return 1;
+  if(q.every(word=>n.includes(word)))return 0.92;
+  return approximatePersonScore(query,name);
+}
+
 export class MicrosoftGraphClient {
   constructor({
     readTenantId,
@@ -162,6 +211,64 @@ export class MicrosoftGraphClient {
       return {messages:selected,scanned,complete:!next,approximateMatch:true,suggestedSender};
     }
     return {messages:matches,scanned,complete:!next};
+  }
+
+  async resolveVoiceContact({mailbox='principal',query,context='',maxMessages=5000}={}) {
+    const owner=this.voiceMailbox(mailbox);
+    const term=String(query||'').trim();
+    if(!term||term.length>160)throw new Error('A contact name or email address is required.');
+    const token=await this.#getToken(this.actionCreds,this.actionToken);
+    const base=`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(owner)}`;
+    const headers={Authorization:`Bearer ${token}`,Prefer:'IdType="ImmutableId", outlook.body-content-type="text"'};
+    const inbox=await fetchJson(this.fetchImpl,`${base}/mailFolders/inbox?$select=id,displayName,parentFolderId,childFolderCount`,{headers});
+    if(!inbox?.id)throw new Error('The principal Inbox could not be opened for contact lookup.');
+    const folders=[{id:inbox.id,name:inbox.displayName||'Inbox',path:inbox.displayName||'Inbox',childFolderCount:Number(inbox.childFolderCount||0)}];
+    const queue=[folders[0]];const folderIds=new Set([String(inbox.id)]);
+    const validPage=(url,suffix)=>{
+      let path='';try{path=decodeURIComponent(url.pathname).toLowerCase();}catch{}
+      return url.origin==='https://graph.microsoft.com'&&!url.username&&!url.password&&path.startsWith(`/v1.0/users/${owner.toLowerCase()}/`)&&path.endsWith(suffix);
+    };
+    while(queue.length){
+      const parent=queue.shift();if(!parent.childFolderCount)continue;
+      let next=new URL(`${base}/mailFolders/${encodeURIComponent(parent.id)}/childFolders?$top=100&$select=id,displayName,parentFolderId,childFolderCount`);const seen=new Set();
+      while(next){
+        if(!validPage(next,'/childfolders')||seen.has(next.href)||seen.size>=20)throw new Error('Mailbox folder lookup did not complete safely.');
+        seen.add(next.href);const page=await fetchJson(this.fetchImpl,next,{headers});
+        if(!Array.isArray(page?.value))throw new Error('Mailbox folder response was invalid.');
+        for(const item of page.value){
+          if(!item?.id||folderIds.has(String(item.id)))continue;
+          if(folders.length>=200)throw new Error('Mailbox has too many nested folders for reliable contact lookup.');
+          folderIds.add(String(item.id));const folder={id:item.id,name:item.displayName||'',path:`${parent.path}/${item.displayName||''}`,childFolderCount:Number(item.childFolderCount||0)};folders.push(folder);queue.push(folder);
+        }
+        next=page['@odata.nextLink']?new URL(page['@odata.nextLink']):null;
+      }
+    }
+    const contextNeedle=nameWords(context).join(' ');const queryNeedle=nameWords(term).join(' ');
+    const candidates=new Map();let scanned=0;
+    for(const folder of folders){
+      const folderText=nameWords(folder.path).join(' ');const relevant=Boolean((queryNeedle&&folderText.includes(queryNeedle))||(contextNeedle&&folderText.includes(contextNeedle)));
+      let pages=0;let next=new URL(`${base}/mailFolders/${encodeURIComponent(folder.id)}/messages?$top=50&$orderby=receivedDateTime desc&$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime`);const seen=new Set();
+      while(next&&scanned<maxMessages&&(pages<1||relevant&&pages<5)){
+        if(!validPage(next,'/messages')||seen.has(next.href))throw new Error('Contact evidence paging did not complete safely.');
+        seen.add(next.href);pages++;const page=await fetchJson(this.fetchImpl,next,{headers});
+        if(!Array.isArray(page?.value))throw new Error('Contact evidence response was invalid.');
+        for(const message of page.value){
+          if(scanned++>=maxMessages)break;
+          const people=[message.from?.emailAddress,...(message.toRecipients||[]).map(v=>v.emailAddress),...(message.ccRecipients||[]).map(v=>v.emailAddress)].filter(Boolean);
+          for(const person of people){
+            const address=normalizeEmail(person.address);if(!address||address===owner||address===this.readMailbox)continue;
+            const name=String(person.name||'').trim();const baseScore=contactNameScore(term,name,address);if(baseScore<0.56)continue;
+            const subjectContext=contextNeedle&&nameWords(message.subject).join(' ').includes(contextNeedle)?0.04:0;const score=Math.min(1,baseScore+(relevant?0.04:0)+subjectContext);
+            const existing=candidates.get(address)||{address,name,score:0,evidenceCount:0,latestDateTime:'',folders:new Set()};existing.score=Math.max(existing.score,score);existing.evidenceCount++;existing.name=existing.name||name;const when=message.receivedDateTime||message.sentDateTime||'';if(when>existing.latestDateTime)existing.latestDateTime=when;existing.folders.add(folder.path);candidates.set(address,existing);
+          }
+        }
+        next=page['@odata.nextLink']?new URL(page['@odata.nextLink']):null;
+      }
+    }
+    const contacts=[...candidates.values()].map(c=>({...c,score:Number(c.score.toFixed(3)),folders:[...c.folders].slice(0,5)})).sort((a,b)=>b.score-a.score||b.evidenceCount-a.evidenceCount||b.latestDateTime.localeCompare(a.latestDateTime));
+    if(!contacts.length)return {status:'not_found',contacts:[],foldersSearched:folders.length,messagesScanned:scanned};
+    const resolved=!contacts[1]||contacts[0].score-contacts[1].score>=0.08;
+    return {status:resolved?'resolved':'ambiguous',contacts:contacts.slice(0,resolved?1:5),foldersSearched:folders.length,messagesScanned:scanned};
   }
 
   async getVoiceMessage(mailbox,id) {
@@ -308,16 +415,19 @@ export class MicrosoftGraphClient {
     return events;
   }
 
-  async createVoiceMeeting({title,startIso,durationMinutes,timezone,attendees,body='',location='',transactionId}={}) {
+  previewVoiceMeeting({startIso,durationMinutes,timezone='America/Toronto'}={}) {
+    const verified=verifiedMeetingStart(startIso,timezone);const duration=Number(durationMinutes);
+    if(!Number.isInteger(duration)||duration<15||duration>480)throw new Error('Meeting duration must be between 15 minutes and 8 hours.');
+    const end=new Date(verified.date.getTime()+duration*60000);
+    return {startIso:verified.date.toISOString(),endIso:end.toISOString(),localStart:verified.local,localEnd:zonedDateTime(end,verified.zone.iana),timezone:verified.zone.label,microsoftTimeZone:verified.zone.graph};
+  }
+
+  async createVoiceMeeting({title,startIso,durationMinutes,timezone='America/Toronto',attendees,body='',location='',transactionId}={}) {
     const subject=String(title||'').trim();
-    const start=new Date(startIso);
+    const preview=this.previewVoiceMeeting({startIso,durationMinutes,timezone});const start=new Date(preview.startIso);
     const duration=Number(durationMinutes);
-    const zone=String(timezone||'').trim();
     const addresses=Array.isArray(attendees)?[...new Set(attendees.map(normalizeEmail))]:[];
     if(!this.principalMailbox||!subject||subject.length>180)throw new Error('Meeting title is required and must be at most 180 characters.');
-    if(!/^(?:.+(?:Z|[+-]\d{2}:\d{2}))$/.test(String(startIso||''))||!Number.isFinite(start.getTime()))throw new Error('Meeting start requires an explicit ISO date, time, and offset.');
-    if(!Number.isInteger(duration)||duration<15||duration>480)throw new Error('Meeting duration must be between 15 minutes and 8 hours.');
-    if(!zone||zone.length>80)throw new Error('Meeting timezone is required.');
     if(!addresses.length||addresses.length>20||addresses.some(value=>!/^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/.test(value)))throw new Error('Meeting invitations require one to twenty explicit attendee email addresses.');
     if(String(body).length>4000||String(location).length>300)throw new Error('Meeting notes or location are too long.');
     if(!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(transactionId||'')))throw new Error('Meeting transaction is invalid.');
@@ -325,12 +435,12 @@ export class MicrosoftGraphClient {
     const token=await this.#getToken(this.actionCreds,this.actionToken);
     const result=await fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}/events`,{
       method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({
-        subject,body:{contentType:'Text',content:String(body)},start:{dateTime:start.toISOString().replace(/Z$/,''),timeZone:'UTC'},end:{dateTime:end.toISOString().replace(/Z$/,''),timeZone:'UTC'},
+        subject,body:{contentType:'Text',content:String(body)},start:{dateTime:preview.localStart,timeZone:preview.microsoftTimeZone},end:{dateTime:preview.localEnd,timeZone:preview.microsoftTimeZone},
         location:{displayName:String(location)},attendees:addresses.map(address=>({emailAddress:{address},type:'required'})),allowNewTimeProposals:true,transactionId,
       }),
     });
     if(!result?.id)throw new Error('Microsoft did not confirm meeting creation; invitation delivery was not established.');
-    return {id:result.id,title:subject,startIso:start.toISOString(),endIso:end.toISOString(),durationMinutes:duration,timezone:zone,attendees:addresses,location:String(location),calendar:'Primary Outlook calendar',invitationsSubmitted:true};
+    return {id:result.id,title:subject,...preview,durationMinutes:duration,attendees:addresses,location:String(location),calendar:'Primary Outlook calendar',invitationsSubmitted:true};
   }
 
   async createFollowUp({ title, date, notes = '', taskKey, reminder = true }) {
