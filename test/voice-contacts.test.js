@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {MicrosoftGraphClient} from '../src/microsoft-graph.js';
-import {runVoiceTool,voiceTools} from '../src/voice-gateway.js';
+import {realtimeInstructions,runVoiceTool,voiceTools} from '../src/voice-gateway.js';
 
 function graphWith(handler){return new MicrosoftGraphClient({readTenantId:'t',readClientId:'c',readClientSecret:'s',actionTenantId:'t',actionClientId:'c',actionClientSecret:'s',ramyMailbox:'owner@example.com',londonMailbox:'london@example.com',fetchImpl:async(url,options)=>String(url).includes('oauth2')?Response.json({access_token:'token',expires_in:3600}):handler(new URL(url),options)});}
 
@@ -38,4 +38,13 @@ test('voice exposes automatic Outlook contact lookup',async()=>{
   const graph={resolveVoiceContact:async args=>{assert.equal(args.query,'Jack Rodden');return {status:'resolved',contacts:[{name:'Jack Rawdon',address:'jack@example.com'}],foldersSearched:3,messagesScanned:20};}};
   const result=await runVoiceTool('find_contact',{query:'Jack Rodden'},{graph});assert.equal(result.status,'resolved');assert.equal(result.contacts[0].address,'jack@example.com');
 });
+
+test('voice requires nested-folder lookup before claiming an attendee is missing',()=>{
+  const instructions=realtimeInstructions();
+  const contactTool=voiceTools().find(tool=>tool.name==='find_contact');
+  assert.match(instructions,/MUST call find_contact before answering or asking for an address/);
+  assert.match(instructions,/Never say that you lack access to email subfolders/);
+  assert.match(contactTool.description,/every nested person\/project folder/);
+});
+
 

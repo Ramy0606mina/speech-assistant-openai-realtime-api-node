@@ -394,7 +394,7 @@ export class MicrosoftGraphClient {
     url.searchParams.set('startDateTime', start.toISOString());
     url.searchParams.set('endDateTime', end.toISOString());
     url.searchParams.set('$top', String(clampLimit(limit, 20, 50)));
-    url.searchParams.set('$select', 'id,subject,start,end,location,organizer,isCancelled,isAllDay,showAs');
+    url.searchParams.set('$select', 'id,subject,start,end,location,organizer,attendees,isOrganizer,isCancelled,isAllDay,showAs,type,seriesMasterId');
     url.searchParams.set('$orderby', 'start/dateTime');
 
     const events = [];
@@ -450,6 +450,17 @@ export class MicrosoftGraphClient {
     }
     const joinLinkCreated=Boolean(verified?.isOnlineMeeting&&verified?.onlineMeetingProvider==='teamsForBusiness'&&verified?.onlineMeeting?.joinUrl);
     return {id:result.id,title:subject,...preview,durationMinutes:duration,attendees:addresses,location:String(location),calendar:'Primary Outlook calendar',invitationsSubmitted:true,onlineMeeting:Boolean(onlineMeeting),onlineMeetingProvider:onlineMeeting?'teamsForBusiness':'unknown',joinLinkCreated};
+  }
+
+  async cancelVoiceMeeting({eventId,comment=''}={}) {
+    const id=String(eventId||'').trim();const note=String(comment||'').trim();
+    if(!this.principalMailbox||!id||id.length>1000)throw new Error('A selected calendar event is required.');
+    if(note.length>1000)throw new Error('Cancellation note is too long.');
+    const token=await this.#getToken(this.actionCreds,this.actionToken);
+    await fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}/events/${encodeURIComponent(id)}/cancel`,{
+      method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({comment:note}),
+    });
+    return {cancelled:true,cancellationSent:true};
   }
 
   async createFollowUp({ title, date, notes = '', taskKey, reminder = true }) {
