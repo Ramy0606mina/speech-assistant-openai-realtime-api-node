@@ -22,6 +22,7 @@ export function loadConfig(env = process.env) {
       londonMailbox: read(env, 'LONDON_MINACO_EMAIL', 'london@minaco.ca'),
       ramyMailbox: read(env, 'RAMY_MINACO_EMAIL'),
       ramyUserId: read(env, 'RAMY_MINACO_USER_ID'),
+      signatureHtml: read(env, 'OUTLOOK_SIGNATURE_HTML'),
     },
     dropbox: {
       accessToken: read(env, 'DROPBOX_ACCESS_TOKEN'),

@@ -110,6 +110,7 @@ export class MicrosoftGraphClient {
     londonMailbox,
     ramyMailbox,
     ramyUserId,
+    signatureHtml,
     fetchImpl = fetch,
   }) {
     this.readCreds = { tenantId: readTenantId, clientId: readClientId, clientSecret: readClientSecret };
@@ -121,6 +122,7 @@ export class MicrosoftGraphClient {
     this.londonMailbox = londonMailbox;
     this.ramyMailbox = ramyMailbox;
     this.ramyUserId = String(ramyUserId || '').trim();
+    this.signatureHtml = String(signatureHtml || '').trim();
     this.fetchImpl = fetchImpl;
     this.readToken = { value: '', expiresAt: 0 };
     this.actionToken = { value: '', expiresAt: 0 };
@@ -296,15 +298,19 @@ export class MicrosoftGraphClient {
 
   async createVoiceDraft({mailbox='principal',to=[],subject,body,messageId}) {
     if(typeof body!=='string'||!body.trim()||body.length>20000)throw new Error('A draft body of at most 20,000 characters is required.');
+    const owner=this.voiceMailbox(mailbox);
+    const signature=owner===this.principalMailbox?this.signatureHtml:'';
+    if(owner===this.principalMailbox&&!signature)throw new Error('Ramy\u2019s Outlook signature is not configured; no draft was saved.');
+    const content=`${emailBodyHtml(body)}<div class="london-outlook-signature">${signature}</div>`;
     let result;
     if(messageId) {
       const source=await this.getVoiceMessage(mailbox,messageId);
       if(source.isDraft)throw new Error('Choose a received message to reply to.');
-      result=await this.voiceRequest(mailbox,`/messages/${encodeURIComponent(messageId)}/createReply`,{method:'POST',body:JSON.stringify({message:{body:{contentType:'HTML',content:emailBodyHtml(body)}}})});
+      result=await this.voiceRequest(mailbox,`/messages/${encodeURIComponent(messageId)}/createReply`,{method:'POST',body:JSON.stringify({message:{body:{contentType:'HTML',content}}})});
     } else {
       if(typeof subject!=='string'||!subject.trim()||subject.length>250)throw new Error('A draft subject is required.');
       if(!Array.isArray(to)||!to.length||to.length>10||to.some(v=>typeof v!=='string'||v.length>254||!/^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/.test(v)))throw new Error('Provide explicit recipient email addresses; names must not be guessed.');
-      result=await this.voiceRequest(mailbox,'/messages',{method:'POST',body:JSON.stringify({subject,body:{contentType:'HTML',content:emailBodyHtml(body)},toRecipients:to.map(address=>({emailAddress:{address}}))})});
+      result=await this.voiceRequest(mailbox,'/messages',{method:'POST',body:JSON.stringify({subject,body:{contentType:'HTML',content},toRecipients:to.map(address=>({emailAddress:{address}}))})});
     }
     if(!result?.id||result.isDraft!==true)throw new Error('Microsoft did not confirm the saved draft. Check Drafts before retrying.');
     return {id:result.id,subject:result.subject,isDraft:true,mailbox:this.voiceMailbox(mailbox),folder:'Drafts',sent:false};
