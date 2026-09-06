@@ -1,4 +1,5 @@
 import { fetchJson } from './http.js';
+import { createHash } from 'node:crypto';
 
 function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
@@ -142,6 +143,30 @@ export class MicrosoftGraphClient {
       },
     });
     return data?.value || [];
+  }
+
+  async createFollowUp({ title, date, notes = '', taskKey }) {
+    if (!this.principalMailbox || !taskKey || !String(title || '').trim() || String(title).length > 180) throw new Error('Follow-up title and source are required.');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0,10) !== date) throw new Error('Follow-up requires an explicit valid date.');
+    if (String(notes).length > 4000) throw new Error('Follow-up notes are too long.');
+    const token = await this.#getToken(this.actionCreds, this.actionToken);
+    const base = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}`;
+    const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+    const lists = await fetchJson(this.fetchImpl, `${base}/calendars?$select=id,name,owner&$top=100`, { headers });
+    const matches = (lists.value || []).filter(c => c.name === 'London Action Register' && normalizeEmail(c.owner?.address) === this.principalMailbox);
+    if (matches.length !== 1) throw new Error('A unique existing London Action Register was not found; no task was created.');
+    const actionId = createHash('sha256').update(`${taskKey}\n${title}\n${date}`).digest('hex');
+    const now = new Date().toISOString();
+    const next = new Date(Date.parse(date)+86400000).toISOString().slice(0,10);
+    const action = { actionId, title:String(title).trim(), owner:'London', dateOpened:now.slice(0,10), nextFollowUp:date,
+      status:'ACTIVE',priority:'NORMAL',nextAction:String(title).trim(),source:'London owner email',notes:String(notes),createdAt:now,updatedAt:now };
+    const result = await fetchJson(this.fetchImpl, `${base}/calendars/${encodeURIComponent(matches[0].id)}/events`, {
+      method:'POST',headers,body:JSON.stringify({ subject:`[NORMAL] [ACTIVE] ${action.title}`, body:{contentType:'text',content:`LONDON_ACTION_V1\n${JSON.stringify(action,null,2)}`},
+        start:{dateTime:`${date}T00:00:00`,timeZone:'Eastern Standard Time'},end:{dateTime:`${next}T00:00:00`,timeZone:'Eastern Standard Time'},
+        isAllDay:true,showAs:'free',sensitivity:'private',isReminderOn:false,attendees:[],transactionId:actionId }),
+    });
+    if (!result?.id) throw new Error('Microsoft did not confirm task creation; delivery requires review.');
+    return { title:action.title,date,id:result.id,calendar:'London Action Register' };
   }
 
   async sendMail({ to, subject, body, cc = [] }) {

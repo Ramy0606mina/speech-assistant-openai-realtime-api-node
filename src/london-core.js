@@ -56,12 +56,18 @@ export class LondonCore {
       }
       const attachments = full.hasAttachments ? await this.graph.getLondonAttachments(summary.id) : [];
       const analysis = await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox, graph: this.graph });
-      const text = String(analysis.text || '').trim();
+      let text = String(analysis.text || '').trim();
       if (!text) throw new Error('London produced an empty delegated-task result.');
       // Only the winner of the durable claim may save a report or dispatch mail.
       if (this.deliveryGuard && !await this.deliveryGuard.claim(key)) {
         this.state.markMessage(key, { sender, result: 'durable-duplicate' });
         return { skipped: true, reason: 'durable-duplicate', key };
+      }
+      if (analysis.followUps?.length) {
+        if (!this.deliveryGuard) throw new Error('Follow-up creation requires durable delivery protection.');
+        const tasks = [];
+        for (const task of analysis.followUps) tasks.push(await this.graph.createFollowUp({ ...task, taskKey:key }));
+        text += '\n\nCreated in London Action Register:\n' + tasks.map(t=>`- ${t.title} — ${t.date} (task record; no reminder notification)`).join('\n');
       }
       const report = this.dropbox?.saveReports
         ? await this.dropbox.saveReport({ taskKey: key, subject: full.subject, text })
