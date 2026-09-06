@@ -58,6 +58,19 @@ function currentMontrealContext() {
   }).format(new Date());
 }
 
+function formattedDraftBody(value) {
+  const body=String(value||'').replace(/\r\n?/g,'\n').split('\n').map(line=>line.trimEnd()).join('\n').trim();
+  const blocks=body.split(/\n\s*\n/).map(block=>block.trim()).filter(Boolean);
+  const greeting=blocks[0]?.split('\n')[0]?.trim()||'';
+  const closingLines=(blocks.at(-1)||'').split('\n').map(line=>line.trim()).filter(Boolean);
+  const greetingOk=/^(dear|hello|hi|good morning|good afternoon|good evening|bonjour|bonsoir)\b.*[,!:]$/i.test(greeting);
+  const closingOk=/^(kind regards|best regards|regards|sincerely|thank you|best|cordialement|merci)[,!]$/i.test(closingLines[0]||'')&&closingLines.length>=2;
+  const bodyBlocks=blocks.slice(1,-1);
+  const punctuationOk=bodyBlocks.length>=1&&bodyBlocks.every(block=>/[.!?…]["')\]]?$/.test(block));
+  if(!greetingOk||!closingOk||!punctuationOk)throw new Error('Rewrite the email in polished plain text: a greeting ending with punctuation, a blank line, one or more short punctuated paragraphs separated by blank lines, then a professional closing and sender name on separate lines.');
+  return body;
+}
+
 export function realtimeInstructions() {
   return [
     'You are London Assistant, executive assistant to Ramy Mina for Minaco.',
@@ -75,6 +88,7 @@ export function realtimeInstructions() {
     'Call confirm_calendar_meeting only after Ramy unambiguously confirms that exact prepared proposal in a later spoken turn. A request to prepare, schedule, or invite is not confirmation. Never claim a meeting or invitation exists unless confirm_calendar_meeting returned success true during the current request.',
     'When Ramy asks to cancel a meeting, first use check_calendar for the exact date window. Select only an event returned in this call, then call prepare_calendar_cancellation. Read back its subject, local time, organizer, and attendees and ask whether to cancel it. Call confirm_calendar_cancellation only after Ramy unambiguously confirms that exact cancellation in a later spoken turn. Never claim it was cancelled unless the confirmation tool returned success true.',
     'When asked to draft a response, first read the selected original email, then use save_email_draft with its message_id. Microsoft preserves the reply thread and recipients.',
+    'Every email draft must be polished plain text: begin with a recipient greeting and punctuation, use blank lines between short complete paragraphs, use normal sentence punctuation, and end with a professional closing followed by Ramy Mina on a separate line. Do not submit a one-paragraph block. Use bullets only when Ramy asks for a list.',
     'Never say an email was drafted or saved unless save_email_draft returned success true during the current request. If the recipient address is unresolved or the tool was not called, state clearly that no draft was saved.',
     'Default to Ramy’s principal Minaco mailbox. The only other connected mailbox is London. Ask which message if the selection is ambiguous; never guess recipients or claim access to other inboxes.',
     'You have read-only access to the principal Inbox and every nested mail folder through find_contact. Never say that you lack access to email subfolders.',
@@ -119,8 +133,8 @@ export function voiceTools() {
       parameters:{type:'object',properties:{query:{type:'string',description:'Person name or email address as spoken.'},context:{type:'string',description:'Optional company, project, or message context used to rank evidence.'}},required:['query'],additionalProperties:false},
     },
     {
-      type:'function',name:'save_email_draft',description:'Save a new email or reply in Outlook Drafts ONLY when Ramy requests it. Never sends. For a reply, provide the original message_id after read_email. For a new email, provide exact to addresses and subject.',
-      parameters:{type:'object',properties:{mailbox:{type:'string',enum:['principal','london']},message_id:{type:'string'},to:{type:'array',items:{type:'string'},maxItems:10},subject:{type:'string'},body:{type:'string',description:'The requested draft text or reply text.'}},required:['body'],additionalProperties:false},
+      type:'function',name:'save_email_draft',description:'Save a professionally formatted new email or reply in Outlook Drafts ONLY when Ramy requests it. Never sends. For a reply, provide the original message_id after read_email. For a new email, provide exact to addresses and subject.',
+      parameters:{type:'object',properties:{mailbox:{type:'string',enum:['principal','london']},message_id:{type:'string'},to:{type:'array',items:{type:'string'},maxItems:10},subject:{type:'string'},body:{type:'string',description:'Polished plain-text email with a punctuated greeting, blank lines between short complete paragraphs, and a professional closing plus Ramy Mina on separate lines.'}},required:['body'],additionalProperties:false},
     },
     {
       type: 'function',
@@ -253,7 +267,7 @@ export async function runVoiceTool(name, args, { graph, dropbox, readMessages = 
   if (name === 'save_email_draft') {
     const mailbox=args.mailbox||'principal';
     if(args.message_id && !readMessages.has(`${mailbox}:${args.message_id}`))throw new Error('Read the selected original email before drafting its reply.');
-    const draft={mailbox,messageId:args.message_id,to:args.to,subject:args.subject,body:args.body};
+    const draft={mailbox,messageId:args.message_id,to:args.to,subject:args.subject,body:formattedDraftBody(args.body)};
     const fingerprint=createHash('sha256').update(JSON.stringify(draft)).digest('hex');
     if(draftRequests.has(fingerprint))throw new Error('This draft was already attempted during the call; check Drafts before retrying.');
     if(draftRequests.size>=10)throw new Error('Ten drafts have been attempted on this call; review Drafts before making more.');
