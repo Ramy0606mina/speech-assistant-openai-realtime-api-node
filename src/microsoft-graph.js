@@ -79,6 +79,45 @@ export class MicrosoftGraphClient {
     return data?.value||[];
   }
 
+  async searchVoiceMessages({mailbox='principal',folder='inbox',query,startIso,endIso,maxScan=1000,maxResults=25}={}) {
+    const owner=this.voiceMailbox(mailbox);
+    const folders=['all','inbox','drafts','sentitems','deleteditems'];
+    if(!folders.includes(folder))throw new Error('Unsupported mail folder.');
+    const needle=String(query||'').trim().toLowerCase();
+    if(!needle||needle.length>200)throw new Error('A sender, email address, subject, or phrase is required.');
+    const start=startIso ? new Date(startIso) : null;
+    const end=endIso ? new Date(endIso) : null;
+    if((start && !Number.isFinite(start.getTime()))||(end && !Number.isFinite(end.getTime()))||(start&&end&&end<=start))throw new Error('The email date range is invalid.');
+    maxScan=Math.min(2000,Math.max(50,Number(maxScan)||1000));
+    maxResults=Math.min(50,Math.max(1,Number(maxResults)||25));
+    const token=await this.#getToken(this.actionCreds,this.actionToken);
+    const base=`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(owner)}`;
+    const collection=folder==='all' ? `${base}/messages` : `${base}/mailFolders/${folder}/messages`;
+    const first=new URL(collection);
+    first.searchParams.set('$top','50');
+    first.searchParams.set('$select','id,subject,from,toRecipients,bodyPreview,isDraft,receivedDateTime,sentDateTime,hasAttachments');
+    first.searchParams.set('$orderby','receivedDateTime desc');
+    let next=first,scanned=0;
+    const matches=[];
+    const visited=new Set();
+    while(next&&scanned<maxScan) {
+      if(next.origin!=='https://graph.microsoft.com'||!next.pathname.startsWith(`/v1.0/users/${encodeURIComponent(owner)}/`)||!next.pathname.endsWith('/messages')||visited.has(next.href)||visited.size>=50)throw new Error('Email search paging was invalid; results were not established.');
+      visited.add(next.href);
+      const page=await fetchJson(this.fetchImpl,next,{headers:{Authorization:`Bearer ${token}`,Prefer:'IdType="ImmutableId", outlook.body-content-type="text"'}});
+      if(!Array.isArray(page?.value))throw new Error('Email search response was invalid.');
+      for(const message of page.value) {
+        if(scanned++>=maxScan)break;
+        const when=new Date(message.receivedDateTime||message.sentDateTime||0);
+        if(start&&when<start)continue;
+        if(end&&when>=end)continue;
+        const haystack=[message.from?.emailAddress?.name,message.from?.emailAddress?.address,message.subject,message.bodyPreview].map(v=>String(v||'').toLowerCase()).join('\n');
+        if(haystack.includes(needle)&&matches.length<maxResults)matches.push(message);
+      }
+      next=page['@odata.nextLink']?new URL(page['@odata.nextLink']):null;
+    }
+    return {messages:matches,scanned,complete:!next};
+  }
+
   async getVoiceMessage(mailbox,id) {
     if(typeof id!=='string'||!id||id.length>2000)throw new Error('A message selected from the mailbox is required.');
     return this.voiceRequest(mailbox,`/messages/${encodeURIComponent(id)}?$select=id,subject,from,replyTo,toRecipients,ccRecipients,body,isDraft,hasAttachments`);
