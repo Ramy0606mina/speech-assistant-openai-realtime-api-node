@@ -28,6 +28,17 @@ test('Microsoft re-reads an online event when creation response omits joining in
   assert.equal(call,2);assert.equal(result.joinLinkCreated,true);
 });
 
+test('Microsoft upgrades and verifies an event when Teams data remains absent after creation',async()=>{
+  const calls=[];const graph=client((url,options)=>{calls.push({url,options});if(calls.length<4)return Response.json({id:'event-online',isOnlineMeeting:false,onlineMeetingProvider:'unknown'});return Response.json({id:'event-online',isOnlineMeeting:true,onlineMeetingProvider:'teamsForBusiness',onlineMeeting:{joinUrl:'https://teams.microsoft.com/meet/example'}});});
+  const result=await graph.createVoiceMeeting({title:'Virtual project call',startIso:'2030-07-11T10:00:00-04:00',durationMinutes:30,timezone:'America/Toronto',attendees:['person@example.com'],onlineMeeting:true,transactionId:'52345678-1234-4123-8123-123456789abc'});
+  assert.equal(calls.length,4);assert.equal(calls[2].options.method,'PATCH');assert.deepEqual(JSON.parse(calls[2].options.body),{isOnlineMeeting:true,onlineMeetingProvider:'teamsForBusiness'});assert.equal(result.joinLinkCreated,true);
+});
+
+test('Microsoft refuses to report success when a Teams link cannot be verified',async()=>{
+  const graph=client(()=>Response.json({id:'event-online',isOnlineMeeting:false,onlineMeetingProvider:'unknown'}));
+  await assert.rejects(()=>graph.createVoiceMeeting({title:'Virtual project call',startIso:'2030-07-11T10:00:00-04:00',durationMinutes:30,timezone:'America/Toronto',attendees:['person@example.com'],onlineMeeting:true,transactionId:'62345678-1234-4123-8123-123456789abc'}),/did not create a Teams joining link/);
+});
+
 test('Toronto meetings keep ten a.m. through winter and summer daylight-saving offsets',async()=>{
   const payloads=[];const graph=client((url,options)=>{payloads.push(JSON.parse(options.body));return Response.json({id:`event-${payloads.length}`});});
   const base={title:'Toronto call',durationMinutes:60,timezone:'America/Toronto',attendees:['person@example.com'],transactionId:'12345678-1234-4123-8123-123456789abc'};
@@ -62,6 +73,12 @@ test('meeting preparation reports conflicts and refuses guessed attendee names',
   await assert.rejects(()=>runVoiceTool('prepare_calendar_meeting',{title:'Call Jack',start_iso:'2030-09-11T10:00:00-04:00',timezone:'America/Toronto',duration_minutes:30,attendees:['Jack Rawdon'],online_meeting:false},context),/exact attendee/);
   const result=await runVoiceTool('prepare_calendar_meeting',{title:'Call Jack',start_iso:'2030-09-11T10:00:00-04:00',timezone:'America/Toronto',duration_minutes:30,attendees:['jack@example.com'],online_meeting:false},context);
   assert.equal(result.conflicts.length,1);assert.equal(result.conflicts[0].subject,'Existing');
+});
+
+test('meeting preparation treats spoken virtual mode as Teams even if the boolean is wrong',async()=>{
+  const context={graph:{listPrincipalCalendar:async()=>[],previewVoiceMeeting:()=>({localStart:'2030-09-11T10:00:00',localEnd:'2030-09-11T10:30:00',timezone:'America/Toronto'})},meetingProposals:new Map()};
+  const result=await runVoiceTool('prepare_calendar_meeting',{title:'Virtual Meeting',start_iso:'2030-09-11T10:00:00-04:00',timezone:'America/Toronto',duration_minutes:30,attendees:['person@example.com'],online_meeting:false},context);
+  assert.equal(result.proposal.onlineMeeting,true);assert.equal(result.proposal.onlineMeetingProvider,'Microsoft Teams');
 });
 
 test('meeting attempt is durable and cannot be replayed',async()=>{

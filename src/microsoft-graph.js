@@ -448,7 +448,16 @@ export class MicrosoftGraphClient {
         headers:{Authorization:`Bearer ${token}`},
       });
     }
+    if(onlineMeeting&&(!verified?.isOnlineMeeting||verified?.onlineMeetingProvider!=='teamsForBusiness'||!verified?.onlineMeeting?.joinUrl)){
+      await fetchJson(this.fetchImpl,`${eventUrl}/${encodeURIComponent(result.id)}`,{
+        method:'PATCH',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({isOnlineMeeting:true,onlineMeetingProvider:'teamsForBusiness'}),
+      });
+      verified=await fetchJson(this.fetchImpl,`${eventUrl}/${encodeURIComponent(result.id)}?$select=id,isOnlineMeeting,onlineMeetingProvider,onlineMeeting`,{
+        headers:{Authorization:`Bearer ${token}`},
+      });
+    }
     const joinLinkCreated=Boolean(verified?.isOnlineMeeting&&verified?.onlineMeetingProvider==='teamsForBusiness'&&verified?.onlineMeeting?.joinUrl);
+    if(onlineMeeting&&!joinLinkCreated)throw new Error('Microsoft did not create a Teams joining link; the meeting must be checked before reporting success.');
     return {id:result.id,title:subject,...preview,durationMinutes:duration,attendees:addresses,location:String(location),calendar:'Primary Outlook calendar',invitationsSubmitted:true,onlineMeeting:Boolean(onlineMeeting),onlineMeetingProvider:onlineMeeting?'teamsForBusiness':'unknown',joinLinkCreated};
   }
 
