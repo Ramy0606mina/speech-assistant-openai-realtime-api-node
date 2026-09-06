@@ -7,9 +7,26 @@ function client(handler){return new MicrosoftGraphClient({readTenantId:'t',readC
 
 test('Microsoft meeting includes attendee invitations and a stable transaction',async()=>{
   const calls=[];const graph=client((url,options)=>{calls.push({url,options});return Response.json({id:'event-1'});});
-  const result=await graph.createVoiceMeeting({title:'Project call',startIso:'2030-09-11T10:00:00-04:00',durationMinutes:30,timezone:'America/Toronto',attendees:['JACK@example.com'],body:'Discuss next steps.',location:'Microsoft Teams',transactionId:'12345678-1234-4123-8123-123456789abc'});
+  const result=await graph.createVoiceMeeting({title:'Project call',startIso:'2030-07-11T10:00:00-04:00',durationMinutes:30,timezone:'America/Toronto',attendees:['JACK@example.com'],body:'Discuss next steps.',location:'Microsoft Teams',transactionId:'12345678-1234-4123-8123-123456789abc'});
   assert.equal(result.invitationsSubmitted,true);assert.equal(calls.length,1);assert.match(calls[0].url,/owner%40example.com\/events$/);
-  const body=JSON.parse(calls[0].options.body);assert.equal(body.attendees[0].emailAddress.address,'jack@example.com');assert.equal(body.start.timeZone,'UTC');assert.equal(body.transactionId,'12345678-1234-4123-8123-123456789abc');
+  const body=JSON.parse(calls[0].options.body);assert.equal(body.attendees[0].emailAddress.address,'jack@example.com');assert.deepEqual(body.start,{dateTime:'2030-07-11T10:00:00',timeZone:'Eastern Standard Time'});assert.deepEqual(body.end,{dateTime:'2030-07-11T10:30:00',timeZone:'Eastern Standard Time'});assert.equal(body.transactionId,'12345678-1234-4123-8123-123456789abc');
+  assert.equal(result.timezone,'America/Toronto');assert.equal(result.microsoftTimeZone,'Eastern Standard Time');
+});
+
+test('Toronto meetings keep ten a.m. through winter and summer daylight-saving offsets',async()=>{
+  const payloads=[];const graph=client((url,options)=>{payloads.push(JSON.parse(options.body));return Response.json({id:`event-${payloads.length}`});});
+  const base={title:'Toronto call',durationMinutes:60,timezone:'America/Toronto',attendees:['person@example.com'],transactionId:'12345678-1234-4123-8123-123456789abc'};
+  await graph.createVoiceMeeting({...base,startIso:'2030-01-15T10:00:00-05:00'});
+  await graph.createVoiceMeeting({...base,startIso:'2030-07-15T10:00:00-04:00',transactionId:'22345678-1234-4123-8123-123456789abc'});
+  assert.deepEqual(payloads.map(p=>p.start),[{dateTime:'2030-01-15T10:00:00',timeZone:'Eastern Standard Time'},{dateTime:'2030-07-15T10:00:00',timeZone:'Eastern Standard Time'}]);
+});
+
+test('meeting rejects an offset that disagrees with Toronto daylight saving and preserves an explicit alternative timezone',async()=>{
+  const payloads=[];const graph=client((url,options)=>{payloads.push(JSON.parse(options.body));return Response.json({id:'event'});});
+  const base={title:'Call',durationMinutes:30,attendees:['person@example.com'],transactionId:'12345678-1234-4123-8123-123456789abc'};
+  await assert.rejects(()=>graph.createVoiceMeeting({...base,startIso:'2030-07-15T10:00:00-05:00',timezone:'America/Toronto'}),/daylight-saving/);
+  const result=await graph.createVoiceMeeting({...base,startIso:'2030-07-15T10:00:00+01:00',timezone:'Europe/London'});
+  assert.deepEqual(payloads[0].start,{dateTime:'2030-07-15T10:00:00',timeZone:'Europe/London'});assert.equal(result.timezone,'Europe/London');
 });
 
 test('meeting requires preparation then explicit confirmation before Microsoft write',async()=>{
