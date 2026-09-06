@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {MicrosoftGraphClient} from '../src/microsoft-graph.js';
-import {runVoiceTool,voiceTools,validTwilioRequest} from '../src/voice-gateway.js';
+import {realtimeInstructions,runVoiceTool,voiceTools,validTwilioRequest} from '../src/voice-gateway.js';
 import {createHmac} from 'node:crypto';
 
 function client(handler) {
@@ -54,6 +54,12 @@ test('voice leaves the sender name to Ramy’s exact Outlook signature',async()=
   let created=false;
   await assert.rejects(()=>runVoiceTool('save_email_draft',{to:['x@example.com'],subject:'Update',body:'Hello,\n\nThank you for your message.\n\nBest regards,\nRamy Mina'},{graph:{createVoiceDraft:()=>created=true},dropbox:{createDeliveryRecord:async()=>true},callKey:'call'}),/Do not add a sender name/);
   assert.equal(created,false);
+});
+test('voice instructions require professional rewriting without changing material facts',()=>{
+  const instructions=realtimeInstructions();
+  assert.match(instructions,/spoken dictation as source ideas/i);
+  assert.match(instructions,/professional business English/i);
+  assert.match(instructions,/Never invent, omit, soften, or strengthen a material fact/i);
 });
 test('Twilio signature rejects spoofed callers and altered fields',()=>{
   const request={method:'POST',url:'/incoming-call',body:{From:'+15145550000'},headers:{}};
