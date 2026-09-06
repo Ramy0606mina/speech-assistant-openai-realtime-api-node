@@ -422,7 +422,7 @@ export class MicrosoftGraphClient {
     return {startIso:verified.date.toISOString(),endIso:end.toISOString(),localStart:verified.local,localEnd:zonedDateTime(end,verified.zone.iana),timezone:verified.zone.label,microsoftTimeZone:verified.zone.graph};
   }
 
-  async createVoiceMeeting({title,startIso,durationMinutes,timezone='America/Toronto',attendees,body='',location='',transactionId}={}) {
+  async createVoiceMeeting({title,startIso,durationMinutes,timezone='America/Toronto',attendees,body='',location='',onlineMeeting=false,transactionId}={}) {
     const subject=String(title||'').trim();
     const preview=this.previewVoiceMeeting({startIso,durationMinutes,timezone});const start=new Date(preview.startIso);
     const duration=Number(durationMinutes);
@@ -433,14 +433,23 @@ export class MicrosoftGraphClient {
     if(!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(transactionId||'')))throw new Error('Meeting transaction is invalid.');
     const end=new Date(start.getTime()+duration*60000);
     const token=await this.#getToken(this.actionCreds,this.actionToken);
-    const result=await fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}/events`,{
+    const eventUrl=`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}/events`;
+    const result=await fetchJson(this.fetchImpl,eventUrl,{
       method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({
         subject,body:{contentType:'Text',content:String(body)},start:{dateTime:preview.localStart,timeZone:preview.microsoftTimeZone},end:{dateTime:preview.localEnd,timeZone:preview.microsoftTimeZone},
         location:{displayName:String(location)},attendees:addresses.map(address=>({emailAddress:{address},type:'required'})),allowNewTimeProposals:true,transactionId,
+        ...(onlineMeeting?{isOnlineMeeting:true,onlineMeetingProvider:'teamsForBusiness'}:{}),
       }),
     });
     if(!result?.id)throw new Error('Microsoft did not confirm meeting creation; invitation delivery was not established.');
-    return {id:result.id,title:subject,...preview,durationMinutes:duration,attendees:addresses,location:String(location),calendar:'Primary Outlook calendar',invitationsSubmitted:true};
+    let verified=result;
+    if(onlineMeeting&&(!result.isOnlineMeeting||!result.onlineMeeting?.joinUrl)){
+      verified=await fetchJson(this.fetchImpl,`${eventUrl}/${encodeURIComponent(result.id)}?$select=id,isOnlineMeeting,onlineMeetingProvider,onlineMeeting`,{
+        headers:{Authorization:`Bearer ${token}`},
+      });
+    }
+    const joinLinkCreated=Boolean(verified?.isOnlineMeeting&&verified?.onlineMeetingProvider==='teamsForBusiness'&&verified?.onlineMeeting?.joinUrl);
+    return {id:result.id,title:subject,...preview,durationMinutes:duration,attendees:addresses,location:String(location),calendar:'Primary Outlook calendar',invitationsSubmitted:true,onlineMeeting:Boolean(onlineMeeting),onlineMeetingProvider:onlineMeeting?'teamsForBusiness':'unknown',joinLinkCreated};
   }
 
   async createFollowUp({ title, date, notes = '', taskKey, reminder = true }) {
