@@ -73,6 +73,10 @@ export class LondonCore {
         if (!text) throw new Error('Confirmed follow-up report is empty; delivery requires review.');
         text += '\n\nCreated in London Action Register:\n' + tasks.map(t=>`- ${t.title} — ${t.date}. Reminder: ${t.reminder}`).join('\n');
       }
+      if(analysis.followUpUpdates?.length){
+        const updates=[];for(const update of analysis.followUpUpdates)updates.push(await this.graph.updateFollowUp(update));
+        text+=`\n\nUpdated in London Action Register:\n${updates.map(item=>`- ${item.title} — ${item.status}.`).join('\n')}`;
+      }
       if (analysis.smsText) {
         if(!this.deliveryGuard || !this.sms?.configured)throw new Error('SMS requires configured delivery protection.');
         const result=await this.sms.send(analysis.smsText);
@@ -117,3 +121,4 @@ export class LondonCore {
     return { checked: messages.length, results };
   }
 }
+
