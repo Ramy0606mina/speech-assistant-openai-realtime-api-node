@@ -4,6 +4,7 @@ import mammoth from 'mammoth';
 import { renderReportPdf } from './report-pdf.js';
 import { renderReportDocx } from './report-docx.js';
 import { parseReport, reportSubject } from './report-format.js';
+import { isSpreadsheet, extractSpreadsheet, renderReportXlsx } from './spreadsheet-report.js';
 
 function normalizeDropboxPath(value) {
   let path = String(value || '').trim().replace(/\\/g, '/');
@@ -98,7 +99,7 @@ export class DropboxClient {
   async readFile(path, maxBytes = 40 * 1024 * 1024) {
     const resolved = this.resolvePath(path);
     const filename = resolved.split('/').at(-1);
-    if (!/\.(pdf|docx?|xlsx?|pptx?|txt|csv|md|rtf)$/i.test(filename)) throw new Error('Unsupported Dropbox document type.');
+    if (!/\.(pdf|docx?|xlsx?|xlsm|pptx?|txt|csv|tsv|md|rtf)$/i.test(filename)) throw new Error('Unsupported Dropbox document type.');
     const token = await this.#token();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 30000);
@@ -124,6 +125,7 @@ export class DropboxClient {
         return { path: resolved, filename, size, part: { type: 'input_text',
           text: `Dropbox Word source: ${resolved}\nExtracted text only; images and visual layout are not included.\n\n${extracted.value}` } };
       }
+      if(isSpreadsheet(filename))return {path:resolved,filename,size,part:await extractSpreadsheet({filename:resolved,bytes})};
       return { path: resolved, filename, size, part: {
         type: 'input_file', filename,
         file_data: `data:${filename.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream'};base64,${bytes.toString('base64')}`,
@@ -170,7 +172,7 @@ export class DropboxClient {
     }
   }
 
-  async saveReport({ taskKey, subject, text, reportData, includeDocx = false }) {
+  async saveReport({ taskKey, subject, text, reportData, includeDocx = false, includeXlsx = false }) {
     if (!this.saveReports) throw new Error('Dropbox report saving is not enabled.');
     if (!taskKey || !String(text || '').trim()) throw new Error('Report task and content are required.');
     const folder = this.resolvePath('London Work');
@@ -206,7 +208,17 @@ export class DropboxClient {
       docxPath=saved.path_display;
       attachments.push({name:`${label}.docx`,contentType:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',contentBytes:docx.toString('base64')});
     }
-    return { id: data.id, path: data.path_display, ...(docxPath?{docxPath}:{}), attachments };
+    let xlsxPath;
+    if(!reportData && includeXlsx){
+      const xlsx=await renderReportXlsx({subject,text});const target=path.replace(/\.pdf$/,'.xlsx');
+      const saved=await fetchJson(this.fetchImpl,'https://content.dropboxapi.com/2/files/upload',{
+        method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/octet-stream',
+          'Dropbox-API-Arg':JSON.stringify({path:target,mode:'overwrite',autorename:false,mute:true}).replace(/[\u007f-\uffff]/g,c=>`\\u${c.charCodeAt(0).toString(16).padStart(4,'0')}`)},body:xlsx,
+      },30000);
+      if(!saved?.id || !saved?.path_display)throw new Error('Dropbox did not confirm the Excel analysis; no completion sent.');
+      xlsxPath=saved.path_display;attachments.push({name:`${label}.xlsx`,contentType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',contentBytes:xlsx.toString('base64')});
+    }
+    return { id: data.id, path: data.path_display, ...(docxPath?{docxPath}:{}), ...(xlsxPath?{xlsxPath}:{}), attachments };
   }
 }
 
