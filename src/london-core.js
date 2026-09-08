@@ -1,4 +1,4 @@
-import { ownerReminderRequest } from './email-reminder.js';
+import { directOwnerRequestText, ownerReminderRequest } from './email-reminder.js';
 import { renderReportHtml, reportSubject, parseReport } from './report-format.js';
 
 function emailAddress(message) {
@@ -68,6 +68,24 @@ export class LondonCore {
         return { skipped: true, reason: 'durable-duplicate', key };
       }
       let reminderFailed = false;
+      let operationFailed = false;
+      if (analysis.dropboxRenames?.length) {
+        const directRequest = directOwnerRequestText(full);
+        if (!this.deliveryGuard || !/\b(?:rename|re[- ]?name)\b/i.test(directRequest)) {
+          throw new Error('Dropbox renaming requires a direct owner request and durable protection.');
+        }
+        const renamed = [];
+        try {
+          for (const item of analysis.dropboxRenames) {
+            renamed.push(await this.dropbox.renameFile(item.sourcePath,item.destinationName));
+          }
+          text = `Renamed ${renamed.length} file${renamed.length === 1 ? '' : 's'} in Dropbox:\n${renamed.map(item=>`- ${item.from} → ${item.path}`).join('\n')}`;
+        } catch (error) {
+          operationFailed = true;
+          text = 'Dropbox did not confirm every requested rename. Review the target folder before retrying so an already-renamed file is not duplicated.';
+          this.logger.error?.({error:error.message},'Dropbox rename failed');
+        }
+      }
       if (analysis.calendarReminder) {
         if (!this.deliveryGuard || !ownerReminderRequest(full)) throw new Error('Personal reminders require a direct owner request and durable protection.');
         try {
@@ -79,6 +97,7 @@ export class LondonCore {
         } catch (error) {
           const detail = error.status === 403 ? 'Microsoft denied calendar-write access for London.' : 'Outlook did not confirm the reminder and alert. Check the calendar before retrying to avoid a duplicate.';
           reminderFailed = true;
+          operationFailed = true;
           text = `Reminder not confirmed. ${detail}`;
           this.logger.error?.({error:error.message,status:error.status},'Personal reminder creation failed');
         }
@@ -117,7 +136,7 @@ export class LondonCore {
       this.state.markMessage(key, { sender, result: 'delivery-pending-review' });
       await this.graph.sendMail({
         to: principal,
-        subject: reminderFailed ? `LONDON — Reminder Needs Attention | ${full.subject || '(no subject)'}` : completionSubject(full.subject),
+        subject: reminderFailed ? `LONDON — Reminder Needs Attention | ${full.subject || '(no subject)'}` : operationFailed ? `LONDON — Task Needs Attention | ${full.subject || '(no subject)'}` : completionSubject(full.subject),
         body,
         contentType: formatted ? 'HTML' : 'Text',
         attachments: report?.attachments || [],
