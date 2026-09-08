@@ -588,12 +588,14 @@ export class MicrosoftGraphClient {
     return { title:action.title,date,id:result.id,calendar:'London Action Register',reminder:reminder ? 'Outlook alert at 9 a.m. Eastern on the due date' : 'None' };
   }
 
-  async sendMail({ to, subject, body, cc = [], contentType = 'Text' }) {
+  async sendMail({ to, subject, body, cc = [], contentType = 'Text', attachments = [] }) {
     const addresses = (Array.isArray(to) ? to : [to]);
     const copies = (Array.isArray(cc) ? cc : [cc]).filter(Boolean);
     if (!this.principalMailbox || !addresses.length || addresses.some(address => normalizeEmail(address) !== this.principalMailbox) || copies.some(address => normalizeEmail(address) !== this.principalMailbox)) {
       throw new Error('Automatic email is restricted to the configured principal; other recipients are draft-only.');
     }
+    if (!Array.isArray(attachments) || attachments.some(a => !a.name || !a.contentType || typeof a.contentBytes !== 'string')) throw new Error('Invalid report attachments.');
+    if (attachments.reduce((n,a)=>n+Buffer.byteLength(a.contentBytes),0) > 3 * 1024 * 1024) throw new Error('Report attachments exceed the direct email limit; delivery requires review.');
     const token = await this.#getToken(this.actionCreds, this.actionToken);
     const recipients = (Array.isArray(to) ? to : [to]).filter(Boolean).map((address) => ({ emailAddress: { address } }));
     const ccRecipients = (Array.isArray(cc) ? cc : [cc]).filter(Boolean).map((address) => ({ emailAddress: { address } }));
@@ -606,6 +608,7 @@ export class MicrosoftGraphClient {
           body: { contentType: contentType === 'HTML' ? 'HTML' : 'Text', content: String(body || '') },
           toRecipients: recipients,
           ccRecipients,
+          ...(attachments.length ? { attachments: attachments.map(a => ({ '@odata.type': '#microsoft.graph.fileAttachment', name:a.name, contentType:a.contentType, contentBytes:a.contentBytes })) } : {}),
         },
         saveToSentItems: true,
       }),

@@ -1,4 +1,5 @@
 import { ownerReminderRequest } from './email-reminder.js';
+import { renderReportHtml, reportSubject, parseReport } from './report-format.js';
 
 function emailAddress(message) {
   return String(message?.from?.emailAddress?.address || '').trim().toLowerCase();
@@ -9,7 +10,7 @@ function messageKey(message) {
 }
 
 function completionSubject(subject) {
-  return `LONDON — Task Complete | ${String(subject || '(no subject)').trim() || '(no subject)'}`;
+  return `LONDON — Task Complete | ${reportSubject(subject)}`;
 }
 
 export class LondonCore {
@@ -102,15 +103,21 @@ export class LondonCore {
         text=final.text;
       }
       const report = this.dropbox?.saveReports
-        ? await this.dropbox.saveReport({ taskKey: key, subject: full.subject, text })
+        ? await this.dropbox.saveReport({ taskKey: key, subject: full.subject, text, includeDocx: /\b(?:docx|word)\b/i.test(`${full.subject || ''}\n${full.body?.content || ''}`) })
         : null;
+
+      const reportText = report ? `${text}\n\nSaved in Dropbox: ${report.path}${report.docxPath ? `\nWord document: ${report.docxPath}` : ''}` : text;
+      const formatted = parseReport(text).some(block => block.type !== 'paragraph') || /\*\*/.test(text);
+      const body = formatted ? renderReportHtml(reportText) : reportText;
 
       // Persist before dispatch: an interrupted/ambiguous send must not be retried blindly.
       this.state.markMessage(key, { sender, result: 'delivery-pending-review' });
       await this.graph.sendMail({
         to: principal,
         subject: reminderFailed ? `LONDON — Reminder Needs Attention | ${full.subject || '(no subject)'}` : completionSubject(full.subject),
-        body: report ? `${text}\n\nSaved in Dropbox: ${report.path}` : text,
+        body,
+        contentType: formatted ? 'HTML' : 'Text',
+        attachments: report?.attachments || [],
       });
       if (this.deliveryGuard) await this.deliveryGuard.complete(key, report?.path);
 
