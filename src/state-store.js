@@ -15,6 +15,7 @@ export class StateStore {
       this.state = {
         processedMessages: parsed?.processedMessages && typeof parsed.processedMessages === 'object' ? parsed.processedMessages : {},
         lastPollAt: parsed?.lastPollAt || null,
+        smsConversation: parsed?.smsConversation && typeof parsed.smsConversation === 'object' ? parsed.smsConversation : {},
       };
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
