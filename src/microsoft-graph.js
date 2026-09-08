@@ -1,5 +1,6 @@
 import { fetchJson } from './http.js';
 import { createHash } from 'node:crypto';
+import { isSpreadsheet, extractSpreadsheet } from './spreadsheet-report.js';
 
 function normalizeEmail(value) {
   return String(value || '').trim().toLowerCase();
@@ -420,7 +421,7 @@ export class MicrosoftGraphClient {
         if (item.isInline) continue;
         if (++count > 20) throw new Error('Too many attachments; maximum is 20.');
         const name = String(item.name || 'attachment');
-        const supported = /\.(pdf|docx?|xlsx?|pptx?|txt|csv|md|rtf)$/i.test(name);
+        const supported = /\.(pdf|docx?|xlsx?|xlsm|pptx?|txt|csv|tsv|md|rtf)$/i.test(name);
         if (item['@odata.type'] !== '#microsoft.graph.fileAttachment' || !supported) {
           parts.push({ type: 'input_text', text: `Attachment not analyzed (unsupported type): ${name}` });
           continue;
@@ -428,7 +429,10 @@ export class MicrosoftGraphClient {
         if (!item.contentBytes) throw new Error(`Attachment content unavailable: ${name}`);
         total += Buffer.from(item.contentBytes, 'base64').length;
         if (total > 20 * 1024 * 1024) throw new Error('Attachments exceed the 20 MB analysis limit.');
-        parts.push({ type: 'input_file', filename: name, file_data: `data:${item.contentType || 'application/octet-stream'};base64,${item.contentBytes}` });
+        if(isSpreadsheet(name)){
+          try{parts.push(await extractSpreadsheet({filename:name,bytes:Buffer.from(item.contentBytes,'base64')}));}
+          catch(error){parts.push({type:'input_text',text:`Spreadsheet not analyzed: ${name}. ${error.message}`});}
+        }else parts.push({ type: 'input_file', filename: name, file_data: `data:${item.contentType || 'application/octet-stream'};base64,${item.contentBytes}` });
       }
       url = data['@odata.nextLink'] ? new URL(data['@odata.nextLink']) : null;
     }

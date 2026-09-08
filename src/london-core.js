@@ -103,10 +103,13 @@ export class LondonCore {
         text=final.text;
       }
       const report = this.dropbox?.saveReports
-        ? await this.dropbox.saveReport({ taskKey: key, subject: full.subject, text, includeDocx: /\b(?:docx|word)\b/i.test(`${full.subject || ''}\n${full.body?.content || ''}`) })
+        ? await this.dropbox.saveReport({ taskKey: key, subject: full.subject, text,
+          includeDocx: /\b(?:docx|word)\b/i.test(`${full.subject || ''}\n${full.body?.content || ''}`),
+          includeXlsx: /\b(?:excel|xlsx|spreadsheet|workbook)\b/i.test(`${full.subject || ''}\n${full.body?.content || ''}`) || analysis.spreadsheetAnalyzed || attachments.some(part=>part.text?.startsWith('Spreadsheet source data')),
+        })
         : null;
 
-      const reportText = report ? `${text}\n\nSaved in Dropbox: ${report.path}${report.docxPath ? `\nWord document: ${report.docxPath}` : ''}` : text;
+      const reportText = report ? `${text}\n\nSaved in Dropbox: ${report.path}${report.docxPath ? `\nWord document: ${report.docxPath}` : ''}${report.xlsxPath ? `\nExcel analysis: ${report.xlsxPath}` : ''}` : text;
       const formatted = parseReport(text).some(block => block.type !== 'paragraph') || /\*\*/.test(text);
       const body = formatted ? renderReportHtml(reportText) : reportText;
 
