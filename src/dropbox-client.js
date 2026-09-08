@@ -133,6 +133,34 @@ export class DropboxClient {
     } finally { clearTimeout(timer); }
   }
 
+  async renameFile(sourcePath, destinationName) {
+    const source = this.resolvePath(sourcePath);
+    const name = String(destinationName || '').trim();
+    if (!name || name === '.' || name === '..' || /[\\/\u0000-\u001f]/.test(name) || name.length > 255) {
+      throw new Error('Dropbox destination must be one valid filename.');
+    }
+    const currentName = source.split('/').at(-1);
+    const sourceExtension = currentName.includes('.') ? currentName.slice(currentName.lastIndexOf('.')).toLowerCase() : '';
+    const destinationExtension = name.includes('.') ? name.slice(name.lastIndexOf('.')).toLowerCase() : '';
+    if (sourceExtension !== destinationExtension) throw new Error('Dropbox rename must preserve the source file extension.');
+    const destination = this.resolvePath(`${source.slice(0, source.lastIndexOf('/'))}/${name}`);
+    if (source.toLowerCase() === destination.toLowerCase()) {
+      return { id: null, from: source, path: source, name: currentName, unchanged: true };
+    }
+    const data = await this.#rpc('files/move_v2', {
+      from_path: source, to_path: destination, allow_shared_folder: false,
+      autorename: false, allow_ownership_transfer: false,
+    });
+    const metadata = data?.metadata;
+    if (!metadata?.id || !metadata?.path_display || metadata['.tag'] === 'folder') {
+      throw new Error('Dropbox did not confirm the file rename.');
+    }
+    if (String(metadata.path_display).toLowerCase() !== destination.toLowerCase()) {
+      throw new Error('Dropbox confirmed an unexpected destination path.');
+    }
+    return { id: metadata.id, from: source, path: metadata.path_display, name: metadata.name, unchanged: false };
+  }
+
   deliveryRecordPath(key) {
     if (!/^[a-z0-9-]{1,150}$/.test(key)) throw new Error('Invalid delivery ledger key.');
     return this.resolvePath(`London Work/.london-delivery/${key}.json`);
