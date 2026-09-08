@@ -1,4 +1,34 @@
 import PDFDocument from 'pdfkit';
+import { parseReport, reportSubject, isMoney } from './report-format.js';
+
+function drawReportTable(doc, table) {
+  const widths = table.columns.map(() => 504 / table.columns.length);
+  const height = (row, header) => Math.max(...row.map((v, i) => {
+    doc.font(header ? 'Helvetica-Bold' : 'Helvetica').fontSize(10);
+    return doc.heightOfString(v, { width: widths[i] - 16, lineGap: 2 });
+  })) + 16;
+  const headerHeight = height(table.columns, true);
+  function draw(row, header, index) {
+    const h=height(row,header), y=doc.y; let x=54;
+    row.forEach((value,i)=>{
+      doc.rect(x,y,widths[i],h).fillAndStroke(header?'#e5eaf0':index%2?'#f5f7f9':'#ffffff','#cbd5e1');
+      doc.fillColor('#111827').font(header?'Helvetica-Bold':'Helvetica').fontSize(10)
+        .text(value,x+8,y+8,{width:widths[i]-16,lineGap:2,align:isMoney(value)?'right':'left'});
+      x+=widths[i];
+    });
+    doc.x=54;doc.y=y+h;
+  }
+  const firstHeight=table.rows.length?height(table.rows[0],false):0;
+  ensureRoom(doc,headerHeight+firstHeight);
+  draw(table.columns,true,0);
+  for (const [index,row] of table.rows.entries()) {
+    const h=height(row,false);
+    if(h+headerHeight>doc.page.height-108) throw new Error('A report table row is too tall for a page; split the content before delivery.');
+    if(doc.y+h>doc.page.height-54){doc.addPage();draw(table.columns,true,0);}
+    draw(row,false,index);
+  }
+  doc.y+=12;
+}
 
 const BRIEF_SECTIONS=[
   ['priorities','Top priorities',['priority','item','hint','status','due']],
@@ -45,15 +75,16 @@ export function renderReportPdf({ subject, text, reportData }) {
     doc.on('error', reject);
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     if(reportData){drawBrief(doc,reportData);doc.end();return;}
-    doc.fillColor('#18364a').font('Helvetica-Bold').fontSize(20).text(String(subject || 'London report'));
+    doc.fillColor('#111827').font('Helvetica-Bold').fontSize(20).text(reportSubject(subject));
     doc.moveDown(0.5).font('Helvetica').fontSize(9).fillColor('#526573').text('LONDON | MINACO');
     doc.moveDown(1).fillColor('#202b33');
-    for (const line of String(text || '').split(/\r?\n/)) {
-      const heading = /^#{1,6}\s|^\*\*[^*]+\*\*\s*$/.test(line);
-      const clean = line.replace(/^#{1,6}\s+/, '').replace(/\*\*([^*]+)\*\*/g, '$1').replace(/`([^`]+)`/g, '$1').replace(/[\u2010-\u2015]/g, '-');
-      if (!clean.trim()) { doc.moveDown(0.45); continue; }
-      doc.font(heading ? 'Helvetica-Bold' : 'Helvetica').fontSize(heading ? 12 : 10.5)
-        .text(clean, { width: 504, lineGap: 3 });
+    for (const block of parseReport(text)) {
+      if(block.type==='table'){drawReportTable(doc,block);continue;}
+      const heading=block.type==='heading';
+      ensureRoom(doc,heading?60:28);
+      doc.x=54;doc.fillColor('#111827').font(heading?'Helvetica-Bold':'Helvetica').fontSize(heading?13:10.5)
+        .text(block.text,{width:504,lineGap:3});
+      doc.moveDown(.5);
     }
     doc.end();
   });

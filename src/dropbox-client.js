@@ -2,6 +2,8 @@ import { fetchJson } from './http.js';
 import { createHash } from 'node:crypto';
 import mammoth from 'mammoth';
 import { renderReportPdf } from './report-pdf.js';
+import { renderReportDocx } from './report-docx.js';
+import { parseReport, reportSubject } from './report-format.js';
 
 function normalizeDropboxPath(value) {
   let path = String(value || '').trim().replace(/\\/g, '/');
@@ -168,7 +170,7 @@ export class DropboxClient {
     }
   }
 
-  async saveReport({ taskKey, subject, text, reportData }) {
+  async saveReport({ taskKey, subject, text, reportData, includeDocx = false }) {
     if (!this.saveReports) throw new Error('Dropbox report saving is not enabled.');
     if (!taskKey || !String(text || '').trim()) throw new Error('Report task and content are required.');
     const folder = this.resolvePath('London Work');
@@ -180,7 +182,7 @@ export class DropboxClient {
     // Content-addressed output names preserve prior reports and source documents.
     const contents = `# ${String(subject || 'London report').replace(/[\r\n]+/g, ' ')}\n\n${text}\n`;
     const suffix = createHash('sha256').update(`${taskKey}\n${contents}`).digest('hex');
-    const label = String(subject || 'Report').replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 60) || 'Report';
+    const label = reportSubject(subject).replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 60) || 'Report';
     const path = this.resolvePath(`${folder}/London - ${label} - ${suffix.slice(0, 16)}.pdf`);
     const pdf = await renderReportPdf({ subject, text, reportData });
     const token = await this.#token();
@@ -191,7 +193,20 @@ export class DropboxClient {
       body: pdf,
     }, 30000);
     if (!data?.id || !data?.path_display) throw new Error('Dropbox did not confirm the saved report.');
-    return { id: data.id, path: data.path_display };
+    const attachments = [{ name: `${label}.pdf`, contentType: 'application/pdf', contentBytes: pdf.toString('base64') }];
+    let docxPath;
+    if (!reportData && (includeDocx || parseReport(text).some(block => block.type === 'table'))) {
+      const docx = renderReportDocx({subject,text});
+      const target = path.replace(/\.pdf$/, '.docx');
+      const saved = await fetchJson(this.fetchImpl, 'https://content.dropboxapi.com/2/files/upload', {
+        method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/octet-stream',
+          'Dropbox-API-Arg':JSON.stringify({path:target,mode:'overwrite',autorename:false,mute:true}).replace(/[\u007f-\uffff]/g,c=>`\\u${c.charCodeAt(0).toString(16).padStart(4,'0')}`)},body:docx,
+      },30000);
+      if(!saved?.id || !saved?.path_display)throw new Error('Dropbox did not confirm the Word report; no completion sent.');
+      docxPath=saved.path_display;
+      attachments.push({name:`${label}.docx`,contentType:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',contentBytes:docx.toString('base64')});
+    }
+    return { id: data.id, path: data.path_display, ...(docxPath?{docxPath}:{}), attachments };
   }
 }
 
