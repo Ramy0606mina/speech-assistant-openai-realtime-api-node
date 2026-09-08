@@ -13,6 +13,7 @@ import { registerVoiceRoutes } from './src/voice-gateway.js';
 import { MorningBrief } from './src/morning-brief.js';
 import { SmsClient } from './src/sms-client.js';
 import { UrgentAlerts } from './src/urgent-alerts.js';
+import { SmsConversation, registerSmsWebhook } from './src/sms-conversation.js';
 
 dotenv.config();
 const config = loadConfig();
@@ -29,6 +30,19 @@ const deliveryGuard = new DeliveryGuard(dropbox, graph.readMailbox);
 const sms = new SmsClient({accountSid:process.env.TWILIO_ACCOUNT_SID,authToken:process.env.TWILIO_AUTH_TOKEN,from:process.env.TWILIO_PHONE_NUMBER,to:config.voice.principalPhone});
 const london = new LondonCore({ graph, openai, dropbox, state, deliveryGuard, sms, logger: app.log });
 const urgentAlerts=new UrgentAlerts({graph,openai,sms,guard:new DeliveryGuard(dropbox,`${graph.principalMailbox}:urgent-alerts`)});
+const smsConversation = new SmsConversation({sms,openai,graph,dropbox,state,guard:new DeliveryGuard(dropbox,`${graph.principalMailbox}:incoming-sms`),logger:app.log});
+// Do not activate owner texts in PR previews that share production credentials.
+const smsConversationEnabled = process.env.LONDON_SMS_CONVERSATION_ENABLED === undefined
+  ? process.env.RENDER_EXTERNAL_URL === 'https://london-ai-pr-1.onrender.com'
+  : process.env.LONDON_SMS_CONVERSATION_ENABLED === 'true';
+let smsWebhookStatus = 'not-initialized';
+async function safeSmsConversation(){if(!smsConversationEnabled)return;try{await smsConversation.tick();}catch(error){app.log.error({status:error.status||null},'Owner SMS conversation failed');}}
+async function initializeSmsWebhook(){
+  if(!smsConversationEnabled || !sms.configured)return;
+  try{smsWebhookStatus=await sms.configureInbound(process.env.RENDER_EXTERNAL_URL);}
+  catch(error){smsWebhookStatus='configuration-needs-review';app.log.error({status:error.status||null},'SMS webhook configuration failed; inbox polling remains available');}
+}
+registerSmsWebhook(app,{sms,publicUrl:process.env.RENDER_EXTERNAL_URL,onMessage:safeSmsConversation});
 async function safeUrgentAlerts(){try{await urgentAlerts.tick();}catch(error){app.log.error({err:error},'Urgent email alert failed');}}
 let deliveryGuardReady = false;
 const morningBrief = new MorningBrief({graph,openai,dropbox,guard:deliveryGuard});
@@ -72,6 +86,7 @@ app.get('/health', async () => ({
   powerAutomateRequired: false,
   revision: process.env.RENDER_GIT_COMMIT || null,
   sms: sms.configured ? 'owner-requested' : 'not-configured',
+  smsConversation: {enabled:smsConversationEnabled,configured:sms.configured,ready:smsConversation.ready,mode:'two-way-owner-only',transport:'webhook-with-inbox-polling',webhook:smsWebhookStatus,intervalSeconds:15,lastCheckedAt:smsConversation.lastCheckedAt,lastOutcome:smsConversation.lastOutcome,lastReplyStatus:smsConversation.lastReplyStatus},
   urgentEmailAlerts: {configured:sms.configured,ready:urgentAlerts.ready,newMessagesOnly:true},
   whatsapp: 'removed',
   pendingDeliveryReview: Object.values(state.state.processedMessages).filter(item => item.result === 'delivery-pending-review').length,
@@ -109,3 +124,6 @@ setTimeout(safePoll, 1500).unref?.();
 setInterval(safeMorningBrief,60000).unref?.();
 setInterval(safeUrgentAlerts,60000).unref?.();
 setTimeout(safeUrgentAlerts,2500).unref?.();
+setInterval(safeSmsConversation,15000).unref?.();
+setTimeout(safeSmsConversation,3000).unref?.();
+setTimeout(initializeSmsWebhook,3500).unref?.();
