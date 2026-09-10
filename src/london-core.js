@@ -59,6 +59,9 @@ export class LondonCore {
         }
       }
       const attachments = full.hasAttachments ? await this.graph.getLondonAttachments(summary.id) : [];
+      if (this.deliveryGuard && !await this.deliveryGuard.claimAnalysis(key)) {
+        return { processed: false, reason: 'analysis-needs-review', key };
+      }
       const analysis = await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox, graph: this.graph, sms:this.sms });
       let text = String(analysis.text || '').trim();
       if (!text) throw new Error('London produced an empty delegated-task result.');

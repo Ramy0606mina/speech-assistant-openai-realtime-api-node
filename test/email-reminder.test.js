@@ -70,7 +70,7 @@ function coreHarness({fail=false,claim=true,body=request.body}={}){
     if(fail)throw Object.assign(new Error('Denied'),{status:403});
     return {id:'event',created:true,reminderOn:true,title:value.title,startLocal:'2030-07-11T09:00:00',timezone:'Eastern time',phone:value.phone};
   },sendMail:async mail=>sent.push(mail)};
-  const core=new LondonCore({graph,openai:{analyzeDelegatedEmail:async()=>({text:'Unverified model draft',calendarReminder:reminder})},state:{hasMessage:key=>seen.has(key),markMessage:key=>seen.add(key)},deliveryGuard:{check:async()=>null,claim:async()=>{claimed=true;return claim;},complete:async()=>{}},logger:{error(){}}});
+  const core=new LondonCore({graph,openai:{analyzeDelegatedEmail:async()=>({text:'Unverified model draft',calendarReminder:reminder})},state:{hasMessage:key=>seen.has(key),markMessage:key=>seen.add(key)},deliveryGuard:{check:async()=>null,claimAnalysis:async()=>true,claim:async()=>{claimed=true;return claim;},complete:async()=>{}},logger:{error(){}}});
   return {core,sent,writes:()=>writes};
 }
 

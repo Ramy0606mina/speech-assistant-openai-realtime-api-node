@@ -31,10 +31,28 @@ test('ambiguous dispatch never sends again after restart',async()=>{
  await assert.rejects(core(g,sends,{failSend:true}).processMessage(msg),/timeout/);
  await core(g,sends).processMessage(msg);assert.equal(sends.length,1);
 });
-test('analysis failure before claiming remains retryable',async()=>{
+test('failed analysis is held for review instead of paid reprocessing after restart',async()=>{
  const s=store(),g=new DeliveryGuard(s,'london@example.com');await g.initialize();const sends=[];const msg={id:'one'};
  await assert.rejects(core(g,sends,{failAnalysis:true}).processMessage(msg),/analysis/);
- await core(g,sends).processMessage(msg);assert.equal(sends.length,1);
+ const restarted = new DeliveryGuard(s,'london@example.com');await restarted.initialize();
+ const result=await core(restarted,sends).processMessage(msg);
+ assert.equal(result.processed,false);assert.equal(result.reason,'analysis-needs-review');assert.equal(sends.length,0);
+});
+
+test('concurrent workers perform paid analysis only once',async()=>{
+ const s=store(),a=new DeliveryGuard(s,'london@example.com'),b=new DeliveryGuard(s,'london@example.com');
+ await Promise.all([a.initialize(),b.initialize()]);let analyses=0;const sends=[];
+ const first=core(a,sends),second=core(b,sends);
+ for(const worker of [first,second])worker.openai.analyzeDelegatedEmail=async()=>{analyses++;return {text:'Report'};};
+ await Promise.all([first.processMessage({id:'one'}),second.processMessage({id:'one'})]);
+ assert.equal(analyses,1);assert.equal(sends.length,1);
+});
+
+test('analysis ledger write outage blocks paid work',async()=>{
+ const s=store(),g=new DeliveryGuard(s,'london@example.com');await g.initialize();
+ const worker=core(g,[]);worker.openai.analyzeDelegatedEmail=async()=>assert.fail('must not call AI');
+ s.createDeliveryRecord=async()=>{throw Error('ledger write unavailable');};
+ await assert.rejects(worker.processMessage({id:'one'}),/ledger write unavailable/);
 });
 test('migration boundary survives restart and holds old or undated requests',async()=>{
  const s=store(),g=new DeliveryGuard(s,'london@example.com');await g.initialize();const boundary=g.notBefore;
