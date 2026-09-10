@@ -53,7 +53,7 @@ test('a successful inbox read with failed tasks is degraded, not healthy', async
   const worker = new MailboxWorker({ guard: { initialize: async () => {} }, london: {
     pollOnce: async () => ({ checked: 2, results: [{ processed: false }, { skipped: true }] }),
   } });
-  assert.deepEqual(await worker.poll(), { ok: false, state: 'degraded', checked: 2, failed: 1, lastCheckedAt: worker.status.lastCheckedAt });
+  assert.deepEqual(await worker.poll(), { ok: false, state: 'degraded', checked: 2, failed: 1, heldForReview: 0, newFailures: 1, lastCheckedAt: worker.status.lastCheckedAt });
 });
 
 test('optional report failure still delivers the result once and never repeats the verified rename', async () => {
@@ -81,4 +81,20 @@ test('optional report failure still delivers the result once and never repeats t
 
 test('new response subjects do not accumulate across reply chains', () => {
   assert.equal(reportSubject('RE: LONDON — Task Response | RE: LONDON — Task Needs Attention | Rename files'), 'Rename files');
+});
+
+
+test('health distinguishes held analysis from new failures without exposing message data',async()=>{
+ const worker=new MailboxWorker({guard:{initialize:async()=>{}},london:{pollOnce:async()=>({checked:3,results:[{processed:false,reason:'analysis-needs-review',key:'private'},{processed:false,error:'secret'},{skipped:true}]})}});
+ const status=await worker.poll();assert.equal(status.heldForReview,1);assert.equal(status.newFailures,1);assert.equal(status.ok,false);assert.doesNotMatch(JSON.stringify(status),/private|secret/);
+});
+
+
+test('inbound classification is durable across restart and holds failed analysis',async()=>{
+ const records=new Map();const guard=new DeliveryGuard({readDeliveryRecord:async k=>records.get(k),createDeliveryRecord:async(k,v)=>{if(records.has(k))return false;records.set(k,v);return true;}},'inbound');
+ await guard.initialize();let calls=0,fail=false;
+ const deps={deliveryGuard:guard,graph:{principalMailbox:'owner@example.com',readMailbox:'london@example.com',getLondonMessage:async()=>({from:{emailAddress:{address:'vendor@example.com'}},receivedDateTime:new Date(Date.now()+1000).toISOString()})},openai:{classifyInboundEmail:async()=>{calls++;if(fail)throw Error('offline');return{text:'ACTION'};}}};
+ const make=()=>new LondonCore({...deps,state:new StateStore()});
+ await make().processMessage({id:'ok'});await make().processMessage({id:'ok'});assert.equal(calls,1);
+ fail=true;await assert.rejects(make().processMessage({id:'failed'}));assert.equal((await make().processMessage({id:'failed'})).reason,'analysis-needs-review');assert.equal(calls,2);
 });

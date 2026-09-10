@@ -23,8 +23,10 @@ export class MailboxWorker {
       }
       const result = await this.london.pollOnce(this.limit);
       const failed = result.results.filter(item => item.processed === false).length;
+      const heldForReview = result.results.filter(item => item.processed === false && item.reason === 'analysis-needs-review').length;
       this.status = { state: failed ? 'degraded' : 'ready',
-        lastCheckedAt: new Date().toISOString(), checked: result.checked, failed };
+        lastCheckedAt: new Date().toISOString(), checked: result.checked, failed,
+        heldForReview, newFailures: failed - heldForReview };
       return { ok: !failed, ...this.status };
     } catch {
       this.status = { state: 'blocked', reason: 'mailbox-poll-failed', lastCheckedAt: new Date().toISOString() };

@@ -90,7 +90,7 @@ export class LondonCore {
           text = `Renamed ${renamed.length} file${renamed.length === 1 ? '' : 's'} in Dropbox:\n${renamed.map(item=>`- ${item.from} → ${item.path}`).join('\n')}`;
         } catch (error) {
           operationFailed = true;
-          text = 'Dropbox did not confirm every requested rename. Review the target folder before retrying so an already-renamed file is not duplicated.';
+          text = `Dropbox confirmed ${renamed.length} of ${analysis.dropboxRenames.length} requested renames.${renamed.length ? '\n'+renamed.map(item=>`- ${item.from} → ${item.path}`).join('\n') : ''}\nThe remaining renames were not confirmed. Review the target folder before retrying so an already-renamed file is not duplicated.`;
           this.logger.error?.({error:error.message},'Dropbox rename failed');
         }
       }
@@ -158,8 +158,20 @@ export class LondonCore {
 
       result = { type: 'delegated-task', sender, analysis: text, completionSent: true, reportPath: report?.path || null };
     } else {
-      const classification = await this.openai.classifyInboundEmail(full);
-      result = { type: 'inbound-email', sender, classification: classification.text.trim().toUpperCase() };
+      if (this.deliveryGuard) {
+        const reason = await this.deliveryGuard.check(key, full.receivedDateTime);
+        if (reason) return { skipped: true, reason, key };
+        const saved = await this.deliveryGuard.analysisResult(key);
+        if (saved) {
+          this.state.markMessage(key, { sender, result: 'inbound-email' });
+          return { skipped: true, reason: 'classification-completed', key };
+        }
+        if (!await this.deliveryGuard.claimAnalysis(key)) return { processed: false, reason: 'analysis-needs-review', key };
+      }
+      const classification = (await this.openai.classifyInboundEmail(full)).text.trim().toUpperCase();
+      if (!['URGENT','ACTION','INFORMATION','IGNORE'].includes(classification)) throw new Error('Invalid inbound classification.');
+      if (this.deliveryGuard) await this.deliveryGuard.completeAnalysis(key, classification);
+      result = { type: 'inbound-email', sender, classification };
     }
 
     this.state.markMessage(key, { sender, result: result.type });

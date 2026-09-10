@@ -24,15 +24,18 @@ export class UrgentAlerts {
     try {
       if(!this.ready){await this.guard.initialize();this.ready=true;}
       const messages=await this.graph.listPrincipalInbox(25);
+      this.heldForReview=0;
       for(const message of [...messages].reverse()){
         const key=message.internetMessageId||message.id;
         if(!key || this.seen.has(key))continue;
         if(await this.guard.check(key,message.receivedDateTime)){this.seen.add(key);continue;}
+        if((await this.guard.analysisResult(key))?.classification==='NORMAL'){this.seen.add(key);continue;}
+        if(!await this.guard.claimAnalysis(key)){this.heldForReview++;continue;}
         const result=await this.openai.respond({instructions:urgencyInstructions,input:JSON.stringify({subject:message.subject,from:message.from,received:message.receivedDateTime,preview:message.bodyPreview})});
         const decision=result.text.trim().toUpperCase();
         if(!['URGENT','NORMAL'].includes(decision))throw new Error('Urgency classification returned an invalid decision.');
         this.logger.info({decision},'Urgent inbox classification completed');
-        if(decision==='NORMAL'){this.seen.add(key);continue;}
+        if(decision==='NORMAL'){await this.guard.completeAnalysis(key,'NORMAL');this.seen.add(key);continue;}
         const smsBody=await buildUrgentSms(message,this.openai);
         if(!await this.guard.claim(key)){this.seen.add(key);continue;}
         this.seen.add(key);

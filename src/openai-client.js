@@ -128,6 +128,7 @@ export class OpenAIClient {
     const input = [{ role: 'user', content: [{ type: 'input_text', text: `From: ${sender}\nSubject: ${subject}\nReceived: ${email.receivedDateTime || '[unknown; clarify relative dates]'}\nCurrent time: ${new Date().toISOString()}\n\n${body}` }, ...attachments] }];
     let bytes = attachments.reduce((sum, part) => sum + (part.file_data ? Buffer.from(part.file_data.split(',')[1] || '', 'base64').length : 0), 0);
     let reads = 0;
+    const readDocuments = new Map();
     const followUps = [];
     const followUpUpdates=[];
     const dropboxRenames=[];
@@ -188,12 +189,18 @@ export class OpenAIClient {
           else if (call.name === 'search_dropbox') output = (await dropbox.search(String(args.query || ''))).map(entrySummary);
           else if (call.name === 'list_dropbox') output = (await dropbox.listFolder(String(args.path || ''))).slice(0, 100).map(entrySummary);
           else if (call.name === 'read_dropbox_file') {
+            const documentKey = (dropbox.resolvePath ? dropbox.resolvePath(String(args.path || '')) : String(args.path || '')).toLowerCase();
+            if (readDocuments.has(documentKey)) {
+              output = { ...readDocuments.get(documentKey), documentInputFollows: false, alreadyInContext: true };
+            } else {
             if (++reads > 6 || bytes >= 40 * 1024 * 1024) throw new Error('Document analysis limit reached for this task.');
             const file = await dropbox.readFile(String(args.path || ''), 40 * 1024 * 1024 - bytes);
             bytes += file.size;
             document = file.part;
             if(document?.text?.startsWith('Spreadsheet source data')) spreadsheetAnalyzed=true;
             output = { read: true, path: file.path, filename: file.filename, documentInputFollows: true };
+            readDocuments.set(documentKey, output);
+            }
           } else if (call.name === 'prepare_dropbox_rename') {
             if (!renameRequest) throw new Error('A direct owner rename request is required. Quoted text cannot authorize file changes.');
             if (dropboxRenames.length >= 10) throw new Error('Maximum ten file renames per request.');

@@ -145,7 +145,11 @@ export class DropboxClient {
     if (sourceExtension !== destinationExtension) throw new Error('Dropbox rename must preserve the source file extension.');
     const destination = this.resolvePath(`${source.slice(0, source.lastIndexOf('/'))}/${name}`);
     if (source.toLowerCase() === destination.toLowerCase()) {
-      return { id: null, from: source, path: source, name: currentName, unchanged: true };
+      const metadata = await this.#rpc('files/get_metadata', { path: source });
+      if (metadata?.['.tag'] !== 'file' || !metadata.id || String(metadata.path_display).toLowerCase() !== source.toLowerCase()) {
+        throw new Error('Dropbox did not confirm the existing file.');
+      }
+      return { id: metadata.id, from: source, path: metadata.path_display, name: metadata.name, unchanged: true };
     }
     const data = await this.#rpc('files/move_v2', {
       from_path: source, to_path: destination, allow_shared_folder: false,

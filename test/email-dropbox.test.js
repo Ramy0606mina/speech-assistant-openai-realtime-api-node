@@ -151,3 +151,15 @@ test('generated reports stay in London Work, retain changed versions and retry i
   assert.notEqual(uploaded[0], uploaded[2]);
   assert.ok(uploaded.every(path => !path.includes('..')));
 });
+
+
+test('repeated document lookups append and download the document only once',async()=>{
+ let step=0,reads=0;const client=new OpenAIClient({apiKey:'test',fetchImpl:async(url,options)=>{
+ const request=JSON.parse(options.body);
+ if(++step<=3)return Response.json({output:[{type:'function_call',call_id:String(step),name:'read_dropbox_file',arguments:JSON.stringify({path:step===2?'DOC.pdf':'doc.pdf'})}]});
+ assert.equal(request.input.flatMap(x=>x.content||[]).filter(x=>x.type==='input_file').length,1);
+ assert.equal(request.input.filter(x=>x.type==='function_call_output'&&JSON.parse(x.output).alreadyInContext).length,2);
+ return Response.json({output_text:'Done'});
+ }});
+ await client.analyzeDelegatedEmail({body:{content:'Read doc'}},[],{dropbox:{resolvePath:p=>p,readFile:async()=>{reads++;return{size:10,path:'doc.pdf',filename:'doc.pdf',part:{type:'input_file',file_data:'data:application/pdf;base64,UERG'}};}}});assert.equal(reads,1);
+});

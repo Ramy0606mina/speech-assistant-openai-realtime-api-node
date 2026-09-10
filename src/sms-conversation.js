@@ -119,6 +119,10 @@ export class SmsConversation {
         const current = this.state.state.smsConversation || {};
         if (current.optedOut) { this.state.markMessage(key, { result: 'sms-opted-out' }); continue; }
         const history = Date.now() - Date.parse(current.updatedAt) < 86400000 && Array.isArray(current.history) ? current.history : [];
+        if (!await this.guard.claimAnalysis(key)) {
+          this.lastOutcome = 'analysis-needs-review';
+          continue;
+        }
         let answer;
         try {
           answer = !body || message.numMedia > 0

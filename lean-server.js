@@ -88,7 +88,7 @@ app.get('/health', async () => ({
   revision: process.env.RENDER_GIT_COMMIT || null,
   sms: sms.configured ? 'owner-requested' : 'not-configured',
   smsConversation: {enabled:smsConversationEnabled,configured:sms.configured,ready:smsConversation.ready,mode:'two-way-owner-only',transport:'webhook-with-inbox-polling',webhook:smsWebhookStatus,intervalSeconds:15,lastCheckedAt:smsConversation.lastCheckedAt,lastOutcome:smsConversation.lastOutcome,lastReplyStatus:smsConversation.lastReplyStatus},
-  urgentEmailAlerts: {configured:sms.configured,ready:urgentAlerts.ready,newMessagesOnly:true},
+  urgentEmailAlerts: {configured:sms.configured,ready:urgentAlerts.ready,newMessagesOnly:true,heldForReview:urgentAlerts.heldForReview||0},
   whatsapp: 'removed',
   pendingDeliveryReview: Object.values(state.state.processedMessages).filter(item => item.result === 'delivery-pending-review').length,
   durableDeliveryGuard: mailboxWorker.guardReady,
