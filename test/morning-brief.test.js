@@ -52,3 +52,18 @@ test('concurrent reports pay for one analysis',async()=>{
  await Promise.all([new MorningBrief(deps).tick(new Date('2026-09-07T11:30:00Z')),new MorningBrief(deps).tick(new Date('2026-09-07T11:30:00Z'))]);
  assert.equal(calls,1);
 });
+
+
+test('weekend mornings skip every source, model and delivery operation',async()=>{
+ const fail=()=>assert.fail('weekend must do no report work');
+ const brief=new MorningBrief({graph:new Proxy({}, {get:()=>fail}),openai:{respond:fail},dropbox:{saveReport:fail},guard:{check:fail,claimAnalysis:fail}});
+ for(const instant of ['2026-09-12T11:30:00Z','2026-09-13T11:30:00Z','2026-03-08T11:30:00Z','2026-11-01T12:30:00Z']){
+  assert.equal(briefSlot(new Date(instant)).due,false);assert.deepEqual(await brief.tick(new Date(instant)),{skipped:true});
+ }
+});
+
+test('weekday schedule retains Toronto time across both DST transitions',()=>{
+ for(const [before,due] of [['2026-03-06T12:29:00Z','2026-03-06T12:30:00Z'],['2026-03-09T11:29:00Z','2026-03-09T11:30:00Z'],['2026-10-30T11:29:00Z','2026-10-30T11:30:00Z'],['2026-11-02T12:29:00Z','2026-11-02T12:30:00Z']]){
+  assert.equal(briefSlot(new Date(before)).due,false);assert.equal(briefSlot(new Date(due)).due,true);
+ }
+});

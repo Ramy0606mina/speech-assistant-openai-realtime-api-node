@@ -93,7 +93,7 @@ app.get('/health', async () => ({
   pendingDeliveryReview: Object.values(state.state.processedMessages).filter(item => item.result === 'delivery-pending-review').length,
   durableDeliveryGuard: mailboxWorker.guardReady,
   historicalRequestsHeld: Object.values(state.state.processedMessages).filter(item => item.result === 'historical-review').length,
-  morningBrief: {enabled:morningBriefEnabled,time:'07:30',timeZone:'America/Toronto',cadence:'daily',catchUpUntil:'12:00',lastOutcome:morningBrief.lastOutcome},
+  morningBrief: {enabled:morningBriefEnabled,time:'07:30',timeZone:'America/Toronto',cadence:'weekdays',catchUpUntil:'12:00',lastOutcome:morningBrief.lastOutcome},
   ...configurationStatus(config),
   lastPollAt: state.state.lastPollAt,
   time: new Date().toISOString(),
