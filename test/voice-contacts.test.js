@@ -42,9 +42,27 @@ test('voice exposes automatic Outlook contact lookup',async()=>{
 test('voice requires nested-folder lookup before claiming an attendee is missing',()=>{
   const instructions=realtimeInstructions();
   const contactTool=voiceTools().find(tool=>tool.name==='find_contact');
-  assert.match(instructions,/MUST call find_contact before answering or asking for an address/);
+  assert.match(instructions,/MUST call find_contact before asking for an address/);
   assert.match(instructions,/Never say that you lack access to email subfolders/);
   assert.match(contactTool.description,/every nested person\/project folder/);
 });
 
 
+
+
+test('contact already read on this call resolves without scanning folders',async()=>{
+ const context={knownContacts:new Map(),readMessages:new Set(),graph:{getVoiceMessage:async()=>({from:{emailAddress:{name:'Christine Normando',address:'christine@example.com'}}}),resolveVoiceContact:async()=>assert.fail('unnecessary mailbox scan')}};
+ await runVoiceTool('read_email',{message_id:'selected'},context);
+ const found=await runVoiceTool('find_contact',{query:'Christine Normando'},context);
+ assert.equal(found.status,'resolved');assert.equal(found.contacts[0].address,'christine@example.com');assert.equal(found.messagesScanned,0);
+});
+
+test('cached contact ambiguity is preserved and unknown names use full lookup',async()=>{
+ let searches=0;const context={knownContacts:new Map([['a',{name:'Alex Smith',address:'one@example.com'}],['b',{name:'Alex Smith',address:'two@example.com'}]]),graph:{resolveVoiceContact:async()=>{searches++;return {status:'not_found',contacts:[]};}}};
+ assert.equal((await runVoiceTool('find_contact',{query:'Alex Smith'},context)).status,'ambiguous');assert.equal(searches,0);
+ await runVoiceTool('find_contact',{query:'Unknown Name'},context);assert.equal(searches,1);
+});
+
+test('voice acknowledges work first and uses selected reply without contact lookup',()=>{
+ const text=realtimeInstructions();assert.match(text,/immediately say one short acknowledgment/);assert.match(text,/Replies to a selected email do not require contact lookup/);assert.match(text,/only if it has not already been read/);
+});
