@@ -4,7 +4,7 @@ import mammoth from 'mammoth';
 import { renderReportPdf } from './report-pdf.js';
 import { renderReportDocx } from './report-docx.js';
 import { parseReport, reportSubject } from './report-format.js';
-import { isSpreadsheet, extractSpreadsheet, renderReportXlsx } from './spreadsheet-report.js';
+import { isSpreadsheet, extractSpreadsheet, renderReportXlsx } from './spreadsheet-report.js';import { resolveFileContentType } from '../file-content-type.js';
 
 function normalizeDropboxPath(value) {
   let path = String(value || '').trim().replace(/\\/g, '/');
@@ -128,7 +128,7 @@ export class DropboxClient {
       if(isSpreadsheet(filename))return {path:resolved,filename,size,part:await extractSpreadsheet({filename:resolved,bytes})};
       return { path: resolved, filename, size, part: {
         type: 'input_file', filename,
-        file_data: `data:${filename.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream'};base64,${bytes.toString('base64')}`,
+        file_data: `data:${resolveFileContentType({ filename, buffer: bytes })};base64,${bytes.toString('base64')}`,
       } };
     } finally { clearTimeout(timer); }
   }
