@@ -15,7 +15,8 @@ export function briefSlot(now = new Date()) {
   const p=easternParts(now);
   const date=`${p.year}-${p.month}-${p.day}`;
   const minutes=Number(p.hour)*60+Number(p.minute);
-  return {date,due:minutes>=450 && minutes<720};
+  const weekday=new Date(`${date}T12:00:00Z`).getUTCDay();
+  return {date,due:weekday>=1 && weekday<=5 && minutes>=450 && minutes<720};
 }
 
 const REPORT_SECTIONS = [
