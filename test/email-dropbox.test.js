@@ -118,9 +118,16 @@ test('report is saved before owner email and save failure does not claim complet
   await core.processMessage({ id: 'save-test' });
   assert.deepEqual(events, ['save', 'email']);
   core.dropbox.saveReport = async () => { throw new Error('Storage unavailable'); };
-  await assert.rejects(core.processMessage({ id: 'save-failed' }), /Storage unavailable/);
-  assert.equal(core.state.hasMessage('save-failed'), false);
-  assert.deepEqual(events, ['save', 'email']);
+  core.graph.sendMail = async mail => {
+    events.push('warning-email');
+    assert.match(mail.subject, /Needs Attention/);
+    assert.match(mail.body, /Comparison findings/);
+    assert.match(mail.body, /saving was not confirmed/);
+    assert.doesNotMatch(mail.body, /Saved in Dropbox:/);
+  };
+  await core.processMessage({ id: 'save-failed' });
+  assert.equal(core.state.hasMessage('save-failed'), true);
+  assert.deepEqual(events, ['save', 'email', 'warning-email']);
 });
 
 test('generated reports stay in London Work, retain changed versions and retry identical output safely', async () => {

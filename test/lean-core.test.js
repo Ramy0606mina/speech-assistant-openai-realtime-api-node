@@ -62,7 +62,7 @@ test('London processes Ramy email as delegated task and sends completion through
   assert.equal(result.results[0].completionSent, true);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].to, 'ramy@minaco.ca');
-  assert.equal(sent[0].subject, 'LONDON — Task Complete | Review');
+  assert.equal(sent[0].subject, 'LONDON — Task Response | Review');
 });
 
 test('London classifies external email without executing it as Ramy task', async () => {
