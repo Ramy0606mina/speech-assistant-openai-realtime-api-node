@@ -11,9 +11,9 @@ test('morning schedule observes Eastern daylight saving and the catch-up window'
  assert.equal(easternMidnight('2026-03-09'),'2026-03-09T04:00:00.000Z');
 });
 function harness(){
- const claims=new Set();const sent=[];
+ const claims=new Set(),analyses=new Set();const sent=[];
  const graph={principalMailbox:'owner@example.com',listPrincipalInbox:async()=>[],listPrincipalCalendar:async()=>[],listFollowUps:async()=>[],sendMail:async m=>sent.push(m)};
- const guard={check:async k=>claims.has(k),claim:async k=>{if(claims.has(k))return false;claims.add(k);return true;},complete:async()=>{}};
+ const guard={claimAnalysis:async k=>{if(analyses.has(k))return false;analyses.add(k);return true;},check:async k=>claims.has(k),claim:async k=>{if(claims.has(k))return false;claims.add(k);return true;},complete:async()=>{}};
  const deps={graph,guard,openai:{respond:async()=>({text:reportJson})},dropbox:{saveReport:async()=>({path:'report.pdf'})}};
  return {deps,sent};
 }
@@ -35,4 +35,20 @@ test('brief preserves missing-source status rather than treating failure as empt
 test('brief JSON renders a compact colored HTML table',()=>{
  const report=parseBriefReport(reportJson);const html=renderBriefHtml(report);
  assert.match(html,/Top priorities/);assert.match(html,/Review quote/);assert.match(html,/background:#fff2cc/);assert.doesNotMatch(html,/undefined/);
+});
+
+
+test('failed report generation cannot repeat paid analysis on polling or restart',async()=>{
+ const {deps,sent}=harness();let calls=0;deps.openai.respond=async()=>{calls++;throw Error('model unavailable');};
+ const now=new Date('2026-09-07T11:30:00Z'),worker=new MorningBrief(deps);
+ await assert.rejects(worker.tick(now));assert.equal(worker.lastOutcome.requiresReview,true);
+ assert.equal((await worker.tick(now)).reason,'analysis-needs-review');
+ assert.equal((await new MorningBrief(deps).tick(now)).requiresReview,true);
+ assert.equal(calls,1);assert.equal(sent.length,0);
+});
+
+test('concurrent reports pay for one analysis',async()=>{
+ const {deps}=harness();let calls=0;deps.openai.respond=async()=>{calls++;return {text:reportJson};};
+ await Promise.all([new MorningBrief(deps).tick(new Date('2026-09-07T11:30:00Z')),new MorningBrief(deps).tick(new Date('2026-09-07T11:30:00Z'))]);
+ assert.equal(calls,1);
 });

@@ -62,3 +62,20 @@ test('London performs prepared renames only after durable claim and reports veri
   assert.deepEqual(events,['claim','rename','email','complete']);
 });
 
+
+
+test('unchanged name requires a verified existing file',async()=>{
+ const path='/LONDON - ACCESS/old.pdf';let payload={'.tag':'file',id:'id:one',path_display:path,name:'old.pdf'};
+ const dbx=new DropboxClient({accessToken:'test',fetchImpl:async(url)=>{assert.ok(String(url).endsWith('/files/get_metadata'));return Response.json(payload);}});
+ assert.equal((await dbx.renameFile(path,'old.pdf')).id,'id:one');
+ for(const invalid of [{},{'.tag':'folder',id:'id:one',path_display:path},{'.tag':'file',id:'id:one',path_display:'/wrong.pdf'}]){payload=invalid;await assert.rejects(dbx.renameFile(path,'old.pdf'),/did not confirm/);}
+});
+
+test('partial rename preserves verified successes and does not replay them',async()=>{
+ let calls=0,mail;const core=new LondonCore({state:new StateStore(),
+ graph:{principalMailbox:'owner@example.com',readMailbox:'london@example.com',getLondonMessage:async()=>({from:{emailAddress:{address:'owner@example.com'}},body:{content:'Rename two files'}}),sendMail:async value=>mail=value},
+ openai:{analyzeDelegatedEmail:async()=>({text:'Prepared',dropboxRenames:[{sourcePath:'one.pdf',destinationName:'new-one.pdf'},{sourcePath:'two.pdf',destinationName:'new-two.pdf'}]})},
+ dropbox:{renameFile:async()=>{if(++calls===2)throw Error('conflict');return{from:'one.pdf',path:'new-one.pdf'};}},
+ deliveryGuard:{check:async()=>null,claimAnalysis:async()=>true,claim:async()=>true,complete:async()=>{}},logger:{error(){}}});
+ await core.processMessage({id:'one'});await core.processMessage({id:'one'});assert.equal(calls,2);assert.match(mail.subject,/Needs Attention/);assert.match(mail.body,/confirmed 1 of 2/);assert.match(mail.body,/one.pdf.*new-one.pdf/);
+});

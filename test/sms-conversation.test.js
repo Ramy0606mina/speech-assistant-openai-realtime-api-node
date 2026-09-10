@@ -88,3 +88,9 @@ test('webhook rejects forged requests, silently ignores other senders and acknow
   const stranger={...fields,From:'+15145550999'};assert.equal((await inject(stranger,signature(stranger))).statusCode,200);await new Promise(setImmediate);assert.equal(ticks,0);
   const result=await inject(fields,signature(fields));assert.equal(result.statusCode,200);assert.match(result.body,/<Response\/>/);await new Promise(setImmediate);assert.equal(ticks,1);await app.close();
 });
+
+
+test('separate SMS workers acquire one analysis claim before paid work',async()=>{
+ const f=fixture();await Promise.all([f.make(new StateStore()).tick(),f.make(new StateStore()).tick()]);
+ assert.equal(f.requests.length,1);assert.equal(f.sent.length,1);
+});

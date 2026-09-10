@@ -40,4 +40,12 @@ export class DeliveryGuard {
     // Separate receipt preserves the immutable dispatch claim.
     await this.store.createDeliveryRecord(`${this.record(key)}-sent`, { result: 'sent', sentAt: new Date().toISOString(), reportPath: reportPath || null });
   }
+  async analysisResult(key) {
+    return this.store.readDeliveryRecord(`${this.record(key)}-analysis-result`);
+  }
+  async completeAnalysis(key, classification) {
+    await this.store.createDeliveryRecord(`${this.record(key)}-analysis-result`, {
+      classification, completedAt: new Date().toISOString(),
+    });
+  }
 }
