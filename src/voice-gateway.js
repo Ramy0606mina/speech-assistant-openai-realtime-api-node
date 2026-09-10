@@ -78,6 +78,7 @@ export function realtimeInstructions() {
     'Ramy is speaking to you by phone.',
     'Speak in polished British English with a calm, mature, discreet executive-assistant manner.',
     'Keep answers concise unless Ramy asks for detail.',
+    'Before starting any lookup or draft tool, immediately say one short acknowledgment of the requested work, such as “I’ll draft that question to Christine.” Then call the tool without waiting for another confirmation. Do not stay silent while beginning tool work, repeat filler, or claim completion before the result. After a lookup, briefly explain the verified next step before another tool if more work is needed.',
     'Ramy may pause briefly while forming a sentence; do not interrupt unnecessarily.',
     'If he interrupts you, stop promptly and listen.',
     'Never invent current email, calendar, Dropbox, financial, tenant, project, or business facts.',
@@ -87,13 +88,13 @@ export function realtimeInstructions() {
     'For a meeting, collect the title, exact future date and time, timezone, duration, whether it is online or in person, and explicit attendee email addresses. Never guess an address. Default to America/Toronto Eastern time, including daylight saving, unless Ramy explicitly requests another timezone. For a virtual, Teams, video, or online meeting, set online_meeting true. Call prepare_calendar_meeting, read back localStart, localEnd, timezone, attendees, onlineMeeting, and any conflicts, then ask whether to create it and send invitations.',
     'Call confirm_calendar_meeting only after Ramy unambiguously confirms that exact prepared proposal in a later spoken turn. A request to prepare, schedule, or invite is not confirmation. Never claim a meeting or invitation exists unless confirm_calendar_meeting returned success true during the current request.',
     'When Ramy asks to cancel a meeting, first use check_calendar for the exact date window. Select only an event returned in this call, then call prepare_calendar_cancellation. Read back its subject, local time, organizer, and attendees and ask whether to cancel it. Call confirm_calendar_cancellation only after Ramy unambiguously confirms that exact cancellation in a later spoken turn. Never claim it was cancelled unless the confirmation tool returned success true.',
-    'When asked to draft a response, first read the selected original email, then use save_email_draft with its message_id. Microsoft preserves the reply thread and recipients.',
+    'When asked to respond to an email just discussed, use that selected original email and save_email_draft with its message_id. Read it first only if it has not already been read during this call. Microsoft preserves the reply thread and recipients. Do not run find_contact or create a new unrelated email for this reply. Ask only if more than one original email could be meant.',
     'Treat Ramy’s spoken dictation as source ideas, not final wording. For every email draft, rewrite it into clear professional business English: correct grammar, spelling, punctuation, and sentence structure; remove filler and repetition; organize the message into logical short paragraphs; and keep the tone courteous, confident, and appropriate for the recipient. Preserve Ramy’s intended meaning and every factual detail, especially names, dates, times, amounts, addresses, decisions, requests, and commitments. Never invent, omit, soften, or strengthen a material fact.',
     'Every email draft must be polished plain text: begin with a recipient greeting and punctuation, use blank lines between short complete paragraphs, use normal sentence punctuation, and end with a professional closing on its own line. Do not add Ramy Mina or any signature block; Ramy adds his exact Outlook signature when reviewing the draft. Do not submit a one-paragraph block. Use bullets only when Ramy asks for a list.',
     'Never say an email was drafted or saved unless save_email_draft returned success true during the current request. If the recipient address is unresolved or the tool was not called, state clearly that no draft was saved.',
     'Default to Ramy’s principal Minaco mailbox. The only other connected mailbox is London. Ask which message if the selection is ambiguous; never guess recipients or claim access to other inboxes.',
     'You have read-only access to the principal Inbox and every nested mail folder through find_contact. Never say that you lack access to email subfolders.',
-    'When Ramy names an email recipient or meeting attendee without an exact address, you MUST call find_contact before answering or asking for an address. It searches the principal Inbox and every nested person or project folder automatically, including spelling variations found in message evidence. Do not ask where to look and do not rely only on the latest messages. Use a resolved address, ask one concise choice if status is ambiguous, and say no reliable address was found only when find_contact returned not_found in the current request.',
+    'For a NEW email or meeting attendee whose exact address is not already verified in this call, you MUST call find_contact before asking for an address. Speak the brief acknowledgment first. Replies to a selected email do not require contact lookup. The lookup uses verified current-call contacts before searching nested person or project folders, including spelling variations. Do not ask where to look. Use a resolved address, ask one concise choice if status is ambiguous, and say no reliable address was found only when find_contact returned not_found in the current request.',
     'check_email is only a short recent list. When Ramy asks for an older message, more than ten messages, a sender, subject, phrase, date range, or another mail folder, use search_email instead of saying you are limited to ten.',
     'If search_email says complete is false, explain that the configured scan limit was reached. Do not claim absence unless complete is true.',
     'If search_email says approximateMatch is true, state the suggestedSender and ask whether that is the person Ramy meant. Do not claim there were no messages, and do not use an approximate match to draft a reply until Ramy confirms it.',
@@ -131,7 +132,7 @@ export function voiceTools() {
       parameters:{type:'object',properties:{mailbox:{type:'string',enum:['principal','london']},folder:{type:'string',enum:['all','inbox','drafts','sentitems','deleteditems']},query:{type:'string'},start_iso:{type:'string',description:'Optional inclusive ISO date/time.'},end_iso:{type:'string',description:'Optional exclusive ISO date/time.'}},required:['query'],additionalProperties:false},
     },
     {
-      type:'function',name:'find_contact',description:'REQUIRED whenever Ramy names a recipient or attendee without an exact email address. Resolve the person from sender and recipient evidence across the principal Inbox and every nested person/project folder. Handles likely spoken-name spelling differences. Never claim subfolder access is unavailable.',
+      type:'function',name:'find_contact',description:'Resolve an unknown NEW recipient or attendee from verified current-call contacts, then the principal Inbox and every nested person/project folder. Do not call for a reply to an email already read; use its message_id. Handles likely spoken-name spelling differences. Never claim subfolder access is unavailable.',
       parameters:{type:'object',properties:{query:{type:'string',description:'Person name or email address as spoken.'},context:{type:'string',description:'Optional company, project, or message context used to rank evidence.'}},required:['query'],additionalProperties:false},
     },
     {
@@ -242,7 +243,7 @@ function explicitlyOnlineMeeting(args,title) {
   return /\b(?:teams|virtual|online|video)\b/i.test([title,args.location,args.body].map(value=>String(value||'')).join(' '));
 }
 
-export async function runVoiceTool(name, args, { graph, dropbox, readMessages = new Set(), draftRequests = new Set(), calendarEvents = new Map(), actionRecords = new Map(), actionUpdates = new Set(), meetingProposals = new Map(), meetingRequests = new Set(), cancellationProposals = new Map(), cancellationRequests = new Set(), callKey = '' }) {
+export async function runVoiceTool(name, args, { graph, dropbox, readMessages = new Set(), knownContacts = new Map(), draftRequests = new Set(), calendarEvents = new Map(), actionRecords = new Map(), actionUpdates = new Set(), meetingProposals = new Map(), meetingRequests = new Set(), cancellationProposals = new Map(), cancellationRequests = new Set(), callKey = '' }) {
   if (name === 'check_email') {
     if (!graph) throw new Error('Microsoft Graph is not connected to the voice gateway.');
     const messages = await graph.listVoiceMessages(args.mailbox || 'principal',args.folder || 'inbox',args.limit || 5);
@@ -253,6 +254,11 @@ export async function runVoiceTool(name, args, { graph, dropbox, readMessages = 
     const mailbox=args.mailbox||'principal';
     const message=await graph.getVoiceMessage(mailbox,args.message_id);
     readMessages.add(`${mailbox}:${args.message_id}`);
+    for (const person of [message.from?.emailAddress,...(message.replyTo||[]).map(item=>item.emailAddress),...(message.toRecipients||[]).map(item=>item.emailAddress)]) {
+      if (person?.address && /^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/.test(person.address)) {
+        knownContacts.set(person.address.toLowerCase(), {name:String(person.name||''),address:person.address});
+      }
+    }
     return {success:true,message};
   }
 
@@ -265,6 +271,9 @@ export async function runVoiceTool(name, args, { graph, dropbox, readMessages = 
 
   if(name==='find_contact'){
     if(!graph)throw new Error('Microsoft Graph is not connected to the voice gateway.');
+    const query=String(args.query||'').trim().toLowerCase().replace(/\s+/g,' ');
+    const matches=[...knownContacts.values()].filter(person=>person.address.toLowerCase()===query || (query.split(' ').length>1 && person.name.trim().toLowerCase().replace(/\s+/g,' ')===query));
+    if(matches.length)return {success:true,status:matches.length===1?'resolved':'ambiguous',contacts:matches,source:'emails-read-in-current-call',foldersSearched:0,messagesScanned:0};
     return {success:true,...await graph.resolveVoiceContact({mailbox:'principal',query:args.query,context:args.context||''})};
   }
 
@@ -425,6 +434,7 @@ export function registerVoiceRoutes(app, {
       }
       authorizedStreamTokens.delete(token);
       const readMessages=new Set();
+      const knownContacts=new Map();
       const draftRequests=new Set();
       const calendarEvents=new Map();
       const actionRecords=new Map();
@@ -541,11 +551,13 @@ export function registerVoiceRoutes(app, {
           }
 
           if (event.type === 'response.function_call_arguments.done') {
+            const startedAt=Date.now();
             try {
               const args = JSON.parse(event.arguments || '{}');
-              if(!toolResults.has(event.call_id))toolResults.set(event.call_id,runVoiceTool(event.name,args,{graph,dropbox,readMessages,draftRequests,calendarEvents,actionRecords,actionUpdates,meetingProposals,meetingRequests,cancellationProposals,cancellationRequests,callKey:authorization.callKey}));
+              logger.info?.({tool:event.name},'London voice tool started');
+              if(!toolResults.has(event.call_id))toolResults.set(event.call_id,runVoiceTool(event.name,args,{graph,dropbox,readMessages,knownContacts,draftRequests,calendarEvents,actionRecords,actionUpdates,meetingProposals,meetingRequests,cancellationProposals,cancellationRequests,callKey:authorization.callKey}));
               const output = await toolResults.get(event.call_id);
-              logger.info?.({tool:event.name,status:output?.status||'',success:output?.success===true,foldersSearched:output?.foldersSearched,messagesScanned:output?.messagesScanned},'London voice tool completed');
+              logger.info?.({tool:event.name,elapsedMs:Date.now()-startedAt,status:output?.status||'',success:output?.success===true,foldersSearched:output?.foldersSearched,messagesScanned:output?.messagesScanned},'London voice tool completed');
               sendToolOutput(event.call_id, output, event.name);
             } catch (error) {
               logger.error?.({ err: error, tool: event.name }, 'London voice tool failed');
