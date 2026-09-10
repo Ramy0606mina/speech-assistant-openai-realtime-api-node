@@ -14,7 +14,7 @@ function completionSubject(subject) {
 }
 
 function reportRequested(message) {
-  const request = `${message?.subject || ''}\n${message?.body?.content || ''}`;
+  const request = `${message?.subject || ''}\n${directOwnerRequestText(message)}`;
   return /\b(?:report|pdf|docx|word document|spreadsheet|xlsx|workbook|compare|comparison|analysis|analy[sz]e|audit|brief)\b/i.test(request);
 }
 
