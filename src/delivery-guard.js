@@ -28,6 +28,14 @@ export class DeliveryGuard {
   async claim(key) {
     return this.store.createDeliveryRecord(this.record(key), { result: 'delivery-pending-review', claimedAt: new Date().toISOString() });
   }
+  async claimAnalysis(key) {
+    // Separate from dispatch: a failed or interrupted analysis must not silently
+    // restart paid model work on the next poll, deployment, or second worker.
+    if (!Number.isFinite(this.notBefore)) throw new Error('Delivery ledger is not initialized.');
+    return this.store.createDeliveryRecord(`${this.record(key)}-analysis`, {
+      result: 'analysis-started-review-if-incomplete', startedAt: new Date().toISOString(),
+    });
+  }
   async complete(key, reportPath) {
     // Separate receipt preserves the immutable dispatch claim.
     await this.store.createDeliveryRecord(`${this.record(key)}-sent`, { result: 'sent', sentAt: new Date().toISOString(), reportPath: reportPath || null });

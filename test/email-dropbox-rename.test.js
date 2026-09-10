@@ -56,7 +56,7 @@ test('London performs prepared renames only after durable claim and reports veri
       sendMail:async mail=>{events.push('email');assert.match(mail.body,/old\.pdf → .*new\.pdf/);}},
     dropbox:{saveReports:false,renameFile:async()=>{events.push('rename');return{id:'id:one',from:source,path:destination,name:'new.pdf'};}},
     openai:{analyzeDelegatedEmail:async()=>({text:'Prepared.',dropboxRenames:[{sourcePath:source,destinationName:'new.pdf',ruleSourcePath:'guide.docx'}]})},
-    state:new StateStore(),deliveryGuard:{check:async()=>null,claim:async()=>{events.push('claim');return true;},complete:async()=>events.push('complete')},
+    state:new StateStore(),deliveryGuard:{check:async()=>null,claimAnalysis:async()=>true,claim:async()=>{events.push('claim');return true;},complete:async()=>events.push('complete')},
   });
   await core.processMessage({id:'rename-one',internetMessageId:'rename-one'});
   assert.deepEqual(events,['claim','rename','email','complete']);
