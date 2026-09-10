@@ -11,7 +11,7 @@ export function cleanReportText(value) {
 }
 
 export function reportSubject(value) {
-  return String(value || 'London report').replace(/^(?:(?:re|fw|fwd)\s*:\s*|LONDON\s*[—–-]?\s*Task Complete\s*[|:]?\s*)+/i, '').trim() || 'London report';
+  return String(value || 'London report').replace(/^(?:(?:re|fw|fwd)\s*:\s*|LONDON\s*[—–-]?\s*(?:Task (?:Complete|Response|Needs Attention)|Reminder Needs Attention)\s*[|:]?\s*)+/i, '').trim() || 'London report';
 }
 
 function cells(line) {

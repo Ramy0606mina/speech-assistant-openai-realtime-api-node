@@ -48,18 +48,40 @@ export class OpenAIClient {
     this.apiKey = apiKey;
     this.model = model;
     this.fetchImpl = fetchImpl;
+    this.lastFailure = null;
+    this.retryAfter = 0;
+  }
+
+  get status() {
+    return { state: this.lastFailure ? 'blocked' : this.apiKey ? 'available' : 'not-configured',
+      reason: this.lastFailure, retryAt: this.retryAfter ? new Date(this.retryAfter).toISOString() : null };
   }
 
   async respond({ instructions, input, model = this.model, tools }) {
     if (!this.apiKey) throw new Error('OPENAI_API_KEY is not configured.');
-    const payload = await fetchJson(this.fetchImpl, 'https://api.openai.com/v1/responses', {
+    if (Date.now() < this.retryAfter) {
+      const error = new Error('OpenAI API quota is exhausted; task remains pending.');
+      error.status = 429;
+      throw error;
+    }
+    let payload;
+    try { payload = await fetchJson(this.fetchImpl, 'https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ model, instructions, input, ...(tools ? { tools, parallel_tool_calls: false } : {}) }),
-    }, 45000);
+    }, 45000); }
+    catch (error) {
+      const detail = error.data?.error;
+      const exhausted = detail?.type === 'insufficient_quota' || ['insufficient_quota', 'credit_balance_exhausted'].includes(detail?.code);
+      this.lastFailure = exhausted ? 'openai-quota-exhausted' : 'openai-request-failed';
+      this.retryAfter = exhausted ? Date.now() + 5 * 60 * 1000 : 0;
+      throw error;
+    }
+    this.lastFailure = null;
+    this.retryAfter = 0;
     const text = extractResponseText(payload);
     if (!text && !(tools && payload?.output?.some(item => item.type === 'function_call'))) throw new Error('OpenAI returned no assistant text.');
     return { text, raw: payload };

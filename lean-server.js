@@ -8,6 +8,7 @@ import { MicrosoftGraphClient } from './src/microsoft-graph.js';
 import { DropboxClient } from './src/dropbox-client.js';
 import { StateStore } from './src/state-store.js';
 import { DeliveryGuard } from './src/delivery-guard.js';
+import { MailboxWorker } from './src/mailbox-worker.js';
 import { LondonCore } from './src/london-core.js';
 import { registerVoiceRoutes } from './src/voice-gateway.js';
 import { MorningBrief } from './src/morning-brief.js';
@@ -44,11 +45,11 @@ async function initializeSmsWebhook(){
 }
 registerSmsWebhook(app,{sms,publicUrl:process.env.RENDER_EXTERNAL_URL,onMessage:safeSmsConversation});
 async function safeUrgentAlerts(){try{await urgentAlerts.tick();}catch(error){app.log.error({err:error},'Urgent email alert failed');}}
-let deliveryGuardReady = false;
+const mailboxWorker = new MailboxWorker({ graph, london, guard: deliveryGuard, limit: config.runtime.pollBatchSize, logger: app.log });
 const morningBrief = new MorningBrief({graph,openai,dropbox,guard:deliveryGuard});
 const morningBriefEnabled = process.env.LONDON_MORNING_BRIEF_ENABLED !== 'false';
 async function safeMorningBrief() {
-  if (!morningBriefEnabled || !deliveryGuardReady) return;
+  if (!morningBriefEnabled || !mailboxWorker.guardReady) return;
   try { await morningBrief.tick(); } catch(error) { app.log.error({err:error},'Morning executive report failed'); }
 }
 
@@ -64,23 +65,23 @@ registerVoiceRoutes(app, {
   logger: app.log,
 });
 
-let pollInFlight = false;
 async function safePoll() {
-  if (pollInFlight) return;
-  pollInFlight = true;
-  try {
-    if (!deliveryGuardReady) { await deliveryGuard.initialize(); deliveryGuardReady = true; }
-    const result = await london.pollOnce(config.runtime.pollBatchSize);
-    app.log.info({ checked: result.checked }, 'London mailbox poll complete');
-  } catch (error) {
-    app.log.error({ err: error }, 'London mailbox poll failed');
-  } finally {
-    pollInFlight = false;
-  }
+  const result = await mailboxWorker.poll();
+  if (!result.busy) app.log[result.ok ? 'info' : 'error'](result, 'London mailbox poll outcome');
+  return result;
+}
+
+function operational() {
+  const checkedAt = Date.parse(mailboxWorker.status.lastCheckedAt);
+  return mailboxWorker.status.state === 'ready' && openai.status.state === 'available'
+    && Date.now() - checkedAt < Math.max(config.runtime.pollIntervalMs * 3, 180000);
 }
 
 app.get('/health', async () => ({
-  ok: true,
+  ok: operational(),
+  live: true,
+  mailbox: mailboxWorker.status,
+  openai: openai.status,
   service: 'London Assistant',
   architecture: 'lean-single-backend',
   powerAutomateRequired: false,
@@ -90,7 +91,7 @@ app.get('/health', async () => ({
   urgentEmailAlerts: {configured:sms.configured,ready:urgentAlerts.ready,newMessagesOnly:true},
   whatsapp: 'removed',
   pendingDeliveryReview: Object.values(state.state.processedMessages).filter(item => item.result === 'delivery-pending-review').length,
-  durableDeliveryGuard: deliveryGuardReady,
+  durableDeliveryGuard: mailboxWorker.guardReady,
   historicalRequestsHeld: Object.values(state.state.processedMessages).filter(item => item.result === 'historical-review').length,
   morningBrief: {enabled:morningBriefEnabled,time:'07:30',timeZone:'America/Toronto',cadence:'daily',catchUpUntil:'12:00',lastOutcome:morningBrief.lastOutcome},
   ...configurationStatus(config),
@@ -98,21 +99,26 @@ app.get('/health', async () => ({
   time: new Date().toISOString(),
 }));
 
+// Keep /health HTTP 200 for Render liveness: a provider outage must not cause
+// restart loops. Readiness reflects actual worker outcomes, not key presence.
+app.get('/ready', async (_request, reply) => reply.code(operational() ? 200 : 503).send({
+  ok: operational(), mailbox: mailboxWorker.status, openai: openai.status,
+}));
+
 app.get('/health/deep', async (request, reply) => {
   if (!config.runtime.healthSecret || request.headers['x-london-health-secret'] !== config.runtime.healthSecret) {
     return reply.code(401).send({ ok: false, error: 'Unauthorized.' });
   }
-  return { ok: true, architecture: 'lean-single-backend', powerAutomateRequired: false, ...configurationStatus(config) };
+  return { ok: operational(), mailbox: mailboxWorker.status, openai: openai.status, architecture: 'lean-single-backend', powerAutomateRequired: false, ...configurationStatus(config) };
 });
 
 app.post('/internal/poll-once', async (request, reply) => {
   if (!config.runtime.healthSecret || request.headers['x-london-health-secret'] !== config.runtime.healthSecret) {
     return reply.code(401).send({ ok: false, error: 'Unauthorized.' });
   }
-  if (!deliveryGuardReady) return reply.code(503).send({ ok: false, error: 'Delivery ledger is not ready.' });
-  if (pollInFlight) return reply.code(409).send({ ok: false, error: 'Mailbox poll already running.' });
-  await safePoll();
-  return { ok: true };
+  if (mailboxWorker.running) return reply.code(409).send({ ok: false, error: 'Mailbox poll already running.' });
+  const result = await safePoll();
+  return reply.code(result.ok ? 200 : 503).send(result);
 });
 
 const port = Number(process.env.PORT || 3000);
