@@ -13,6 +13,11 @@ function completionSubject(subject) {
   return `LONDON — Task Response | ${reportSubject(subject)}`;
 }
 
+function reportRequested(message) {
+  const request = `${message?.subject || ''}\n${message?.body?.content || ''}`;
+  return /\b(?:report|pdf|docx|word document|spreadsheet|xlsx|workbook|compare|comparison|analysis|analy[sz]e|audit|brief)\b/i.test(request);
+}
+
 export class LondonCore {
   constructor({ graph, openai, dropbox, state, deliveryGuard, sms, logger = console }) {
     this.sms = sms;
@@ -125,7 +130,7 @@ export class LondonCore {
         text=final.text;
       }
       let report = null;
-      if (this.dropbox?.saveReports) {
+      if (this.dropbox?.saveReports && reportRequested(full)) {
         try { report = await this.dropbox.saveReport({ taskKey: key, subject: full.subject, text,
           includeDocx: /\b(?:docx|word)\b/i.test(`${full.subject || ''}\n${full.body?.content || ''}`),
           includeXlsx: /\b(?:excel|xlsx|spreadsheet|workbook)\b/i.test(`${full.subject || ''}\n${full.body?.content || ''}`) || analysis.spreadsheetAnalyzed || attachments.some(part=>part.text?.startsWith('Spreadsheet source data')),
