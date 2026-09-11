@@ -19,8 +19,9 @@ function reportRequested(message) {
 }
 
 export class LondonCore {
-  constructor({ graph, openai, dropbox, state, deliveryGuard, sms, logger = console }) {
+  constructor({ graph, openai, dropbox, state, deliveryGuard, sms, meetings, logger = console }) {
     this.sms = sms;
+    this.meetings = meetings;
     this.graph = graph;
     this.openai = openai;
     this.dropbox = dropbox;
@@ -67,7 +68,8 @@ export class LondonCore {
       if (this.deliveryGuard && !await this.deliveryGuard.claimAnalysis(key)) {
         return { processed: false, reason: 'analysis-needs-review', key };
       }
-      const analysis = await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox, graph: this.graph, sms:this.sms });
+      const meetingReply = await this.meetings?.handle({text:directOwnerRequestText(full),owner:principal,requestKey:key,receivedAt:full.receivedDateTime});
+      const analysis = meetingReply ? {text:meetingReply} : await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox, graph: this.graph, sms:this.sms });
       let text = String(analysis.text || '').trim();
       if (!text) throw new Error('London produced an empty delegated-task result.');
       // Only the winner of the durable claim may save a report or dispatch mail.
@@ -130,7 +132,7 @@ export class LondonCore {
         text=final.text;
       }
       let report = null;
-      if (this.dropbox?.saveReports && reportRequested(full)) {
+      if (this.dropbox?.saveReports && !meetingReply && reportRequested(full)) {
         try { report = await this.dropbox.saveReport({ taskKey: key, subject: full.subject, text,
           includeDocx: /\b(?:docx|word)\b/i.test(`${full.subject || ''}\n${full.body?.content || ''}`),
           includeXlsx: /\b(?:excel|xlsx|spreadsheet|workbook)\b/i.test(`${full.subject || ''}\n${full.body?.content || ''}`) || analysis.spreadsheetAnalyzed || attachments.some(part=>part.text?.startsWith('Spreadsheet source data')),
