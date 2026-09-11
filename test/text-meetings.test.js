@@ -112,3 +112,13 @@ test('authenticated SMS routes proposal result without read-only assistant or tr
  const worker=new SmsConversation({sms:{configured:true,listIncoming:async()=>[{sid:'one',body:'Create Teams meeting',receivedAt:new Date().toISOString()}],send:async text=>{sent.push(text);return{id:'reply',status:'delivered'};}},graph:{principalMailbox:'owner@example.com'},openai:{respond:async()=>assert.fail('meeting must use dedicated route')},meetings:{handle:async request=>{handled++;assert.equal(request.owner,'owner@example.com');return 'Teams proposal. CONFIRM MEETING abcdef123456';}},state,guard:{initialize:async()=>{},notBefore:0,check:async()=>null,claimAnalysis:async()=>true,claim:async()=>true,complete:async()=>{}}});
  await worker.tick();await worker.tick();assert.equal(handled,1);assert.equal(sent.length,1);assert.match(sent[0],/CONFIRM MEETING/);
 });
+
+test('short reply after a conflict carries forward the meeting and submits the changed time',async()=>{
+ const f=harness();const created=[];
+ f.graph.listPrincipalCalendar=async()=>[{subject:'Existing item',showAs:'busy'}];
+ f.graph.createVoiceMeeting=async p=>{created.push(p);return{id:'created',invitationsSubmitted:true,joinLinkCreated:true};};
+ f.openai.respond=async args=>{const input=JSON.parse(args.input);assert.match(input.request,/30 minutes teams meeting with Mina Capital/);assert.match(input.request,/set it at 2:30/);return{text:JSON.stringify({title:'Meeting with Mina Capital',startIso:'2030-09-11T14:30:00-04:00',timezone:'America/Toronto',durationMinutes:30,contacts:['Mina Capital'],clarification:''})};};
+ const history=[{role:'user',content:'Generate or create a 30 minutes teams meeting with Mina Capital, admin@minacapital.ca <mailto:admin@minacpital.ca> today at 2:00 pm',receivedAt:'2030-09-11T13:00:00Z'},{role:'assistant',content:'That time overlaps an existing calendar item. I have not prepared or sent another invitation. Please check the existing item or choose another time.'}];
+ const result=await f.make().handle({...f.request,text:'Ok, set it at 2:30',requestKey:'changed-time',receivedAt:'2030-09-11T13:00:00Z',history});
+ assert.match(result,/invitation submitted/);assert.equal(created.length,1);assert.equal(created[0].startIso,'2030-09-11T14:30:00-04:00');assert.equal(created[0].durationMinutes,30);assert.deepEqual(created[0].attendees,['admin@minacapital.ca']);
+});
