@@ -16,6 +16,40 @@ function harness(){
 }
 const code=reply=>reply.match(/CONFIRM MEETING ([a-f0-9]{12})/)[1];
 
+test('explicit address next to attendee name bypasses ambiguous directory and is not autocorrected',async()=>{
+ const f=harness();f.graph.resolveVoiceContact=async()=>assert.fail('explicit address must not need lookup');
+ const result=await f.make().handle({...f.request,text:'Create Teams meeting with Anass, admin@minacpital.ca today at 2 pm for one hour'});
+ assert.match(result,/To: admin@minacpital.ca/);assert.ok(code(result));assert.equal(f.writes(),0);
+});
+
+test('SMS attendee clarification preserves owner details and generates a saved confirmation code',async()=>{
+ const f=harness();f.graph.resolveVoiceContact=async()=>({status:'ambiguous',contacts:[]});
+ const clarification=await f.make().handle(f.request);
+ const history=[{role:'user',content:f.request.text,receivedAt:f.request.receivedAt},{role:'assistant',content:clarification}];
+ f.openai.respond=async args=>{const input=JSON.parse(args.input);assert.match(input.request,/tomorrow at 2pm/);assert.match(input.request,/admin@example.com/);assert.equal(input.receivedAt,f.request.receivedAt);return{text:JSON.stringify({title:'Discussion',startIso:'2030-09-11T14:00:00-04:00',durationMinutes:60,contacts:['admin@example.com']})};};
+ const proposal=await f.make().handle({...f.request,text:'admin@example.com',requestKey:'address',history,maxReplyLength:480});
+ assert.match(proposal,/To: admin@example.com/);assert.ok(code(proposal));assert.equal(f.writes(),0);
+ const nextHistory=[...history,{role:'user',content:'admin@example.com'},{role:'assistant',content:proposal}];
+ assert.equal(await f.make().handle({...f.request,text:'CONFIRM MEETING',requestKey:'bare',history:nextHistory}),proposal);assert.equal(f.writes(),0);
+ assert.match(await f.make().handle({...f.request,text:'CONFIRM MEETING '+code(proposal),requestKey:'confirm',history:nextHistory}),/invitation submitted/);assert.equal(f.writes(),1);
+});
+
+test('unrelated texts and cancelled conversations do not restart pending meetings',async()=>{
+ const f=harness(),history=[{role:'user',content:f.request.text},{role:'assistant',content:'Please provide an address. No invitation was sent.'}];
+ assert.equal(await f.make().handle({...f.request,text:'What is the weather?',history}),null);
+ const cancelled=await f.make().handle({...f.request,text:'never mind',history});assert.match(cancelled,/cancelled/);
+ assert.equal(await f.make().handle({...f.request,text:'admin@example.com',history:[...history,{role:'assistant',content:cancelled}]}),null);
+ assert.equal(f.models(),0);assert.equal(f.writes(),0);
+});
+
+test('cancelling a pending proposal invalidates its confirmation after restart',async()=>{
+ const f=harness(),proposal=await f.make().handle(f.request);
+ const history=[{role:'user',content:f.request.text},{role:'assistant',content:proposal}];
+ assert.match(await f.make().handle({...f.request,text:'never mind',requestKey:'cancel',history}),/cancelled/);
+ assert.match(await f.make().handle({...f.request,text:'CONFIRM MEETING '+code(proposal),requestKey:'late'}),/cancelled/);
+ assert.equal(f.writes(),0);
+});
+
 test('oversized SMS proposal and confirmation never create an invitation',async()=>{
  const f=harness();
  const reply=await f.make().handle({...f.request,maxReplyLength:100});
