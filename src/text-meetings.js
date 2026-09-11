@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 
+
 const digest = value => createHash('sha256').update(value).digest('hex');
 const wantsMeeting = text => /\b(?:meeting|teams|invitation)\b/i.test(text) && /\b(?:create|schedule|book|arrange|set up|invite|send)\b/i.test(text);
 const confirmPattern = /^confirm meeting ([a-f0-9]{12})[.!]?$/i;
@@ -12,6 +13,7 @@ function adjacentAddress(name, text) {
   }
   return [...new Set(addresses)];
 }
+
 
 // Only authenticated owner channels call this handler. A model can prepare a
 // proposal; only a separate exact owner confirmation can execute it.
@@ -26,8 +28,10 @@ export class TextMeetings {
     const recent = history.slice(-12);
     const anchor = recent.findLastIndex(item => item.role === 'user' && wantsMeeting(String(item.content || '')));
     const tail = anchor >= 0 ? recent.slice(anchor) : [];
-    const pending = tail.length && tail.some(item => item.role === 'assistant' && /(?:No invitation was sent|Teams proposal:|CONFIRM MEETING)/i.test(item.content || ''))
+    const conflictPending = tail.some(item => item.role === 'assistant' && /(?:overlaps an existing calendar item|have not prepared or sent another invitation)/i.test(item.content || ''));
+    const pending = tail.length && tail.some(item => item.role === 'assistant' && /(?:No invitation was sent|Teams proposal:|CONFIRM MEETING|overlaps an existing calendar item|have not prepared or sent another invitation)/i.test(item.content || ''))
       && !tail.some(item => item.role === 'assistant' && /(?:invitation submitted|already attempted|already submitted|Meeting request cancelled)/i.test(item.content || ''));
+    let confirmedConflictChange = false;
     if ((pending || wantsMeeting(text) || /^confirm meeting\b/i.test(text)) && (!owner || owner.toLowerCase() !== this.graph.principalMailbox?.toLowerCase())) throw new Error('Meeting requests require the authenticated owner.');
     if (pending && /^confirm meeting[.!]?$/i.test(text)) {
       const proposal = [...tail].reverse().find(item => item.role === 'assistant' && /^Teams proposal:/.test(item.content || '') && /CONFIRM MEETING [a-f0-9]{12}/i.test(item.content));
@@ -41,7 +45,8 @@ export class TextMeetings {
         }
         return 'Meeting request cancelled. No invitation was sent.';
       }
-      if (!/@|\b(?:tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|minutes?|hours?|am|pm|attendee|subject|title|instead|understand|confused|confirm|yes)\b|\d{1,2}:\d{2}/i.test(text)) return null;
+      if (!/@|\b(?:tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|minutes?|hours?|am|pm|attendee|subject|title|instead|understand|confused|confirm|yes|set|book|schedule)\b|\d{1,2}:\d{2}/i.test(text)) return null;
+      confirmedConflictChange = conflictPending && /\b(?:set|book|schedule|create|send)\s+(?:it|the\s+(?:meeting|invitation?))\b/i.test(text);
       text = [...tail.filter(item => item.role === 'user' && !/^confirm meeting\b/i.test(item.content || '')).map(item => item.content), text].join('\n');
       receivedAt = tail[0].receivedAt || receivedAt;
     }
@@ -53,12 +58,12 @@ export class TextMeetings {
       if (match) return await this.confirm(match[1].toLowerCase(), owner, requestKey, maxReplyLength);
       if (/^confirm meeting\b/i.test(text)) return 'Use the exact confirmation line from the proposal. Changed details require a new proposal; no invitation was sent.';
       if (/\b(?:in[- ]person|phone meeting|zoom|google meet)\b/i.test(text)) return 'This workflow creates Microsoft Teams invitations. Please clarify whether you want a Teams meeting. No invitation was sent.';
-      return await this.prepare(text, owner, requestKey, receivedAt, maxReplyLength);
+      return await this.prepare(text, owner, requestKey, receivedAt, maxReplyLength, confirmedConflictChange);
     } catch {
       return 'The meeting was not confirmed. No automatic retry will run. Check your calendar before requesting it again, because an interrupted Microsoft operation may have created it.';
     }
   }
-  async prepare(text, owner, requestKey, receivedAt, maxReplyLength) {
+  async prepare(text, owner, requestKey, receivedAt, maxReplyLength, confirmedConflictChange = false) {
     const existing = await this.dropbox.readDeliveryRecord(`text-meeting-request-${digest(owner+requestKey)}`);
     if (existing) return existing.reply;
     const response = await this.openai.respond({
@@ -87,13 +92,14 @@ export class TextMeetings {
     const proposal={title:args.title.trim(),startIso:args.startIso,timezone:args.timezone||'America/Toronto',durationMinutes:args.durationMinutes,attendees:[...new Set(attendees)],onlineMeeting:true,location:'Microsoft Teams',body:''};
     const preview=await this.graph.previewVoiceMeeting(proposal);
     const events=await this.graph.listPrincipalCalendar({startIso:preview.startIso,endIso:preview.endIso});
-    if(events.some(event=>!event.isCancelled&&event.showAs!=='free')) return 'That time overlaps an existing calendar item. I have not prepared or sent another invitation. Please check the existing item or choose another time.';
+    if(events.some(event=>!event.isCancelled&&event.showAs!=='free') && !confirmedConflictChange) return 'That time overlaps an existing calendar item. I have not prepared or sent another invitation. Please check the existing item or choose another time.';
     const transactionId=randomUUID(),code=digest(transactionId).slice(0,12);
     const reply=`Teams proposal: ${proposal.title}\n${preview.localStart.replace('T',' ')}–${preview.localEnd.slice(11)} ${proposal.timezone}\nTo: ${proposal.attendees.join(', ')}\nNothing sent. Reply exactly: CONFIRM MEETING ${code}`;
     if(reply.length>maxReplyLength)return 'The full meeting proposal is too long for SMS. Please send the request by email; no invitation was sent.';
-    const stored={owner:owner.toLowerCase(),requestKey,createdAt:this.now().toISOString(),expiresAt:new Date(Math.min(Date.parse(proposal.startIso),this.now().getTime()+86400000)).toISOString(),proposal:{...proposal,transactionId},reply};
+    const stored={owner:owner.toLowerCase(),requestKey,createdAt:this.now().toISOString(),expiresAt:new Date(Math.min(Date.parse(proposal.startIso),this.now().getTime()+86400000)).toISOString(),allowConflict:confirmedConflictChange,proposal:{...proposal,transactionId},reply};
     if(!await this.dropbox.createDeliveryRecord(`text-meeting-proposal-${code}`,stored)) throw Error('Proposal conflict.');
     await this.dropbox.createDeliveryRecord(`text-meeting-request-${digest(owner+requestKey)}`,{reply});
+    if(confirmedConflictChange)return this.confirm(code,owner,`${requestKey}:confirmed-conflict-change`,maxReplyLength);
     return reply;
   }
   async confirm(code,owner,requestKey,maxReplyLength) {
@@ -107,12 +113,13 @@ export class TextMeetings {
     if(Date.parse(stored.expiresAt)<=this.now().getTime())return 'That proposal expired. Please request a fresh proposal; no invitation was sent.';
     const preview=await this.graph.previewVoiceMeeting(p);
     const events=await this.graph.listPrincipalCalendar({startIso:preview.startIso,endIso:preview.endIso});
-    if(events.some(event=>!event.isCancelled&&event.showAs!=='free'))return 'The slot now overlaps an existing calendar item. No new invitation was sent. Please review your calendar.';
+    if(!stored.allowConflict && events.some(event=>!event.isCancelled&&event.showAs!=='free'))return 'The slot now overlaps an existing calendar item. No new invitation was sent. Please review your calendar.';
     const reply=`Teams invitation submitted: ${p.title}\n${preview.localStart.replace('T',' ')}–${preview.localEnd.slice(11)} ${p.timezone}\nTo: ${p.attendees.join(', ')}\nSee the calendar invitation for the Teams link. Acceptance is not yet confirmed.`;
     if(reply.length>maxReplyLength)return 'Please confirm this proposal by email so the full details fit. No invitation was sent.';
     if(!await this.dropbox.createDeliveryRecord(key,{status:'attempted',at:this.now().toISOString(),proposalCode:code}))return 'This invitation was already attempted. Check your calendar; I will not send a duplicate.';
     const result=await this.graph.createVoiceMeeting(p);
     if(!result.id || !result.invitationsSubmitted || !result.joinLinkCreated)throw Error('Teams meeting not verified.');
+
 
     await this.dropbox.createDeliveryRecord(`${key}-done`,{id:result.id,reply});
     return reply;
