@@ -49,7 +49,7 @@ export function smsInstructions() {
 export async function answerOwnerSms({ body, history = [], openai, graph, dropbox }) {
   const tools = voiceTools().filter(tool => readTools.has(tool.name))
     .map(tool => ({ ...tool, strict: false }));
-  const input = [...history.slice(-12), { role: 'user', content: body }];
+  const input = [...history.slice(-12).map(({role,content})=>({role,content})), { role: 'user', content: body }];
   const context = { graph, dropbox };
   for (let round = 0; round < 5; round++) {
     const response = await openai.respond({ instructions: smsInstructions(), input, tools });
@@ -125,7 +125,7 @@ export class SmsConversation {
         }
         let answer;
         try {
-          const meetingReply = !message.numMedia ? await this.meetings?.handle({text:body,owner:this.graph.principalMailbox,requestKey:key,receivedAt:message.receivedAt,maxReplyLength:480}) : null;
+          const meetingReply = !message.numMedia ? await this.meetings?.handle({text:body,owner:this.graph.principalMailbox,requestKey:key,receivedAt:message.receivedAt,history,maxReplyLength:480}) : null;
           answer = meetingReply || (!body || message.numMedia > 0
             ? 'I received your message. I can read text here; please email photos or documents to London for analysis. What would you like me to help with?'
             : await answerOwnerSms({ body: body.slice(0, 4000), history, openai: this.openai, graph: this.graph, dropbox: this.dropbox }));
@@ -142,7 +142,7 @@ export class SmsConversation {
         this.state.state.smsConversation = {
           ...current,
           updatedAt: new Date().toISOString(),
-          history: [...history, { role: 'user', content: body.slice(0, 4000) }, { role: 'assistant', content: answer }].slice(-12),
+          history: [...history, { role: 'user', content: body.slice(0, 4000), receivedAt: message.receivedAt }, { role: 'assistant', content: answer }].slice(-12),
           lastReplyId: result.id,
         };
         this.state.save();
