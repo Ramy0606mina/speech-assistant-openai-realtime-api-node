@@ -12,16 +12,23 @@ function client(handler) {
 }
 test('new email goes into owner Drafts and never calls send',async()=>{
   const calls=[];const graph=client((url,opts)=>{calls.push({url,opts});return {id:'draft',isDraft:true,subject:'Review'};});
-  const result=await graph.createVoiceDraft({to:['recipient@example.com'],subject:'Review',body:'A draft for review.'});
+  const result=await graph.createVoiceDraft({to:['recipient@example.com'],subject:'Review',body:'\r\n\r\nHello,\r\n\r\nA draft for review.\r\n\r\nBest regards,\r\n'});
   assert.equal(result.sent,false);assert.equal(result.folder,'Drafts');
   assert.equal(calls.length,1);assert.match(calls[0].url,/users\/owner%40example.com\/messages$/);
-  assert.equal(calls[0].opts.method,'POST');assert.deepEqual(JSON.parse(calls[0].opts.body).body,{contentType:'HTML',content:'<p style="margin:0;">A draft for review.</p>'});
+  assert.equal(calls[0].opts.method,'POST');assert.deepEqual(JSON.parse(calls[0].opts.body).body,{contentType:'Text',content:'Hello,\n\nA draft for review.\n\nBest regards,'});
 });
 test('reply uses native createReply preserving thread and Microsoft reply recipients',async()=>{
   const calls=[];const graph=client((url,opts)=>{calls.push({url,opts});return opts.method==='POST'?{id:'reply',isDraft:true,subject:'Re: Test'}:{id:'source',isDraft:false};});
   await graph.createVoiceDraft({mailbox:'principal',messageId:'source',body:'Thanks, I will review.'});
   assert.equal(calls.length,2);assert.match(calls[1].url,/messages\/source\/createReply$/);
-  assert.deepEqual(JSON.parse(calls[1].opts.body),{message:{body:{contentType:'HTML',content:'<p style="margin:0;">Thanks, I will review.</p>'}}});
+  assert.deepEqual(JSON.parse(calls[1].opts.body),{message:{body:{contentType:'Text',content:'Thanks, I will review.'}}});
+});
+test('updating an existing draft replaces HTML with plain text starting on the first line',async()=>{
+  const calls=[];const graph=client((url,opts)=>{calls.push({url,opts});return {id:'draft',isDraft:true};});
+  await graph.updateSmsDraft({id:'draft',body:'\n\nHello,\n\nPlease review.\n\nBest regards,\n'});
+  assert.equal(calls.length,1);assert.equal(calls[0].opts.method,'PATCH');
+  assert.match(calls[0].url,/messages\/draft$/);
+  assert.deepEqual(JSON.parse(calls[0].opts.body),{body:{contentType:'Text',content:'Hello,\n\nPlease review.\n\nBest regards,'}});
 });
 test('rejects unconnected mailbox, guessed recipient, and unconfirmed draft',async()=>{
   const graph=client(()=>({id:'missing-draft-flag'}));

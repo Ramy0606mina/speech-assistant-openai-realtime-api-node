@@ -22,7 +22,6 @@ function fixture() {
   async function saved() {
     const source=request('Draft the budget email','first');
     const reply=emails.remember(message,source);
-    await emails.recordReply({requestKey:'first',text:reply,sentAt:new Date(Date.now()-1000).toISOString()});
     return [{role:'user',content:source.body,requestKey:'first'},{role:'assistant',content:reply}];
   }
   return {records,state,writes,graph,dropbox,emails,request,saved,get message(){return message;}};
@@ -37,7 +36,7 @@ test('SMS creates a real draft, reads it back, and remembers its exact ID withou
   const f=fixture();
   const reply=await answerOwnerSms({...f.request('Prepare an email to julie@example.com','first'),...f,openai:{respond:async()=>call('save_email_draft',{to:['julie@example.com'],subject:'Budget',body})}});
   assert.match(reply,/Saved in Outlook Drafts/);assert.equal(f.emails.pending.id,'saved-draft');
-  assert.equal(f.emails.pending.presentedAt,null);assert.deepEqual(f.writes.map(x=>x[0]),['create']);
+  assert.doesNotMatch(reply,/\bsend\b|when ready/i);assert.deepEqual(f.writes.map(x=>x[0]),['create']);
 });
 
 test('recipient clarification and save-it follow-ups continue the authorized draft request',async()=>{
@@ -86,14 +85,19 @@ test('SMS revises the saved body in place and preserves the original draft ID',a
   }}});
   assert.match(result,/Saved in Outlook Drafts/);assert.equal(f.writes[0][0],'update');
   assert.equal(f.writes[0][1].id,'saved-draft');assert.equal(f.emails.pending.id,'saved-draft');
-  assert.equal(f.emails.pending.presentedAt,null);
+  assert.doesNotMatch(result,/\bsend\b|when ready/i);
 });
 
-test('only a later explicit send command sends the selected Outlook draft once',async()=>{
+test('explicit send commands are refused even with a saved draft and an old send invitation',async()=>{
   const f=fixture(),history=await f.saved();
-  const result=await f.emails.prepare(f.request('Please send it.','send',history));
-  assert.match(result.reply,/Microsoft accepted/);assert.deepEqual(f.writes,[['send',{mailbox:'principal',id:'saved-draft'}]]);
-  await f.emails.prepare(f.request('send it','again',history));assert.equal(f.writes.length,1);
+  const oldReply=history.at(-1).content+' Review it in Outlook; reply send it when ready.';
+  history.at(-1).content=oldReply;
+  f.emails.save({...f.emails.pending,reply:oldReply,presentedAt:new Date(Date.now()-1000).toISOString()});
+  for(const text of ['Please send it.','send it','Yes, send the email','go ahead send the draft now']) {
+    const result=await f.emails.prepare(f.request(text,'send',history));
+    assert.match(result.reply,/only saves email drafts/);assert.doesNotMatch(result.reply,/\bsend\b/);
+  }
+  assert.deepEqual(f.writes,[]);assert.equal(f.message.isDraft,true);
 });
 
 test('missing, stale, unrelated, pre-summary and foreign-owner confirmations never send',async()=>{
@@ -107,24 +111,24 @@ test('missing, stale, unrelated, pre-summary and foreign-owner confirmations nev
   await f.emails.prepare(f.request('send it','old',history));assert.equal(f.writes.length,0);
 });
 
-test('a changed Outlook draft is presented again instead of sent under an old confirmation',async()=>{
+test('an edited Outlook draft cannot enable sending',async()=>{
   const f=fixture(),history=await f.saved();f.message.bccRecipients=[{emailAddress:{address:'new@example.com'}}];
   const result=await f.emails.prepare(f.request('send it','changed',history));
-  assert.match(result.reply,/Review it in Outlook/);assert.equal(f.writes.length,0);assert.equal(f.emails.pending.presentedAt,null);
+  assert.match(result.reply,/only saves email drafts/);assert.equal(f.writes.length,0);
 });
 
-test('concurrent sends and an uncertain provider response cannot send twice, including after local-state loss',async()=>{
+test('concurrent send commands and local-state loss never reach a send provider',async()=>{
   const f=fixture(),history=await f.saved();let attempts=0;
   f.graph.sendSmsDraft=async()=>{attempts++;throw Error('timeout');};
   const req=f.request('send it','send',history);
   await Promise.all([f.emails.prepare(req),f.emails.prepare(req)]);
-  assert.equal(attempts,1);
+  assert.equal(attempts,0);
   f.emails.cancelPending();const recoveredHistory=await f.saved();
   const result=await f.emails.prepare(f.request('send it','retry',recoveredHistory));
-  assert.match(result.reply,/already submitted|needs review/);assert.equal(attempts,1);
+  assert.match(result.reply,/only saves email drafts/);assert.equal(attempts,0);
 });
 
-test('starting a new draft invalidates the old send target before clarification',async()=>{
+test('starting a new draft clears the previous draft reference before clarification',async()=>{
   const f=fixture(),history=await f.saved();
   await f.emails.prepare(f.request('Draft another email','new',history));
   assert.equal(f.emails.pending.id,undefined);
@@ -143,7 +147,7 @@ test('a model-only saved claim is corrected and cannot be reported as an Outlook
   assert.equal(calls,2);assert.match(result,/No Outlook draft was saved/);assert.deepEqual(f.writes,[]);
 });
 
-test('SMS worker routes drafting and its send follow-up before calendar/reminder parsers',async()=>{
+test('SMS worker saves the draft and refuses its send follow-up before calendar/reminder parsers',async()=>{
   const f=fixture(),sent=[];let turn=0;
   const sms={configured:true,listIncoming:async()=>[{sid:'SM'+turn,body:turn?'send it':'Draft an email to julie@example.com about tomorrow',receivedAt:new Date(Date.now()+5000).toISOString()}],
     send:async text=>{sent.push(text);return {id:'reply'+turn,status:'queued'};},messageStatus:async()=>'delivered'};
@@ -151,20 +155,21 @@ test('SMS worker routes drafting and its send follow-up before calendar/reminder
     meetings:{handle:async()=>assert.fail('Email reached meeting handler')},reminders:{handle:async()=>assert.fail('Email reached reminder handler')},
     openai:{respond:async()=>call('save_email_draft',{to:['julie@example.com'],subject:'Budget',body})}});
   await worker.tick();turn++;await worker.tick();
-  assert.match(sent[0],/Saved in Outlook Drafts/);assert.match(sent[1],/Microsoft accepted/);
-  assert.deepEqual(f.writes.map(x=>x[0]),['create','send']);
+  assert.match(sent[0],/Saved in Outlook Drafts/);assert.doesNotMatch(sent[0],/\bsend\b/);
+  assert.match(sent[1],/only saves email drafts/);
+  assert.deepEqual(f.writes.map(x=>x[0]),['create']);
 });
 
-test('Graph sends the selected immutable draft with no new message body and requires HTTP 202',async()=>{
-  const requests=[];let status=202;
-  const graph=new MicrosoftGraphClient({readTenantId:'tenant',readClientId:'client',readClientSecret:'secret',ramyMailbox:owner,fetchImpl:async(url,options)=>{
-    if(String(url).includes('login.microsoftonline.com'))return {ok:true,text:async()=>JSON.stringify({access_token:'test',expires_in:3600})};
-    requests.push({url,options});return {status};
-  }});
-  assert.equal((await graph.sendSmsDraft({id:'draft/id'})).accepted,true);
-  assert.match(requests[0].url,/users\/owner%40example.com\/messages\/draft%2Fid\/send$/);
-  assert.equal(requests[0].options.method,'POST');assert.equal(requests[0].options.body,undefined);
-  assert.match(requests[0].options.headers.Prefer,/ImmutableId/);
-  status=403;await assert.rejects(graph.sendSmsDraft({id:'draft/id'}),/did not accept/);
-  await assert.rejects(graph.sendSmsDraft({mailbox:'other',id:'draft/id'}),/connected mailbox/);
+test('SMS and Graph expose no draft sending method',()=>{
+  assert.equal(typeof SmsEmail.prototype.send,'undefined');
+  assert.equal(typeof MicrosoftGraphClient.prototype.sendSmsDraft,'undefined');
+});
+
+test('model send invitations cannot reach SMS during drafting or after an old saved receipt',async()=>{
+  for(const saved of [false,true]) {
+    const f=fixture(),history=saved?await f.saved():[];
+    const result=await answerOwnerSms({...f.request(saved?'Is it ready?':'Draft an email to Julie','request',history),...f,
+      openai:{respond:async()=>({text:'Would you like me to send it?'})}});
+    assert.match(result,/only saves email drafts/);assert.doesNotMatch(result,/\bsend\b/);assert.deepEqual(f.writes,[]);
+  }
 });
