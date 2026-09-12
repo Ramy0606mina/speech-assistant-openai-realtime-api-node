@@ -58,7 +58,7 @@ function currentMontrealContext() {
   }).format(new Date());
 }
 
-function formattedDraftBody(value) {
+export function formattedDraftBody(value) {
   const body=String(value||'').replace(/\r\n?/g,'\n').split('\n').map(line=>line.trimEnd()).join('\n').trim();
   const blocks=body.split(/\n\s*\n/).map(block=>block.trim()).filter(Boolean);
   const greeting=blocks[0]?.split('\n')[0]?.trim()||'';
