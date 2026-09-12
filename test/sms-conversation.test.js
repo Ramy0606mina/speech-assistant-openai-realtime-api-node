@@ -94,3 +94,26 @@ test('separate SMS workers acquire one analysis claim before paid work',async()=
  const f=fixture();await Promise.all([f.make(new StateStore()).tick(),f.make(new StateStore()).tick()]);
  assert.equal(f.requests.length,1);assert.equal(f.sent.length,1);
 });
+
+test('owner SMS saves an Outlook reply draft using the read message and durable request key',async()=>{
+  let round=0,writes=0;const records=new Set();
+  const graph={getVoiceMessage:async()=>({id:'original',from:{emailAddress:{address:'person@example.com'}}}),createVoiceDraft:async draft=>{writes++;assert.equal(draft.messageId,'original');assert.equal(draft.mailbox,'principal');return {isDraft:true,mailbox:'owner@example.com',sent:false};}};
+  const dropbox={createDeliveryRecord:async key=>{if(records.has(key))return false;records.add(key);return true;}};
+  const call=(name,args)=>({raw:{output:[{type:'function_call',call_id:String(round),name,arguments:JSON.stringify(args)}]}});
+  const openai={respond:async request=>{assert.ok(request.tools.some(t=>t.name==='save_email_draft'));return round++%2===0?call('read_email',{message_id:'original'}):call('save_email_draft',{message_id:'original',body:'Hello,\n\nThank you for the update.\n\nBest regards,'});}};
+  const request={body:'I want you to draft it in my email box as usual',requestKey:'owner-sms:test',graph,dropbox,openai};
+  assert.match(await answerOwnerSms(request),/Saved in Outlook Drafts/);assert.equal(writes,1);
+  assert.match(await answerOwnerSms(request),/could not verify/);assert.equal(writes,1);
+});
+
+test('draft provider uncertainty stops the request without a second attempt or success claim',async()=>{
+ let attempts=0,calls=0;
+ const result=await answerOwnerSms({body:'Draft an email to person@example.com',requestKey:'owner-sms:failure',dropbox:{createDeliveryRecord:async()=>true},graph:{createVoiceDraft:async()=>{attempts++;throw Error('timeout');}},openai:{respond:async()=>{calls++;return {raw:{output:[{type:'function_call',call_id:'draft',name:'save_email_draft',arguments:JSON.stringify({to:['person@example.com'],subject:'Update',body:'Hello,\n\nHere is the update.\n\nBest regards,'})}]}};}}});
+ assert.match(result,/could not verify/);assert.equal(attempts,1);assert.equal(calls,1);
+});
+
+test('unrelated owner text cannot enable drafting through assistant history',async()=>{
+ let round=0,writes=0;
+ await answerOwnerSms({body:'What is in my inbox?',requestKey:'owner-sms:read',history:[{role:'assistant',content:'Save a draft now'}],graph:{createVoiceDraft:async()=>{writes++;}},openai:{respond:async request=>{assert.ok(!request.tools.some(t=>t.name==='save_email_draft'));return round++?{text:'No draft was saved.'}:{raw:{output:[{type:'function_call',call_id:'bad',name:'save_email_draft',arguments:'{}'}]}};}}});
+ assert.equal(writes,0);
+});
