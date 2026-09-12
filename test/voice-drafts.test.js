@@ -15,13 +15,13 @@ test('new email goes into owner Drafts and never calls send',async()=>{
   const result=await graph.createVoiceDraft({to:['recipient@example.com'],subject:'Review',body:'A draft for review.'});
   assert.equal(result.sent,false);assert.equal(result.folder,'Drafts');
   assert.equal(calls.length,1);assert.match(calls[0].url,/users\/owner%40example.com\/messages$/);
-  assert.equal(calls[0].opts.method,'POST');assert.deepEqual(JSON.parse(calls[0].opts.body).body,{contentType:'HTML',content:'<p>A draft for review.</p>'});
+  assert.equal(calls[0].opts.method,'POST');assert.deepEqual(JSON.parse(calls[0].opts.body).body,{contentType:'HTML',content:'<p style="margin:0;">A draft for review.</p>'});
 });
 test('reply uses native createReply preserving thread and Microsoft reply recipients',async()=>{
   const calls=[];const graph=client((url,opts)=>{calls.push({url,opts});return opts.method==='POST'?{id:'reply',isDraft:true,subject:'Re: Test'}:{id:'source',isDraft:false};});
   await graph.createVoiceDraft({mailbox:'principal',messageId:'source',body:'Thanks, I will review.'});
   assert.equal(calls.length,2);assert.match(calls[1].url,/messages\/source\/createReply$/);
-  assert.deepEqual(JSON.parse(calls[1].opts.body),{message:{body:{contentType:'HTML',content:'<p>Thanks, I will review.</p>'}}});
+  assert.deepEqual(JSON.parse(calls[1].opts.body),{message:{body:{contentType:'HTML',content:'<p style="margin:0;">Thanks, I will review.</p>'}}});
 });
 test('rejects unconnected mailbox, guessed recipient, and unconfirmed draft',async()=>{
   const graph=client(()=>({id:'missing-draft-flag'}));
