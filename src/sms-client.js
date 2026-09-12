@@ -47,6 +47,14 @@ export class SmsClient {
     const result = await fetchJson(this.fetchImpl, `https://api.twilio.com/2010-04-01/Accounts/${this.accountSid}/Messages/${sid}.json`, { headers: { Authorization: `Basic ${Buffer.from(`${this.accountSid}:${this.authToken}`).toString('base64')}` } });
     return result.status || 'unknown';
   }
+  async latestOutgoing() {
+    if(!this.configured)throw Error('SMS is not configured.');
+    const url=`https://api.twilio.com/2010-04-01/Accounts/${this.accountSid}/Messages.json?${new URLSearchParams({From:this.from,To:this.to,PageSize:'1'})}`;
+    const result=await fetchJson(this.fetchImpl,url,{headers:{Authorization:`Basic ${Buffer.from(`${this.accountSid}:${this.authToken}`).toString('base64')}`}});
+    const item=result.messages?.[0];
+    if(!item || item.from!==this.from || item.to!==this.to || !String(item.direction).startsWith('outbound') || !/^SM[\da-f]{32}$/i.test(item.sid||''))return null;
+    return {id:item.sid,body:String(item.body||''),status:item.status,sentAt:item.date_sent||item.date_created};
+  }
   async send(body){
     if(!this.configured)throw new Error('London SMS credentials are not configured.');
     if(typeof body!=='string' || !body.trim() || body.length>480)throw new Error('SMS must contain 1–480 characters.');

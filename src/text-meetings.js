@@ -21,7 +21,7 @@ export class TextMeetings {
   constructor({ graph, dropbox, openai, now = () => new Date() }) {
     Object.assign(this, { graph, dropbox, openai, now });
   }
-  async handle({ text, owner, requestKey, receivedAt, history = [], maxReplyLength = Infinity }) {
+  async handle({ text, owner, requestKey, receivedAt, history = [], maxReplyLength = Infinity, allowImplicitConflictConfirmation = true }) {
     text = String(text || '').trim();
     // Carry only owner-authored details forward. Assistant messages are routing
     // signals, never meeting details or authority to send an invitation.
@@ -46,7 +46,7 @@ export class TextMeetings {
         return 'Meeting request cancelled. No invitation was sent.';
       }
       if (!/@|\b(?:tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|minutes?|hours?|am|pm|attendee|subject|title|instead|understand|confused|confirm|yes|set|book|schedule)\b|\d{1,2}:\d{2}/i.test(text)) return null;
-      confirmedConflictChange = conflictPending && /\b(?:set|book|schedule|create|send)\s+(?:it|the\s+(?:meeting|invitation?))\b/i.test(text);
+      confirmedConflictChange = allowImplicitConflictConfirmation && conflictPending && /\b(?:set|book|schedule|create|send)\s+(?:it|the\s+(?:meeting|invitation?))\b/i.test(text);
       text = [...tail.filter(item => item.role === 'user' && !/^confirm meeting\b/i.test(item.content || '')).map(item => item.content), text].join('\n');
       receivedAt = tail[0].receivedAt || receivedAt;
     }
