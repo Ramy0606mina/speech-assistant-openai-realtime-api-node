@@ -4,6 +4,7 @@ import {formattedDraftBody} from './voice-gateway.js';
 const hash = value => createHash('sha256').update(value).digest('hex');
 const normalize = text => String(text || '').trim().replace(/\s+/g,' ');
 const sendCommand = /^(?:(?:yes|please|go ahead)[, ]+)?send (?:it|the email|this email|the draft|this draft|the reply)(?: now| please)?[.!]?$/i;
+export const draftOnlyReply = 'London only saves email drafts. Nothing was sent.';
 const keepCommand = /^(?:(?:please|just) )?(?:keep|leave|save) (?:it|this|the email|the draft)(?: (?:as a draft|in (?:my |the |outlook )?drafts?(?: folder| box)?))?[.!]?$/i;
 const noSendCommand = /^(?:(?:please|just) )?(?:do not|don't|don’t|never) send(?: it| the email| the draft)?[.!]?$/i;
 const reviewCommand = /^(?:show|read|review|refresh)(?: me)? (?:it|the draft|this draft|the email)[.!]?$/i;
@@ -28,8 +29,8 @@ export const updateSmsDraftTool = {
   parameters:{type:'object',properties:{body:{type:'string'}},required:['body'],additionalProperties:false},
 };
 
-// The model can compose text, but cannot select an arbitrary message to send or
-// manufacture permission. A separate owner SMS acts on a verified saved draft.
+// SMS email actions only create or revise drafts. There is no sending action,
+// including for conversations saved by versions that offered send confirmation.
 export class SmsEmail {
   constructor({graph,dropbox,state,now=()=>new Date()}) { Object.assign(this,{graph,dropbox,state,now}); }
   get pending() { return this.state.state.smsConversation?.pendingEmail; }
@@ -51,7 +52,7 @@ export class SmsEmail {
   async prepare(request) {
     this.validate(request);
     const text=normalize(request.body), current=this.isCurrent(request);
-    if (sendCommand.test(text)) return {reply:await this.send(request,current)};
+    if (sendCommand.test(text)) return {reply:draftOnlyReply};
     if (keepCommand.test(text) || noSendCommand.test(text)) {
       if (keepCommand.test(text) && current && this.pending?.status==='composing') return {create:true};
       if (!current || !this.pending?.id) return {reply:'Nothing was sent. Which email would you like me to save in Outlook Drafts?'};
@@ -70,7 +71,7 @@ export class SmsEmail {
       return {revise:true,draft:message};
     }
     if (requestsEmailDraft(text)) {
-      // A new request invalidates the earlier send target, even if clarification
+      // A new request invalidates the earlier revision target, even if clarification
       // or a provider failure prevents the new draft from being saved.
       this.save({owner:request.owner,status:'composing',requestKey:request.requestKey,updatedAt:this.now().toISOString()});
       return {create:true};
@@ -86,9 +87,9 @@ export class SmsEmail {
     if (!message?.id || message.isDraft!==true) throw new Error('Microsoft did not confirm the saved draft.');
     const recipients=(message.toRecipients||[]).map(item=>item.emailAddress?.address).filter(Boolean).join(', ');
     const subject=String(message.subject||'(No subject)').replace(/\s+/g,' ').slice(0,90);
-    const reply=`Saved in Outlook Drafts for ${this.graph.voiceMailbox(mailbox)}.\nTo: ${recipients.slice(0,150)||'(not set)'}\nSubject: ${subject}\nNothing was sent. Review it in Outlook; reply send it when ready.`;
+    const reply=`Saved in Outlook Drafts for ${this.graph.voiceMailbox(mailbox)}.\nTo: ${recipients.slice(0,150)||'(not set)'}\nSubject: ${subject}\nNothing was sent.`;
     this.save({owner:request.owner,id:message.id,mailbox,version:draftVersion(message),status:'saved',requestKey:request.requestKey,
-      updatedAt:this.now().toISOString(),presentedAt:null,reply});
+      updatedAt:this.now().toISOString(),reply});
     return reply;
   }
   async saved(result,request,mailbox='principal') {
@@ -105,37 +106,8 @@ export class SmsEmail {
     if (live.isDraft!==true || draftVersion(live)!==draftVersion(expected)) throw new Error('Draft changed during revision.');
     const key='sms-draft-update-'+hash(request.owner+request.requestKey);
     if (!await this.dropbox.createDeliveryRecord(key,{status:'attempted',at:this.now().toISOString()})) throw new Error('Draft update already attempted.');
-    this.save({...p,status:'updating',presentedAt:null});
+    this.save({...p,status:'updating'});
     const result=await this.graph.updateSmsDraft({mailbox:p.mailbox,id:p.id,body});
     return this.saved(result,request,p.mailbox);
-  }
-  async recordReply({requestKey,text,sentAt}) {
-    if (this.pending?.requestKey===requestKey && this.pending.reply===text) this.save({...this.pending,presentedAt:sentAt});
-  }
-  async send(request,current) {
-    const p=this.pending;
-    if (!current || !p?.id) return 'No current email draft is selected for sending. Ask me to review the draft first. Nothing was sent.';
-    if (p.status==='submitted') return 'Microsoft already accepted this draft for sending. I will not send it again.';
-    if (p.status!=='saved') return 'This draft needs review. Check Outlook Drafts and Sent Items before trying again.';
-    if (!p.presentedAt || !Number.isFinite(Date.parse(request.receivedAt)) || Date.parse(request.receivedAt)<=Date.parse(p.presentedAt) || p.requestKey===request.requestKey)
-      return 'Review the saved draft, then send a new text saying send it. Nothing was sent.';
-    const message=await this.graph.getVoiceMessage(p.mailbox,p.id);
-    if (message.isDraft!==true) return 'That message is no longer a draft. I did not send it again.';
-    if (draftVersion(message)!==p.version) return this.remember(message,request,p.mailbox);
-    const recipients=[...(message.toRecipients||[]),...(message.ccRecipients||[]),...(message.bccRecipients||[])];
-    if (!recipients.length || recipients.some(item=>!item.emailAddress?.address?.includes('@'))) return 'The draft has no valid recipients. Correct it in Outlook and ask me to review it. Nothing was sent.';
-    const key='sms-draft-send-'+hash(request.owner+':'+p.mailbox+':'+p.id);
-    if (!await this.dropbox.createDeliveryRecord(key,{status:'attempted',at:this.now().toISOString()})) return 'This draft was already submitted or its send needs review. Check Sent Items; I will not send a duplicate.';
-    this.save({...p,status:'sending',presentedAt:null});
-    try {
-      const result=await this.graph.sendSmsDraft({mailbox:p.mailbox,id:p.id});
-      if (!result?.accepted) throw new Error('Unverified send.');
-      const reply='Microsoft accepted the saved draft for sending. Check Outlook Sent Items; delivery is not yet confirmed.';
-      this.save({...p,status:'submitted',requestKey:request.requestKey,reply,updatedAt:this.now().toISOString()});
-      return reply;
-    } catch {
-      this.save({...p,status:'send-needs-review',presentedAt:null});
-      return 'I could not verify the send result. Check Outlook Sent Items and Drafts. I will not retry automatically.';
-    }
   }
 }

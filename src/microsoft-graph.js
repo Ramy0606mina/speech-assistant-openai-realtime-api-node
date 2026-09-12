@@ -14,9 +14,8 @@ function htmlEscape(value) {
   return String(value||'').replace(/[&<>"']/g,char=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
 }
 
-function emailBodyHtml(value) {
-  return String(value||'').replace(/\r\n?/g,'\n').trim().split(/\n\s*\n/)
-    .map((block,index,blocks)=>`<p style="margin:${index===blocks.length-1?'0':'0 0 12pt 0'};">${block.split('\n').map(htmlEscape).join('<br>')}</p>`).join('');
+function emailDraftBody(value) {
+  return {contentType:'Text',content:String(value||'').replace(/\r\n?/g,'\n').trim()};
 }
 
 function verifiedTeamsJoinUrl(value) {
@@ -317,11 +316,11 @@ export class MicrosoftGraphClient {
     if(messageId) {
       const source=await this.getVoiceMessage(mailbox,messageId);
       if(source.isDraft)throw new Error('Choose a received message to reply to.');
-      result=await this.voiceRequest(mailbox,`/messages/${encodeURIComponent(messageId)}/createReply`,{method:'POST',body:JSON.stringify({message:{body:{contentType:'HTML',content:emailBodyHtml(body)}}})});
+      result=await this.voiceRequest(mailbox,`/messages/${encodeURIComponent(messageId)}/createReply`,{method:'POST',body:JSON.stringify({message:{body:emailDraftBody(body)}})});
     } else {
       if(typeof subject!=='string'||!subject.trim()||subject.length>250)throw new Error('A draft subject is required.');
       if(!Array.isArray(to)||!to.length||to.length>10||to.some(v=>typeof v!=='string'||v.length>254||!/^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/.test(v)))throw new Error('Provide explicit recipient email addresses; names must not be guessed.');
-      result=await this.voiceRequest(mailbox,'/messages',{method:'POST',body:JSON.stringify({subject,body:{contentType:'HTML',content:emailBodyHtml(body)},toRecipients:to.map(address=>({emailAddress:{address}}))})});
+      result=await this.voiceRequest(mailbox,'/messages',{method:'POST',body:JSON.stringify({subject,body:emailDraftBody(body),toRecipients:to.map(address=>({emailAddress:{address}}))})});
     }
     if(!result?.id||result.isDraft!==true)throw new Error('Microsoft did not confirm the saved draft. Check Drafts before retrying.');
     return {id:result.id,subject:result.subject,isDraft:true,mailbox:this.voiceMailbox(mailbox),folder:'Drafts',sent:false};
@@ -330,27 +329,10 @@ export class MicrosoftGraphClient {
   async updateSmsDraft({mailbox='principal',id,body}) {
     if (!id || typeof body !== 'string' || !body.trim() || body.length > 20000) throw new Error('A saved draft and body are required.');
     const result = await this.voiceRequest(mailbox,`/messages/${encodeURIComponent(id)}`,{
-      method:'PATCH',body:JSON.stringify({body:{contentType:'HTML',content:emailBodyHtml(body)}}),
+      method:'PATCH',body:JSON.stringify({body:emailDraftBody(body)}),
     });
     if (result?.id !== id || result.isDraft !== true) throw new Error('Microsoft did not confirm the updated draft.');
     return {id,isDraft:true,mailbox:this.voiceMailbox(mailbox),sent:false};
-  }
-
-  // Only the deterministic SMS confirmation handler calls this method. Send the
-  // stored Outlook draft itself, preserving its thread, recipients and edits.
-  async sendSmsDraft({mailbox='principal',id}) {
-    if (typeof id !== 'string' || !id || id.length > 2000) throw new Error('A saved draft is required.');
-    const owner = this.voiceMailbox(mailbox);
-    const token = await this.#getToken(this.actionCreds,this.actionToken);
-    const response = await this.fetchImpl(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(owner)}/messages/${encodeURIComponent(id)}/send`,{
-      method:'POST',headers:{Authorization:`Bearer ${token}`,Prefer:'IdType="ImmutableId"'},signal:AbortSignal.timeout(12000),
-    });
-    if (response.status !== 202) {
-      const error = new Error('Microsoft did not accept the draft send.');
-      error.status = response.status;
-      throw error;
-    }
-    return {accepted:true,id,mailbox:owner};
   }
 
   async #listInbox(mailbox, limit = 10) {

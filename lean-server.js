@@ -86,7 +86,7 @@ function operational() {
 }
 
 app.get('/health', async () => ({
-  smsEmail: {enabled:smsConversationEnabled,drafts:'Outlook',sendConfirmation:'send it'},
+  smsEmail: {enabled:smsConversationEnabled,drafts:'Outlook',mode:'draft-only',sending:false},
   smsReminders: {enabled:smsConversationEnabled,provider:'Microsoft Graph',calendar:'primary',lastOutcome:reminders.lastOutcome},
   ok: operational(),
   live: true,
