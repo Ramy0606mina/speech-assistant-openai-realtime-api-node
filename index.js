@@ -160,7 +160,42 @@ const validateTwilioFormWebhook = (request) => {
   return a.length === b.length && timingSafeEqual(a, b);
 };
 
-const sendTwilioChannelMessage = async () => { throw new Error('SMS is paused and WhatsApp has been removed.'); };
+const sendTwilioChannelMessage = async ({ to, from, body }) => {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+    throw new Error('Missing Twilio messaging credentials.');
+  }
+  if (!to || !from) throw new Error('Twilio To and From addresses are required.');
+
+  const auth = Buffer.from(
+    `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
+  ).toString('base64');
+
+  const cleanBody = String(body || '').trim().slice(0, MAX_MESSAGING_REPLY_CHARS);
+  const form = new URLSearchParams({
+    To: String(to),
+    From: String(from),
+    Body: cleanBody || 'Updated.',
+  });
+
+  const response = await fetchWithTimeout(
+    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}` ,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: form.toString(),
+    },
+    12000
+  );
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(`Twilio messaging send failed: ${data.message || response.status}`);
+  }
+  return data;
+};
 
 const getMicrosoftGraphToken = async () => {
   if (!MS_TENANT_ID || !MS_CLIENT_ID || !MS_CLIENT_SECRET) {
@@ -4627,7 +4662,7 @@ Use list_actions when Ramy asks what is overdue, what he is waiting for, what ne
 Use quick_action_update as the FIRST choice for simple natural-language status updates such as “Joannie done”, “waiting on Anass until Friday”, “follow up with Franco next Tuesday”, “add task: call Makar tomorrow”, “cancel the EV follow-up”, or several quick updates in one sentence. The server matches the live Action Register and makes the update in one step, which is faster than chaining list_actions + update_action.
 Use update_action when you already have the exact event id or when a precise field edit is needed after listing actions.
 The register fields are outcome, project, owner, dates, status, priority, next action, waiting on, Ramy requirement, risk, source, and notes. Preserve the distinction between promised date, hard deadline, and next follow-up.
-SMS is paused and WhatsApp is removed. Do not offer these channels.
+Ramy may send natural-language executive instructions by SMS. SMS uses the same verified Action Register and Microsoft Graph-backed action logic as voice. WhatsApp remains removed. Do not require special command syntax.
 
 DAILY EXECUTIVE BRIEF
 
@@ -4882,7 +4917,58 @@ fastify.get('/task-inbox/status/:jobId', async (request, reply) => {
 });
 
 
-fastify.all('/incoming-sms', async (_request, reply) => reply.type('text/xml').send('<Response/>'));
+const handleIncomingSms = async (request, reply) => {
+  const body = request.body && typeof request.body === 'object' ? request.body : {};
+  const from = String(body.From || request.query?.From || '').trim();
+  const to = String(body.To || request.query?.To || '').trim();
+  const messageBody = String(body.Body || request.query?.Body || '').trim();
+  const messageSid = String(body.MessageSid || body.SmsMessageSid || '').trim();
+  const numMedia = Number(body.NumMedia || 0);
+
+  const validSignature = validateTwilioFormWebhook(request);
+  const authorizedSender = isAuthorizedRamyMessagingSender(from);
+  const emptyTwiml = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+
+  if (!validSignature || !authorizedSender) {
+    return reply.type('text/xml').code(403).send(emptyTwiml);
+  }
+
+  pruneMessagingState();
+  if (messageSid && processedMessagingSids.has(messageSid)) {
+    return reply.type('text/xml').send(emptyTwiml);
+  }
+  if (messageSid) processedMessagingSids.set(messageSid, Date.now());
+  reply.type('text/xml').send(emptyTwiml);
+
+  setImmediate(async () => {
+    try {
+      let result;
+      if (!messageBody && numMedia > 0) {
+        result = { success: false, reply: 'I received the attachment. For document or spreadsheet analysis, email it to london@minaco.ca so I can process the full file safely.' };
+      } else {
+        result = await processExecutiveMessagingInstruction({ text: messageBody, channel: 'sms', sender: from });
+      }
+      await sendTwilioChannelMessage({
+        to: normalizePhoneIdentity(from),
+        from: normalizePhoneIdentity(to || TWILIO_PHONE_NUMBER),
+        body: result.reply,
+      });
+    } catch (error) {
+      console.error('Inbound SMS failure:', error);
+      try {
+        await sendTwilioChannelMessage({
+          to: normalizePhoneIdentity(from),
+          from: normalizePhoneIdentity(to || TWILIO_PHONE_NUMBER),
+          body: 'I could not complete that SMS request. Please try again.',
+        });
+      } catch (sendError) {
+        console.error('Inbound SMS error reply failed:', sendError);
+      }
+    }
+  });
+};
+
+fastify.all('/incoming-sms', handleIncomingSms);
 
 
 fastify.all('/incoming-call', async (request, reply) => {
