@@ -15,7 +15,8 @@ function htmlEscape(value) {
 }
 
 function emailBodyHtml(value) {
-  return String(value||'').replace(/\r\n?/g,'\n').trim().split(/\n\s*\n/).map(block=>`<p>${block.split('\n').map(htmlEscape).join('<br>')}</p>`).join('');
+  return String(value||'').replace(/\r\n?/g,'\n').trim().split(/\n\s*\n/)
+    .map((block,index,blocks)=>`<p style="margin:${index===blocks.length-1?'0':'0 0 12pt 0'};">${block.split('\n').map(htmlEscape).join('<br>')}</p>`).join('');
 }
 
 function verifiedTeamsJoinUrl(value) {
