@@ -131,10 +131,11 @@ test('actual attachment builder sends PDF bytes and excludes inline signatures',
   assert.equal(result.content.length, 1);
   assert.equal(result.content[0].file_data, 'data:application/pdf;base64,JVBERg==');
 });
-test('messaging routes are removed or inert, voice routes remain', () => {
+test('SMS route is active, WhatsApp remains removed, voice routes remain', () => {
   assert.doesNotMatch(source, /fastify\.all\('\/incoming-whatsapp'/);
-  assert.match(source, /fastify\.all\('\/incoming-sms', async/);
-  assert.match(source, /const sendTwilioChannelMessage = async \(\) => \{ throw new Error/);
+  assert.match(source, /const handleIncomingSms = async/);
+  assert.match(source, /fastify\.all\('\/incoming-sms', handleIncomingSms\)/);
+  assert.match(source, /const sendTwilioChannelMessage = async \(\{ to, from, body \}\)/);
   assert.match(source, /\/incoming-call/);
   assert.match(source, /\/media-stream/);
 });

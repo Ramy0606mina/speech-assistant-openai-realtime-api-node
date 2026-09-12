@@ -1,0 +1,34 @@
+name: Apply London SMS fix
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/sms-2026-09-11]
+    paths:
+      - scripts/apply-sms-fix.mjs
+      - .github/workflows/apply-sms-fix.yml
+permissions:
+  contents: write
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/sms-2026-09-11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node scripts/apply-sms-fix.mjs
+      - run: npm install --ignore-scripts
+      - run: npm test
+      - name: Commit patched production code
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.js test/task-inbox.test.js
+          if git diff --cached --quiet; then
+            echo "No patch changes to commit"
+          else
+            git commit -m "Re-enable verified SMS command channel"
+            git push origin HEAD:fix/sms-2026-09-11
+          fi
