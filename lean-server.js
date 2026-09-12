@@ -16,6 +16,7 @@ import { SmsClient } from './src/sms-client.js';
 import { TextMeetings } from './src/text-meetings.js';
 import { TextReminders } from './src/text-reminders.js';
 import { SmsMeetings } from './src/sms-meetings.js';
+import { SmsEmail } from './src/sms-email.js';
 import { UrgentAlerts } from './src/urgent-alerts.js';
 import { SmsConversation, registerSmsWebhook } from './src/sms-conversation.js';
 
@@ -35,9 +36,10 @@ const sms = new SmsClient({accountSid:process.env.TWILIO_ACCOUNT_SID,authToken:p
 const meetings = new TextMeetings({graph,dropbox,openai});
 const reminders = new TextReminders({graph,dropbox,openai});
 const smsMeetings = new SmsMeetings({meetings,state,graph,dropbox,sms});
+const smsEmail = new SmsEmail({graph,dropbox,state});
 const london = new LondonCore({ graph, openai, dropbox, state, deliveryGuard, sms, meetings, logger: app.log });
 const urgentAlerts=new UrgentAlerts({graph,openai,sms,guard:new DeliveryGuard(dropbox,`${graph.principalMailbox}:urgent-alerts`)});
-const smsConversation = new SmsConversation({sms,openai,graph,dropbox,state,meetings:smsMeetings,reminders,guard:new DeliveryGuard(dropbox,`${graph.principalMailbox}:incoming-sms`),logger:app.log});
+const smsConversation = new SmsConversation({sms,openai,graph,dropbox,state,meetings:smsMeetings,reminders,emails:smsEmail,guard:new DeliveryGuard(dropbox,`${graph.principalMailbox}:incoming-sms`),logger:app.log});
 // Do not activate owner texts in PR previews that share production credentials.
 const smsConversationEnabled = process.env.LONDON_SMS_CONVERSATION_ENABLED === undefined
   ? process.env.RENDER_EXTERNAL_URL === 'https://london-ai-pr-1.onrender.com'
@@ -84,6 +86,7 @@ function operational() {
 }
 
 app.get('/health', async () => ({
+  smsEmail: {enabled:smsConversationEnabled,drafts:'Outlook',sendConfirmation:'send it'},
   smsReminders: {enabled:smsConversationEnabled,provider:'Microsoft Graph',calendar:'primary',lastOutcome:reminders.lastOutcome},
   ok: operational(),
   live: true,

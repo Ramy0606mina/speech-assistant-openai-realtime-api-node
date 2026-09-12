@@ -307,7 +307,7 @@ export class MicrosoftGraphClient {
 
   async getVoiceMessage(mailbox,id) {
     if(typeof id!=='string'||!id||id.length>2000)throw new Error('A message selected from the mailbox is required.');
-    return this.voiceRequest(mailbox,`/messages/${encodeURIComponent(id)}?$select=id,subject,from,replyTo,toRecipients,ccRecipients,body,isDraft,hasAttachments`);
+    return this.voiceRequest(mailbox,`/messages/${encodeURIComponent(id)}?$select=id,subject,from,sender,replyTo,toRecipients,ccRecipients,bccRecipients,body,isDraft,hasAttachments,changeKey`);
   }
 
   async createVoiceDraft({mailbox='principal',to=[],subject,body,messageId}) {
@@ -324,6 +324,32 @@ export class MicrosoftGraphClient {
     }
     if(!result?.id||result.isDraft!==true)throw new Error('Microsoft did not confirm the saved draft. Check Drafts before retrying.');
     return {id:result.id,subject:result.subject,isDraft:true,mailbox:this.voiceMailbox(mailbox),folder:'Drafts',sent:false};
+  }
+
+  async updateSmsDraft({mailbox='principal',id,body}) {
+    if (!id || typeof body !== 'string' || !body.trim() || body.length > 20000) throw new Error('A saved draft and body are required.');
+    const result = await this.voiceRequest(mailbox,`/messages/${encodeURIComponent(id)}`,{
+      method:'PATCH',body:JSON.stringify({body:{contentType:'HTML',content:emailBodyHtml(body)}}),
+    });
+    if (result?.id !== id || result.isDraft !== true) throw new Error('Microsoft did not confirm the updated draft.');
+    return {id,isDraft:true,mailbox:this.voiceMailbox(mailbox),sent:false};
+  }
+
+  // Only the deterministic SMS confirmation handler calls this method. Send the
+  // stored Outlook draft itself, preserving its thread, recipients and edits.
+  async sendSmsDraft({mailbox='principal',id}) {
+    if (typeof id !== 'string' || !id || id.length > 2000) throw new Error('A saved draft is required.');
+    const owner = this.voiceMailbox(mailbox);
+    const token = await this.#getToken(this.actionCreds,this.actionToken);
+    const response = await this.fetchImpl(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(owner)}/messages/${encodeURIComponent(id)}/send`,{
+      method:'POST',headers:{Authorization:`Bearer ${token}`,Prefer:'IdType="ImmutableId"'},signal:AbortSignal.timeout(12000),
+    });
+    if (response.status !== 202) {
+      const error = new Error('Microsoft did not accept the draft send.');
+      error.status = response.status;
+      throw error;
+    }
+    return {accepted:true,id,mailbox:owner};
   }
 
   async #listInbox(mailbox, limit = 10) {
