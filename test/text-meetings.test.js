@@ -16,6 +16,35 @@ function harness(){
 }
 const code=reply=>reply.match(/CONFIRM MEETING ([a-f0-9]{12})/)[1];
 
+test('generic model confirmation is retried before issuing an actual proposal',async()=>{
+ const f=harness();let calls=0;
+ const original=f.openai.respond;
+ f.openai.respond=async request=>{assert.match(request.instructions,/Do not ask for permission or confirmation/);return calls++===0?{text:JSON.stringify({clarification:'Please confirm you want to create this Teams meeting.'})}:original(request);};
+ const reply=await f.make().handle(f.request);
+ assert.match(reply,/Teams proposal:/);assert.ok(code(reply));assert.equal(calls,2);assert.equal(f.writes(),0);
+});
+
+test('repeated generic approval text cannot replace a validated in-person proposal',async()=>{
+ const f=harness();let calls=0;
+ f.openai.respond=async()=>{calls++;return {text:JSON.stringify({title:'Discussion',startIso:'2030-09-11T14:00:00-04:00',durationMinutes:60,contacts:['Anass'],location:'Main office',clarification:'Please confirm this in-person meeting.'})};};
+ const reply=await f.make().handle({...f.request,text:'Create an in-person meeting with Anass tomorrow at 2pm for one hour at Main office'});
+ assert.match(reply,/In-person proposal:/);assert.ok(code(reply));assert.equal(calls,2);assert.equal(f.writes(),0);
+});
+
+test('generic approval without scheduling fields never creates a proposal or meeting',async()=>{
+ const f=harness();let calls=0;
+ f.openai.respond=async()=>{calls++;return {text:JSON.stringify({clarification:'Please confirm this Teams meeting.'})};};
+ const reply=await f.make().handle(f.request);
+ assert.match(reply,/Please provide a future date/);assert.doesNotMatch(reply,/CONFIRM MEETING/);assert.equal(calls,2);assert.equal(f.writes(),0);
+});
+
+test('specific date clarification is preserved and not mistaken for generic approval',async()=>{
+ const f=harness();let calls=0;
+ f.openai.respond=async()=>{calls++;return {text:JSON.stringify({clarification:'Please confirm whether you mean September 11 or September 12.'})};};
+ const reply=await f.make().handle(f.request);
+ assert.match(reply,/September 11 or September 12/);assert.equal(calls,1);assert.equal(f.writes(),0);
+});
+
 test('in-person owner-email proposal shows location and requires separate confirmation',async()=>{
  const f=harness(),created=[];
  f.openai.respond=async()=>({text:JSON.stringify({title:'Discussion',startIso:'2030-09-11T14:00:00-04:00',durationMinutes:60,contacts:['Anass'],location:'Main office'})});
