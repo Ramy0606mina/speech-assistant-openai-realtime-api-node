@@ -16,6 +16,36 @@ function harness(){
 }
 const code=reply=>reply.match(/CONFIRM MEETING ([a-f0-9]{12})/)[1];
 
+test('in-person owner-email proposal shows location and requires separate confirmation',async()=>{
+ const f=harness(),created=[];
+ f.openai.respond=async()=>({text:JSON.stringify({title:'Discussion',startIso:'2030-09-11T14:00:00-04:00',durationMinutes:60,contacts:['Anass'],location:'Main office'})});
+ f.graph.createVoiceMeeting=async p=>{created.push(p);return {id:'inperson',invitationsSubmitted:true,joinLinkCreated:false};};
+ const proposal=await f.make().handle({...f.request,text:'Create an in-person meeting with Anass tomorrow at 2pm for one hour at Main office'});
+ assert.match(proposal,/In-person proposal:/);assert.match(proposal,/Location: Main office/);assert.equal(created.length,0);
+ const reply=await f.make().handle({...f.request,requestKey:'confirm',text:'CONFIRM MEETING '+code(proposal)});
+ assert.match(reply,/In-person invitation submitted/);assert.doesNotMatch(reply,/Teams link/);assert.equal(created.length,1);
+ assert.equal(created[0].onlineMeeting,false);assert.equal(created[0].location,'Main office');
+});
+
+test('in-person meeting needs an owner-supplied location and cannot invent one',async()=>{
+ const f=harness();f.openai.respond=async()=>({text:JSON.stringify({title:'Discussion',startIso:'2030-09-11T14:00:00-04:00',durationMinutes:60,contacts:['Anass'],location:'Invented office'})});
+ assert.match(await f.make().handle({...f.request,text:'Create an in-person meeting with Anass tomorrow at 2pm for one hour'}),/Where should/);
+ assert.equal(f.writes(),0);
+});
+
+test('in-person location clarification and later Teams correction retain the owner proposal',async()=>{
+ const f=harness();let location='';
+ f.openai.respond=async()=>({text:JSON.stringify({title:'Discussion',startIso:'2030-09-11T14:00:00-04:00',durationMinutes:60,contacts:['Anass'],location})});
+ const text='Create an in-person meeting with Anass tomorrow at 2pm for one hour';
+ const clarification=await f.make().handle({...f.request,text});
+ const history=[{role:'user',content:text,receivedAt:f.request.receivedAt},{role:'assistant',content:clarification}];
+ location='Main office';
+ const proposal=await f.make().handle({...f.request,text:location,requestKey:'location',history});
+ assert.match(proposal,/Location: Main office/);
+ const updated=await f.make().handle({...f.request,text:'Make it Teams instead',requestKey:'teams',history:[...history,{role:'user',content:location},{role:'assistant',content:proposal}]});
+ assert.match(updated,/Teams proposal:/);assert.doesNotMatch(updated,/Location: Main office/);assert.equal(f.writes(),0);
+});
+
 test('explicit address next to attendee name bypasses ambiguous directory and is not autocorrected',async()=>{
  const f=harness();f.graph.resolveVoiceContact=async()=>assert.fail('explicit address must not need lookup');
  const result=await f.make().handle({...f.request,text:'Create Teams meeting with Anass, admin@minacpital.ca today at 2 pm for one hour'});
@@ -62,7 +92,7 @@ test('oversized SMS proposal and confirmation never create an invitation',async(
 
 test('another meeting format and missing source ID cannot silently create Teams',async()=>{
  const f=harness();
- assert.match(await f.make().handle({...f.request,text:'Create an in-person meeting with Anass'}),/clarify/);
+ assert.match(await f.make().handle({...f.request,text:'Create a Zoom meeting with Anass'}),/clarify/);
  await assert.rejects(f.make().handle({...f.request,requestKey:undefined}),/source identifier/);
  assert.equal(f.models(),0);assert.equal(f.writes(),0);
 });

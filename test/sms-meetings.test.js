@@ -27,6 +27,13 @@ function fixture(){
  return{records,state,owner,request,graph,openai,meetings,sms,make,wrapper,present,confirm,writes:()=>writes,outgoing:()=>outgoing};
 }
 
+test('in-person SMS uses plain confirm and preserves the location without a Teams link',async()=>{
+ const f=fixture();f.request.text='Create an in-person meeting with admin@example.com tomorrow at 2pm for one hour at Main office';
+ f.openai.respond=async()=>({text:JSON.stringify({title:'Discussion',startIso:'2030-09-11T14:00:00-04:00',durationMinutes:60,contacts:['admin@example.com'],location:'Main office'})});
+ const reply=await f.present();assert.match(reply,/In-person proposal/);assert.match(reply,/Location: Main office/);assert.equal(f.writes(),0);
+ assert.match(await f.wrapper.handle(f.confirm()),/In-person invitation submitted/);assert.equal(f.writes(),1);assert.equal(f.state.state.smsConversation.pendingMeeting.status,'completed');
+});
+
 for(const spelling of ['confirm','CONFIRM','ConFiRm','  confirm \n',' Confirm! ']){
  test('plain confirmation accepts '+JSON.stringify(spelling),async()=>{
    const f=fixture(),reply=await f.present();

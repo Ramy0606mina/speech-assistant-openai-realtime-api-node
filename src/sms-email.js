@@ -13,6 +13,7 @@ const readRequest = /^(?:what|where|which|show|read|list|check|find|search|did|i
 
 export function requestsEmailDraft(text) {
   const body = normalize(text);
+  if(/\bdraft\s+(?:(?:a|an|the)\s+)?(?:report|document|proposal|spreadsheet)\b/i.test(body)&&!/\b(?:email|reply|Outlook)\b/i.test(body))return false;
   if (readRequest.test(body)) return false;
   if (/\b(do not|don't|don’t|never)\b[^.!?]*\b(draft|save|reply|respond|compose|write)\b/i.test(body)) return false;
   return /\b(draft|compose)\b|\b(?:write|prepare|save)\b.*\b(email|mail|drafts|reply)\b|^(?:please )?(?:email|reply|respond)\b|\b(?:reply|respond) to\b|\bsend (?:an? |new )?email\b/i.test(body);

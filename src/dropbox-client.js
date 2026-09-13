@@ -133,6 +133,10 @@ export class DropboxClient {
     } finally { clearTimeout(timer); }
   }
 
+  async getFileMetadata(path) {
+    return this.#rpc('files/get_metadata',{path:this.resolvePath(path)});
+  }
+
   async renameFile(sourcePath, destinationName) {
     const source = this.resolvePath(sourcePath);
     const name = String(destinationName || '').trim();
