@@ -14,9 +14,12 @@ import { registerVoiceRoutes } from './src/voice-gateway.js';
 import { MorningBrief } from './src/morning-brief.js';
 import { SmsClient } from './src/sms-client.js';
 import { TextMeetings } from './src/text-meetings.js';
+import { TextCancellations } from './src/text-cancellations.js';
 import { TextReminders } from './src/text-reminders.js';
 import { SmsMeetings } from './src/sms-meetings.js';
 import { SmsEmail } from './src/sms-email.js';
+import { EmailDraftRevisions } from './src/email-draft-revisions.js';
+import { EmailDraftCreation } from './src/email-draft-creation.js';
 import { UrgentAlerts } from './src/urgent-alerts.js';
 import { SmsConversation, registerSmsWebhook } from './src/sms-conversation.js';
 
@@ -34,12 +37,15 @@ const state = new StateStore(config.runtime.stateFile);
 const deliveryGuard = new DeliveryGuard(dropbox, graph.readMailbox);
 const sms = new SmsClient({accountSid:process.env.TWILIO_ACCOUNT_SID,authToken:process.env.TWILIO_AUTH_TOKEN,from:process.env.TWILIO_PHONE_NUMBER,to:config.voice.principalPhone});
 const meetings = new TextMeetings({graph,dropbox,openai});
+const cancellations = new TextCancellations({graph,dropbox,openai});
 const reminders = new TextReminders({graph,dropbox,openai});
 const smsMeetings = new SmsMeetings({meetings,state,graph,dropbox,sms});
 const smsEmail = new SmsEmail({graph,dropbox,state});
-const london = new LondonCore({ graph, openai, dropbox, state, deliveryGuard, sms, meetings, logger: app.log });
+const emailDraftRevisions = new EmailDraftRevisions({graph,dropbox,openai,state});
+const emailDraftCreation = new EmailDraftCreation({graph,dropbox,openai,state});
+const london = new LondonCore({ graph, openai, dropbox, state, deliveryGuard, sms, meetings, cancellations, emailDraftRevisions, emailDraftCreation, logger: app.log });
 const urgentAlerts=new UrgentAlerts({graph,openai,sms,guard:new DeliveryGuard(dropbox,`${graph.principalMailbox}:urgent-alerts`)});
-const smsConversation = new SmsConversation({sms,openai,graph,dropbox,state,meetings:smsMeetings,reminders,emails:smsEmail,guard:new DeliveryGuard(dropbox,`${graph.principalMailbox}:incoming-sms`),logger:app.log});
+const smsConversation = new SmsConversation({sms,openai,graph,dropbox,state,meetings:smsMeetings,cancellations,reminders,emails:smsEmail,guard:new DeliveryGuard(dropbox,`${graph.principalMailbox}:incoming-sms`),logger:app.log});
 // Do not activate owner texts in PR previews that share production credentials.
 const smsConversationEnabled = process.env.LONDON_SMS_CONVERSATION_ENABLED === undefined
   ? process.env.RENDER_EXTERNAL_URL === 'https://london-ai-pr-1.onrender.com'
@@ -70,6 +76,7 @@ registerVoiceRoutes(app, {
   voice: config.voice.voice,
   graph,
   dropbox,
+  openai,
   logger: app.log,
 });
 
@@ -86,6 +93,8 @@ function operational() {
 }
 
 app.get('/health', async () => ({
+  channelCapabilities: {emailDraftCreation:true,phonePersonalReminders:true,taskCreation:['phone','sms'],taskStatusUpdate:['phone','sms','email'],dropboxDocumentAnalysis:['phone','sms','email'],dropboxRename:['phone','sms','email'],analysisReports:['phone','sms','email'],textMeetingCancellation:true,ordinaryEmailSending:false},
+  draftRevisions: {phone:true,email:true,sms:true,bodyOnly:true,sending:false},
   smsEmail: {enabled:smsConversationEnabled,drafts:'Outlook',mode:'draft-only',sending:false},
   smsReminders: {enabled:smsConversationEnabled,provider:'Microsoft Graph',calendar:'primary',lastOutcome:reminders.lastOutcome},
   ok: operational(),
@@ -99,7 +108,7 @@ app.get('/health', async () => ({
   sms: sms.configured ? 'owner-requested' : 'not-configured',
   smsConversation: {enabled:smsConversationEnabled,configured:sms.configured,ready:smsConversation.ready,mode:'two-way-owner-only',transport:'webhook-with-inbox-polling',webhook:smsWebhookStatus,intervalSeconds:15,lastCheckedAt:smsConversation.lastCheckedAt,lastOutcome:smsConversation.lastOutcome,lastReplyStatus:smsConversation.lastReplyStatus},
   urgentEmailAlerts: {configured:sms.configured,ready:urgentAlerts.ready,newMessagesOnly:true,heldForReview:urgentAlerts.heldForReview||0},
-    textMeetings: {email:true,sms:smsConversationEnabled,confirmation:'explicit-owner-confirmation',smsConfirmation:'confirm',emailConfirmation:'explicit-proposal-code',provider:'Microsoft Teams'},
+    textMeetings: {email:true,sms:smsConversationEnabled,confirmation:'explicit-owner-confirmation',smsConfirmation:'confirm',emailConfirmation:'explicit-proposal-code',provider:'Microsoft Outlook',meetingTypes:['in-person','Microsoft Teams'],cancellationConfirmation:'CONFIRM CANCEL proposal-code'},
   whatsapp: 'removed',
   pendingDeliveryReview: Object.values(state.state.processedMessages).filter(item => item.result === 'delivery-pending-review').length,
   durableDeliveryGuard: mailboxWorker.guardReady,

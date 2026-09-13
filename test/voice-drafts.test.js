@@ -71,7 +71,7 @@ test('voice instructions require professional rewriting without changing materia
 test('voice reads the Action Register before updating one exact status',async()=>{
   let update;
   const graph={listFollowUps:async()=>[{id:'action-1',title:'Review quote',status:'PENDING',nextFollowUp:'2026-09-08'}],updateFollowUp:async value=>(update=value,{...value,title:'Review quote'})};
-  const context={graph,actionRecords:new Map(),actionUpdates:new Set()};
+  const context={graph:{principalMailbox:'owner@example.com',...graph},dropbox:{createDeliveryRecord:async()=>true},callKey:'test-owner-call',actionRecords:new Map(),actionUpdates:new Set()};
   await assert.rejects(()=>runVoiceTool('update_action_register',{action_id:'action-1',status:'COMPLETED',date:'2026-09-08'},context),/Read and select/);
   const listed=await runVoiceTool('read_action_register',{include_completed:false},context);assert.equal(listed.actions.length,1);
   const changed=await runVoiceTool('update_action_register',{action_id:'action-1',status:'COMPLETED',date:'2026-09-08'},context);

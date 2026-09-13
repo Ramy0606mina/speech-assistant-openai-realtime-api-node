@@ -307,7 +307,7 @@ export class MicrosoftGraphClient {
 
   async getVoiceMessage(mailbox,id) {
     if(typeof id!=='string'||!id||id.length>2000)throw new Error('A message selected from the mailbox is required.');
-    return this.voiceRequest(mailbox,`/messages/${encodeURIComponent(id)}?$select=id,subject,from,sender,replyTo,toRecipients,ccRecipients,bccRecipients,body,isDraft,hasAttachments,changeKey`);
+    return this.voiceRequest(mailbox,`/messages/${encodeURIComponent(id)}?$select=id,subject,conversationId,from,sender,replyTo,toRecipients,ccRecipients,bccRecipients,body,isDraft,hasAttachments,changeKey`);
   }
 
   async createVoiceDraft({mailbox='principal',to=[],subject,body,messageId}) {
@@ -327,6 +327,30 @@ export class MicrosoftGraphClient {
   }
 
   async updateSmsDraft({mailbox='principal',id,body}) {
+    return this.updateEmailDraftBody({mailbox,id,body});
+  }
+
+  async listEditableDrafts(mailbox='principal') {
+    const owner=this.voiceMailbox(mailbox);
+    let path='/mailFolders/drafts/messages?$top=50&$select=id,subject,toRecipients,isDraft';
+    const drafts=[],seen=new Set();
+    while(path){
+      if(seen.has(path)||seen.size>=20)throw Error('Too many drafts to identify a unique target safely.');
+      seen.add(path);
+      const page=await this.voiceRequest(mailbox,path);
+      if(!Array.isArray(page.value))throw Error('Outlook draft listing could not be verified.');
+      drafts.push(...page.value);
+      const next=page['@odata.nextLink'];
+      if(!next){path=null;continue;}
+      const url=new URL(next),prefix='/v1.0/users/'+encodeURIComponent(owner);
+      const allowed=[prefix+'/mailFolders/drafts/messages',prefix+"/mailFolders('drafts')/messages"].map(value=>decodeURIComponent(value).toLowerCase());
+      if(url.origin!=='https://graph.microsoft.com'||url.username||url.password||!allowed.includes(decodeURIComponent(url.pathname).toLowerCase()))throw Error('Invalid draft-list pagination.');
+      path='/mailFolders/drafts/messages'+url.search;
+    }
+    return drafts;
+  }
+
+  async updateEmailDraftBody({mailbox='principal',id,body}) {
     if (!id || typeof body !== 'string' || !body.trim() || body.length > 20000) throw new Error('A saved draft and body are required.');
     const result = await this.voiceRequest(mailbox,`/messages/${encodeURIComponent(id)}`,{
       method:'PATCH',body:JSON.stringify({body:emailDraftBody(body)}),
@@ -565,6 +589,12 @@ export class MicrosoftGraphClient {
     return {id:result.id,title:subject,startLocal:start.local,timezone:'Eastern time',phone,calendar:'Primary Outlook calendar',created:true,reminderOn:true};
   }
 
+  async getPrincipalCalendarEvent(eventId) {
+    if(typeof eventId!=='string'||!eventId||eventId.length>1000)throw Error('Selected event required.');
+    const token=await this.#getToken(this.actionCreds,this.actionToken);
+    return fetchJson(this.fetchImpl,`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.principalMailbox)}/events/${encodeURIComponent(eventId)}?$select=id,subject,start,end,organizer,attendees,isOrganizer,isCancelled,type,seriesMasterId`,{headers:{Authorization:`Bearer ${token}`,Prefer:'outlook.timezone="Eastern Standard Time"'}});
+  }
+
   async cancelVoiceMeeting({eventId,comment=''}={}) {
     const id=String(eventId||'').trim();const note=String(comment||'').trim();
     if(!this.principalMailbox||!id||id.length>1000)throw new Error('A selected calendar event is required.');
@@ -576,7 +606,7 @@ export class MicrosoftGraphClient {
     return {cancelled:true,cancellationSent:true};
   }
 
-  async createFollowUp({ title, date, notes = '', taskKey, reminder = true }) {
+  async createFollowUp({ title, date, notes = '', taskKey, reminder = true, source = 'London owner email' }) {
     if (typeof reminder !== 'boolean') throw new Error('Reminder preference must be true or false.');
     if (!this.principalMailbox || !taskKey || !String(title || '').trim() || String(title).length > 180) throw new Error('Follow-up title and source are required.');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0,10) !== date) throw new Error('Follow-up requires an explicit valid date.');
@@ -591,7 +621,7 @@ export class MicrosoftGraphClient {
     const now = new Date().toISOString();
     const next = new Date(Date.parse(date)+86400000).toISOString().slice(0,10);
     const action = { actionId, title:String(title).trim(), owner:'London', dateOpened:now.slice(0,10), nextFollowUp:date,
-      status:'ACTIVE',priority:'NORMAL',nextAction:String(title).trim(),source:'London owner email',notes:String(notes),reminder,createdAt:now,updatedAt:now };
+      status:'ACTIVE',priority:'NORMAL',nextAction:String(title).trim(),source,notes:String(notes),reminder,createdAt:now,updatedAt:now };
     const result = await fetchJson(this.fetchImpl, `${base}/calendars/${encodeURIComponent(matches[0].id)}/events`, {
       method:'POST',headers,body:JSON.stringify({ subject:`[NORMAL] [ACTIVE] ${action.title}`, body:{contentType:'text',content:`LONDON_ACTION_V1\n${JSON.stringify(action,null,2)}`},
         start:{dateTime:`${date}T${reminder ? '09:00:00' : '00:00:00'}`,timeZone:'Eastern Standard Time'},end:{dateTime:reminder ? `${date}T09:15:00` : `${next}T00:00:00`,timeZone:'Eastern Standard Time'},

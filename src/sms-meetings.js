@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 const hash=value=>createHash('sha256').update(value).digest('hex');
-const codeFrom=reply=>/^Teams proposal:/.test(reply||'') ? reply.match(/CONFIRM MEETING ([a-f0-9]{12})/i)?.[1]?.toLowerCase() : null;
+const codeFrom=reply=>/^(?:Teams|In-person) proposal:/.test(reply||'') ? reply.match(/CONFIRM MEETING ([a-f0-9]{12})/i)?.[1]?.toLowerCase() : null;
 const plainReply=reply=>String(reply).replace(/Reply exactly:\s*CONFIRM MEETING [a-f0-9]{12}/i,'Reply confirm to send the invitation.');
 const noPending='There is no current meeting proposal to confirm. Please send the meeting details again. No invitation was sent.';
 
@@ -49,7 +49,7 @@ export class SmsMeetings {
       let reply;
       try { reply=await this.meetings.confirm(pending.code,owner,request.requestKey,request.maxReplyLength||480); }
       catch { reply='The invitation could not be verified. Check your calendar before requesting it again; I will not automatically retry it.'; }
-      this.save({...pending,status:/^(?:Teams invitation submitted:|This Teams invitation was already submitted)/.test(reply)?'completed':'blocked',reply});
+      this.save({...pending,status:/^(?:(?:Teams|In-person) invitation submitted:|This Teams invitation was already submitted)/.test(reply)?'completed':'blocked',reply});
       return reply;
     }
     // Explicitly supplied old codes are no longer the SMS confirmation UI.

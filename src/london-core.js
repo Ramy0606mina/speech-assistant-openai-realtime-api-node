@@ -15,11 +15,14 @@ function completionSubject(subject) {
 
 function reportRequested(message) {
   const request = `${message?.subject || ''}\n${directOwnerRequestText(message)}`;
-  return /\b(?:report|pdf|docx|word document|spreadsheet|xlsx|workbook|compare|comparison|analysis|analy[sz]e|audit|brief)\b/i.test(request);
+  return /\b(?:report|pdf|docx|word|excel|spreadsheet|xlsx|workbook|compare|comparison|analysis|analy[sz]e|audit|brief)\b/i.test(request);
 }
 
 export class LondonCore {
-  constructor({ graph, openai, dropbox, state, deliveryGuard, sms, meetings, logger = console }) {
+  constructor({ graph, openai, dropbox, state, deliveryGuard, sms, meetings, cancellations, emailDraftRevisions, emailDraftCreation, logger = console }) {
+    this.cancellations=cancellations;
+    this.emailDraftCreation=emailDraftCreation;
+    this.emailDraftRevisions=emailDraftRevisions;
     this.sms = sms;
     this.meetings = meetings;
     this.graph = graph;
@@ -68,8 +71,11 @@ export class LondonCore {
       if (this.deliveryGuard && !await this.deliveryGuard.claimAnalysis(key)) {
         return { processed: false, reason: 'analysis-needs-review', key };
       }
-      const meetingReply = await this.meetings?.handle({text:directOwnerRequestText(full),owner:principal,requestKey:key,receivedAt:full.receivedDateTime});
-      const analysis = meetingReply ? {text:meetingReply} : await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox, graph: this.graph, sms:this.sms });
+      const draftRequest={text:directOwnerRequestText(full),subject:full.subject,owner:principal,requestKey:key};
+      const draftReply = await this.emailDraftCreation?.handle(draftRequest) || await this.emailDraftRevisions?.handle(draftRequest);
+      const calendarRequest={text:directOwnerRequestText(full),owner:principal,requestKey:key,receivedAt:full.receivedDateTime};
+      const meetingReply = !draftReply && (await this.cancellations?.handle(calendarRequest) || await this.meetings?.handle(calendarRequest));
+      const analysis = draftReply || meetingReply ? {text:draftReply||meetingReply} : await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox, graph: this.graph, sms:this.sms });
       let text = String(analysis.text || '').trim();
       if (!text) throw new Error('London produced an empty delegated-task result.');
       // Only the winner of the durable claim may save a report or dispatch mail.
@@ -132,10 +138,10 @@ export class LondonCore {
         text=final.text;
       }
       let report = null;
-      if (this.dropbox?.saveReports && !meetingReply && reportRequested(full)) {
+      if (this.dropbox?.saveReports && !meetingReply && !draftReply && reportRequested(full)) {
         try { report = await this.dropbox.saveReport({ taskKey: key, subject: full.subject, text,
-          includeDocx: /\b(?:docx|word)\b/i.test(`${full.subject || ''}\n${full.body?.content || ''}`),
-          includeXlsx: /\b(?:excel|xlsx|spreadsheet|workbook)\b/i.test(`${full.subject || ''}\n${full.body?.content || ''}`) || analysis.spreadsheetAnalyzed || attachments.some(part=>part.text?.startsWith('Spreadsheet source data')),
+          includeDocx: /\b(?:docx|word)\b/i.test(`${full.subject || ''}\n${directOwnerRequestText(full)}`),
+          includeXlsx: /\b(?:excel|xlsx|spreadsheet|workbook)\b/i.test(`${full.subject || ''}\n${directOwnerRequestText(full)}`) || analysis.spreadsheetAnalyzed || attachments.some(part=>part.text?.startsWith('Spreadsheet source data')),
         }); } catch (error) {
           operationFailed = true;
           text += '\n\nDropbox report saving was not confirmed. The task result above is retained in this email. Check London Work before retrying the save.';

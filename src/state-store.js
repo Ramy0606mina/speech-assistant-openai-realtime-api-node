@@ -15,6 +15,7 @@ export class StateStore {
       this.state = {
         processedMessages: parsed?.processedMessages && typeof parsed.processedMessages === 'object' ? parsed.processedMessages : {},
         lastPollAt: parsed?.lastPollAt || null,
+        emailDraftRevision: parsed?.emailDraftRevision && typeof parsed.emailDraftRevision==='object' ? parsed.emailDraftRevision : null,
         smsConversation: parsed?.smsConversation && typeof parsed.smsConversation === 'object' ? parsed.smsConversation : {},
       };
     } catch (error) {
