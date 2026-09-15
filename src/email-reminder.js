@@ -6,7 +6,11 @@ export function directOwnerRequestText(email) {
     .replace(/<(?:br|\/p|\/div)\b[^>]*>/gi, '\n').replace(/<[^>]*>/g, ' ')
     .replace(/&nbsp;|&#160;/gi, ' ').replace(/&amp;/gi, '&')
     .split(/(?:^|\n)\s*(?:From:|De\s*:|On .+wrote:|Le .+écrit\s*:|[-_]{3,}|Begin forwarded message:)/i)[0];
-  return top.trim();
+  const name = String(email?.from?.emailAddress?.name || '').trim();
+  // Outlook's signature belongs to the sender identity, not the new command.
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const signature = name ? new RegExp('(?:\\r?\\n){2,}[ \\t]*' + escapedName + '[ \\t]*\\r?\\n', 'i') : null;
+  return (signature ? top.split(signature)[0] : top).trim();
 }
 
 export function ownerReminderRequest(email) {

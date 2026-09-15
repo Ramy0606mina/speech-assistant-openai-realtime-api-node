@@ -18,6 +18,9 @@ function fixture(){
  const save=()=>call('save_email_draft',{to:['alex@example.com'],subject:'Review',body:'Hello Alex,\n\nPlease review this.\n\nBest regards,'});
  return {handler,graph,queue,state,writes,request,call,save};
 }
+test('meeting instruction plus Email signature never enters draft creation',async()=>{
+ const f=fixture();assert.equal(await f.handler.handle({...f.request,text:'Prepare and send a 1hr Teams meeting on Thursday 17 at 4:30 pm\nInvite alex@example.com\n\nRAMY MINA\nEmail: owner@example.com'}),null);assert.equal(f.writes.length,0);
+});
 test('owner email saves an actual draft and establishes current revision context',async()=>{
  const f=fixture();f.queue.push(f.save());
  assert.match(await f.handler.handle(f.request),/Saved in Outlook Drafts/);

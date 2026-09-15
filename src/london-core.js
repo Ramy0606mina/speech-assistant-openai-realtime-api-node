@@ -19,7 +19,8 @@ function reportRequested(message) {
 }
 
 export class LondonCore {
-  constructor({ graph, openai, dropbox, state, deliveryGuard, sms, meetings, cancellations, emailDraftRevisions, emailDraftCreation, logger = console }) {
+  constructor({ graph, openai, dropbox, state, deliveryGuard, sms, meetings, emailMeetings, cancellations, emailDraftRevisions, emailDraftCreation, logger = console }) {
+    this.emailMeetings = emailMeetings;
     this.cancellations=cancellations;
     this.emailDraftCreation=emailDraftCreation;
     this.emailDraftRevisions=emailDraftRevisions;
@@ -73,8 +74,8 @@ export class LondonCore {
       }
       const draftRequest={text:directOwnerRequestText(full),subject:full.subject,owner:principal,requestKey:key};
       const draftReply = await this.emailDraftCreation?.handle(draftRequest) || await this.emailDraftRevisions?.handle(draftRequest);
-      const calendarRequest={text:directOwnerRequestText(full),owner:principal,requestKey:key,receivedAt:full.receivedDateTime};
-      const meetingReply = !draftReply && (await this.cancellations?.handle(calendarRequest) || await this.meetings?.handle(calendarRequest));
+      const calendarRequest={text:directOwnerRequestText(full),owner:principal,requestKey:key,receivedAt:full.receivedDateTime,conversationId:full.conversationId};
+      const meetingReply = !draftReply && (await this.cancellations?.handle(calendarRequest) || await (this.emailMeetings || this.meetings)?.handle(calendarRequest));
       const analysis = draftReply || meetingReply ? {text:draftReply||meetingReply} : await this.openai.analyzeDelegatedEmail(full, attachments, { dropbox: this.dropbox, graph: this.graph, sms:this.sms });
       let text = String(analysis.text || '').trim();
       if (!text) throw new Error('London produced an empty delegated-task result.');
@@ -155,13 +156,17 @@ export class LondonCore {
 
       // Persist before dispatch: an interrupted/ambiguous send must not be retried blindly.
       this.state.markMessage(key, { sender, result: 'delivery-pending-review' });
-      await this.graph.sendMail({
+      const outgoing = {
         to: principal,
         subject: reminderFailed ? `LONDON — Reminder Needs Attention | ${full.subject || '(no subject)'}` : operationFailed ? `LONDON — Task Needs Attention | ${full.subject || '(no subject)'}` : completionSubject(full.subject),
         body,
         contentType: formatted ? 'HTML' : 'Text',
         attachments: report?.attachments || [],
-      });
+      };
+      if (meetingReply && this.emailMeetings) {
+        await this.graph.replyToLondonMessage({messageId:full.id, conversationId:full.conversationId, body, contentType:outgoing.contentType});
+        this.emailMeetings.recordReply(calendarRequest);
+      } else await this.graph.sendMail(outgoing);
       if (this.deliveryGuard) await this.deliveryGuard.complete(key, report?.path);
 
       result = { type: 'delegated-task', sender, analysis: text, completionSent: true, reportPath: report?.path || null };

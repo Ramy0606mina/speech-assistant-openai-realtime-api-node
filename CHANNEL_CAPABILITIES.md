@@ -7,7 +7,7 @@ Local implementation for the 20 channel entries in the owner's red-marked capabi
 | Actual Outlook draft creation | Owner email | Saves an actual draft, resolves recipient names, verifies saved draft, records current draft for follow-up revisions. |
 | Existing draft body revision | Phone, owner email | Reuses verified same-ID body-only update and readback; preserves recipients, subject and reply thread. |
 | Personal Outlook reminders | SMS, phone | Direct owner request authorizes save; clarify missing purpose/time, no extra confirmation, no attendees. |
-| In-person and Teams meetings | SMS, phone, owner email | In-person proposals include owner-supplied location. Preserve existing meeting-confirmation behavior. SMS uses plain confirm; email uses proposal code; phone uses spoken confirmation. |
+| In-person and Teams meetings | SMS, phone, owner email | In-person proposals include owner-supplied location. SMS and email use plain confirm; phone uses spoken confirmation. Email proposals stay in the source conversation, and confirm is bound to its latest successfully sent proposal. Internal identifiers are never required in the email reply. |
 | Existing meeting cancellation | SMS, owner email | Show subject/time/organizer/attendees. Require separate exact CONFIRM CANCEL code. Re-read event and reject changed, expired, ambiguous or non-organizer targets. |
 | Action Register creation | SMS, phone | Exact title/date, default due-date reminder unless opted out, durable attempt protection. |
 | Task status update | SMS | Read/select existing action, update status, preserve due date; durable attempt protection. |
