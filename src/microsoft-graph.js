@@ -631,6 +631,28 @@ export class MicrosoftGraphClient {
     return { title:action.title,date,id:result.id,calendar:'London Action Register',reminder:reminder ? 'Outlook alert at 9 a.m. Eastern on the due date' : 'None' };
   }
 
+  async replyToLondonMessage({messageId, conversationId, body, contentType = 'Text'}) {
+    if (!messageId || !conversationId || !this.principalMailbox) throw Error('A source email conversation is required.');
+    const source = await this.getLondonMessage(messageId);
+    if (source.conversationId !== conversationId || normalizeEmail(source.from?.emailAddress?.address) !== this.principalMailbox || normalizeEmail(source.sender?.emailAddress?.address || source.from?.emailAddress?.address) !== this.principalMailbox) throw Error('Reply source is not the authenticated owner.');
+    const token = await this.#getToken(this.actionCreds, this.actionToken);
+    const base = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(this.londonMailbox)}/messages`;
+    const headers = {Authorization:`Bearer ${token}`, 'Content-Type':'application/json'};
+    const draft = await fetchJson(this.fetchImpl, `${base}/${encodeURIComponent(messageId)}/createReply`, {method:'POST', headers, body:'{}'});
+    if (!draft?.id || draft.isDraft !== true || draft.conversationId !== conversationId) throw Error('Reply draft was not verified; no automatic resend.');
+    // Override inherited Reply-To/CC explicitly. Only the owner receives the proposal.
+    const updated = await fetchJson(this.fetchImpl, `${base}/${encodeURIComponent(draft.id)}`, {
+      method:'PATCH', headers, body:JSON.stringify({
+        toRecipients:[{emailAddress:{address:this.principalMailbox}}], ccRecipients:[], bccRecipients:[],
+        body:{contentType:contentType === 'HTML' ? 'HTML' : 'Text', content:String(body)},
+      }),
+    });
+    const recipients = updated?.toRecipients || [];
+    if (updated?.id !== draft.id || updated.isDraft !== true || updated.conversationId !== conversationId || recipients.length !== 1 || normalizeEmail(recipients[0]?.emailAddress?.address) !== this.principalMailbox || updated.ccRecipients?.length || updated.bccRecipients?.length) throw Error('Reply recipients or conversation were not verified; no automatic resend.');
+    await fetchJson(this.fetchImpl, `${base}/${encodeURIComponent(draft.id)}/send`, {method:'POST',headers});
+    return {sent:true, conversationId};
+  }
+
   async sendMail({ to, subject, body, cc = [], contentType = 'Text', attachments = [] }) {
     const addresses = (Array.isArray(to) ? to : [to]);
     const copies = (Array.isArray(cc) ? cc : [cc]).filter(Boolean);

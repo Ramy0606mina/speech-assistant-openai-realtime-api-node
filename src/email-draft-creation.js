@@ -9,6 +9,9 @@ export class EmailDraftCreation {
     const request=subject+'\n'+String(text||'').trim();
     // Existing-draft editing belongs to the revision handler.
     const explicitNew=/^(?:(?:please|can you|could you)\s+)?(?:draft|compose|write|prepare|create|save)\s+(?:(?:a|an|new|actual|outlook)\s+)*(?:email|reply|draft)\b/i.test(String(text||'').trim());
+    // A signature's "Email:" must not turn a scheduling request into a draft.
+    const firstLine = String(text || '').trim().split(/\r?\n/)[0];
+    if (!explicitNew && /\b(?:meeting|teams|invitation)\b/i.test(firstLine) && !requestsEmailDraft(firstLine)) return null;
     if(!explicitNew && /\b(?:revise|rewrite|shorten|lengthen|translate|edit|update|change|add|include|remove|make)\b[^.!?]*\b(?:draft|email|reply)\b/i.test(request))return null;
     if(/\bdraft\s+(?:(?:a|an|the)\s+)?(?:report|document|proposal|spreadsheet)\b/i.test(request) && !/\b(?:email|reply|Outlook)\b/i.test(request))return null;
     if(!requestsEmailDraft(/^(?:re|fw|fwd):/i.test(subject.trim())?text:request))return null;
